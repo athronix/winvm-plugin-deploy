@@ -1,6 +1,6 @@
 ---
 name: winvm-plugin-deploy
-description: WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端一键安装、拆除、复验专用技能（v1.3.0 时间预算战役=roundtrip.sh 一键往返模板——固定链取包→拆→装→验连成一脚本、动态参数仅 VM_HOST/VM_USER/ACTION/tag、LLM 介入压缩到「问环境+发一次后台命令+读末块」三处、探针新鲜复用省 ~240s；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 全战役沉淀：通道判稳器/能力通道自救/rhythm-check 定性/ssh2 通道后端/包根三级选根/预算纪律）。当用户要求部署、安装、重装、拆除或卸载本项目到 VM，给出本技能的 URL 或目录让你按其安装/卸载/验证 winvm-plugin，跑 deploy.prompt 或 undeploy.prompt，验证 VM 插件安装，处理发布包下载慢或失败、VM ssh 连不上、不稳定、挂起、安装前置检查与环境体检时使用。封装两主流程的分环节子流程、数十个实战问题的现象根因解法百科，并提供分步计时、双通道连接、远端 PowerShell 铁律执行、一键体检、取包校验与验证 driver 脚本。
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端一键安装、拆除、复验专用技能。封装三主流程一键往返模板 roundtrip.sh（固定链 取包→拆→装→验 连成一脚本、动态参数仅 VM_HOST/VM_USER/ACTION/tag、探针新鲜复用）、分步 driver、双通道连接（ssh2 后端免疫灭相位）、远端 PowerShell 铁律执行器、一键体检、取包校验、分步计时与数十个实战问题的现象根因解法百科。Use when: 用户要求部署、安装、重装、拆除或卸载 winvm-plugin 到 VM；给出本技能的 URL 或目录要求按其安装/卸载/验证；跑 deploy.prompt 或 undeploy.prompt；验证 VM 插件安装；或处理发布包下载慢/失败、VM ssh 连不上、不稳定、挂起、安装前置检查与环境体检。"
 version: 1.3.0
 agent_created: true
 ---
@@ -9,11 +9,13 @@ agent_created: true
 
 把「鸿蒙宿主 ⇄ Windows VM 安装 WinVM Bridge」从长 Prompt 升级为**分环节可执行流程 + 高效脚本 + 问题百科**。业务权威判据仍以仓库 `docs/deploy/deploy.prompt`（安装）与 `docs/deploy/undeploy.prompt`（拆除）为准；本技能负责跑得**快**（driver+计时）、**稳**（通道/超时/避坑内建）、**卡住秒级定位**（troubleshooting 按现象查表）。
 
+**版本史**（当前 v1.3.0）：v1.3.0 时间预算战役=roundtrip 一键往返模板+探针新鲜复用；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 战役沉淀（通道判稳器/能力通道自救/rhythm-check/ssh2 后端/包根三级/预算纪律）。canonical 仓=`athronix/winvm-plugin-deploy`（skill 矩阵规范见其 README），发布包形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
+
 ## URL 单指令入口（v1.2.1：用户只发一句「请依据 skill {skill_url} 安装/卸载/验证 winvm-plugin」）
 
 收到这种指令时，按下述引导序列自主完成，**全程不要反问流程问题**（只按 P-1 问缺的环境事实）：
 
-1. **取技能本体**：`mkdir -p ~/wbtmp && curl -fsSL --connect-timeout 20 --max-time 300 -o ~/wbtmp/winvm-plugin-deploy-skill.zip "<skill_url>"`（⚠ `-o` 必须用资产原名=URL 尾段，旁挂 sha256 内登记的是原名，改名会让 `sha256sum -c` 假失败；gitee 下载 302→foruda 一次性签名，**禁 `-C -` 断点续传**，失败整文件重试；sha256 旁挂同 URL 加 `.sha256` 后缀可取，先校验）。解压到用户级技能目录：`unzip -o <zip> -d ~/.workbuddy/skills/`（zip 内根=`winvm-plugin-deploy/`，解出即标准 skill 布局）。**后续所有 `scripts/…` 相对路径 = `~/.workbuddy/skills/winvm-plugin-deploy/`**。
+1. **取技能本体**（⚠ 若技能已由系统加载/已在 `~/.workbuddy/skills/` 在场——含开发机 symlink 挂载形态——**跳过本步**，直接第 2 步；勿用 unzip 覆盖 symlink 挂载点）：`mkdir -p ~/wbtmp && curl -fsSL --connect-timeout 20 --max-time 300 -o ~/wbtmp/winvm-plugin-deploy-skill.zip "<skill_url>"`（⚠ `-o` 必须用资产原名=URL 尾段，旁挂 sha256 内登记的是原名，改名会让 `sha256sum -c` 假失败；gitee 下载 302→foruda 一次性签名，**禁 `-C -` 断点续传**，失败整文件重试；sha256 旁挂同 URL 加 `.sha256` 后缀可取，先校验）。解压到用户级技能目录：`unzip -o <zip> -d ~/.workbuddy/skills/`（zip 内根=`winvm-plugin-deploy/`，解出即标准 skill 布局）。**后续所有 `scripts/…` 相对路径 = `~/.workbuddy/skills/winvm-plugin-deploy/`**（技能以其它位置加载时=该技能目录）。
 2. **环境事实**：`VM_HOST` / `VM_USER`（未知 → P-1 问用户，这是唯一允许的提问点）；密码/私钥按 vm-conn.sh 双通道现探。
 3. **取发布包**：`bash scripts/env-detect.sh` → `source ~/wbtmp/vmdeploy-env.sh` → `bash scripts/download-verify.sh`（gitee latest 主源）→ 记下末行 `PKG_ROOT=`。此步后 ssh2 后端自动可解析（`$PKG_ROOT/delivery/ssh2-resolve.mjs` + 包内 `node_modules/ssh2`，且 download-verify 默认落点与 ssh2-conn 兜底候选路径同源）。
 4. **按动词路由（v1.3.0 一键往返模板，优先于分步 driver）**：LLM 只在「取 VM_HOST/VM_USER + 发一次后台命令 + 读末块汇报」三处介入，其余全在模板脚本内——
@@ -31,9 +33,9 @@ agent_created: true
 2. **远端 PowerShell 铁律**：复合逻辑=写 `.ps1` → scp → `powershell -File`；短片段=`-EncodedCommand`（base64 UTF-16LE）。**任何情况下不双引号内联含 `$` 的 PS**——本地 bash 与远端壳都会吞改（R8 安装链 183 次失败、run11 本地 `$_` 展开两案定谳）。本技能一律经 `scripts/ps-run.sh`。
 3. **宿主删文件禁 `rm`**（部分鸿蒙宿主坏 shim=`bad interpreter`）→ `fs_rm`（node fs）。禁 `rm -rf <目录>` 式清理——**误写 `rm -f ~/.config` 类通配/目录删除可能被沙箱提权批准后真执行**；清理具体文件用 `node -e 'fs.unlinkSync(路径)'`（存在性先判断，幂等）。
 4. **ssh/scp 必须外层 timeout**：VM sshd 连接位占满时 TCP 层**无限挂起**（连 BatchMode 不退，实测卡死 8 分钟）——`vm-conn.sh` 已内建 `VM_SSH_TIMEOUT=25`。
-4. **shell 拼接纪律**：命令行内嵌 python/sed 含嵌套单引号会被 eval 撕碎（run13 实证：token 提取一行式炸整链 exit 127）→ 复杂逻辑一律先写脚本文件再执行；令牌经文件/环境变量中转并即删。
-5. **密码只走环境变量**（askpass / `WINVM_VM_PASSWORD`），不落盘不进命令行；`.env` 凭据 V1.4.20 起自动回注（旧包=外部 export 后跑 setup）。
-6. **每步判据自检不过 = 停**：按四元组（现象/根因/证据/处置）记录并查 `references/troubleshooting.md`，不跳步硬推；缺信息问用户（P-1）。
+5. **shell 拼接纪律**：命令行内嵌 python/sed 含嵌套单引号会被 eval 撕碎（run13 实证：token 提取一行式炸整链 exit 127）→ 复杂逻辑一律先写脚本文件再执行；令牌经文件/环境变量中转并即删。
+6. **密码只走环境变量**（askpass / `WINVM_VM_PASSWORD`），不落盘不进命令行；`.env` 凭据 V1.4.20 起自动回注（旧包=外部 export 后跑 setup）。
+7. **每步判据自检不过 = 停**：按四元组（现象/根因/证据/处置）记录并查 `references/troubleshooting.md`，不跳步硬推；缺信息问用户（P-1）。
 
 ## 安装主流程（对应 deploy.prompt Step 0→6）
 
