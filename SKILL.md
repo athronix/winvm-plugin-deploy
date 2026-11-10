@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端一键安装、拆除、复验专用技能。封装三主流程一键往返模板 roundtrip.sh（固定链 取包→拆→装→验 连成一脚本、动态参数仅 VM_HOST/VM_USER/ACTION/tag、探针新鲜复用）、分步 driver、双通道连接（ssh2 后端免疫灭相位）、远端 PowerShell 铁律执行器、一键体检、取包校验、分步计时与数十个实战问题的现象根因解法百科。Use when: 用户要求部署、安装、重装、拆除或卸载 winvm-plugin 到 VM；给出本技能的 URL 或目录要求按其安装/卸载/验证；跑 deploy.prompt 或 undeploy.prompt；验证 VM 插件安装；或处理发布包下载慢/失败、VM ssh 连不上、不稳定、挂起、安装前置检查与环境体检。"
-version: 1.3.0
+version: 1.3.1
 agent_created: true
 ---
 

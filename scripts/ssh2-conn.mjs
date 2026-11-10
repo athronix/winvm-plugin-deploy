@@ -27,7 +27,7 @@
  * 凭据纪律：绝不 console.log 打印任何密钥/密码内容；错误只打 e.message 前 120 字符。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
@@ -352,8 +352,13 @@ async function main() {
 }
 
 // 仅在作为脚本直接执行时进入 CLI；被单测 import 时只导出纯函数（不触网）。
+// v1.3.1 symlink 形态兼容：skill 矩阵规范化后本文件常经 symlink 路径执行（母项目
+// deploy/skills/… 或 ~/.workbuddy/skills/… → canonical），argv 与 import.meta.url 字符串不等
+// 但 realpath 相等——旧判在 symlink 下静默不跑 main（CLI 输出空，p7 CLI 用例实锤）。
+let realUrl = null;
+try { realUrl = pathToFileURL(realpathSync(process.argv[1])).href; } catch { /* 不可解析=维持原判 */ }
 const invokedDirectly =
-  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+  process.argv[1] && (pathToFileURL(process.argv[1]).href === import.meta.url || (realUrl && realUrl === import.meta.url));
 if (invokedDirectly) {
   main().catch((e) => {
     console.error('ssh2-conn: ' + briefError(e));
