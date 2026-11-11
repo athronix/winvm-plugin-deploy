@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端一键安装、拆除、复验专用技能。封装三主流程一键往返模板 roundtrip.sh（固定链 取包→拆→装→验 连成一脚本、动态参数仅 VM_HOST/VM_USER/ACTION/tag、探针新鲜复用）、分步 driver、双通道连接（ssh2 后端免疫灭相位）、远端 PowerShell 铁律执行器、一键体检、取包校验、分步计时与数十个实战问题的现象根因解法百科。Use when: 用户要求部署、安装、重装、拆除或卸载 winvm-plugin 到 VM；给出本技能的 URL 或目录要求按其安装/卸载/验证；跑 deploy.prompt 或 undeploy.prompt；验证 VM 插件安装；或处理发布包下载慢/失败、VM ssh 连不上、不稳定、挂起、安装前置检查与环境体检。"
-version: 1.3.1
+version: 1.4.0
 agent_created: true
 ---
 
@@ -9,14 +9,14 @@ agent_created: true
 
 把「鸿蒙宿主 ⇄ Windows VM 安装 WinVM Bridge」从长 Prompt 升级为**分环节可执行流程 + 高效脚本 + 问题百科**。业务权威判据仍以仓库 `docs/deploy/deploy.prompt`（安装）与 `docs/deploy/undeploy.prompt`（拆除）为准；本技能负责跑得**快**（driver+计时）、**稳**（通道/超时/避坑内建）、**卡住秒级定位**（troubleshooting 按现象查表）。
 
-**版本史**（当前 v1.3.0）：v1.3.0 时间预算战役=roundtrip 一键往返模板+探针新鲜复用；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 战役沉淀（通道判稳器/能力通道自救/rhythm-check/ssh2 后端/包根三级/预算纪律）。canonical 仓=`athronix/winvm-plugin-deploy`（skill 矩阵规范见其 README），发布包形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
+**版本史**（当前 v1.4.0）：v1.4.0=SSH 免密通道生命周期外委 hos-winvm-ssh-tunnel（创建/验证/拆除权威指引+密钥接线 A/B 注记）；v1.3.0 时间预算战役=roundtrip 一键往返模板+探针新鲜复用；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 战役沉淀（通道判稳器/能力通道自救/rhythm-check/ssh2 后端/包根三级/预算纪律）。canonical 仓=`athronix/winvm-plugin-deploy`（skill 矩阵规范见其 README），发布包形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
 
 ## URL 单指令入口（v1.2.1：用户只发一句「请依据 skill {skill_url} 安装/卸载/验证 winvm-plugin」）
 
 收到这种指令时，按下述引导序列自主完成，**全程不要反问流程问题**（只按 P-1 问缺的环境事实）：
 
 1. **取技能本体**（⚠ 若技能已由系统加载/已在 `~/.workbuddy/skills/` 在场——含开发机 symlink 挂载形态——**跳过本步**，直接第 2 步；勿用 unzip 覆盖 symlink 挂载点）：`mkdir -p ~/wbtmp && curl -fsSL --connect-timeout 20 --max-time 300 -o ~/wbtmp/winvm-plugin-deploy-skill.zip "<skill_url>"`（⚠ `-o` 必须用资产原名=URL 尾段，旁挂 sha256 内登记的是原名，改名会让 `sha256sum -c` 假失败；gitee 下载 302→foruda 一次性签名，**禁 `-C -` 断点续传**，失败整文件重试；sha256 旁挂同 URL 加 `.sha256` 后缀可取，先校验）。解压到用户级技能目录：`unzip -o <zip> -d ~/.workbuddy/skills/`（zip 内根=`winvm-plugin-deploy/`，解出即标准 skill 布局）。**后续所有 `scripts/…` 相对路径 = `~/.workbuddy/skills/winvm-plugin-deploy/`**（技能以其它位置加载时=该技能目录）。
-2. **环境事实**：`VM_HOST` / `VM_USER`（未知 → P-1 问用户，这是唯一允许的提问点）；密码/私钥按 vm-conn.sh 双通道现探。
+2. **环境事实**：`VM_HOST` / `VM_USER`（未知 → P-1 问用户，这是唯一允许的提问点）；密码/私钥按 vm-conn.sh 双通道现探。**无免密通道（从零建/通道已毁）** ⇒ 不自行造轮子：按下方「SSH 免密通道生命周期（外委）」用 hos-winvm-ssh-tunnel skill 建通道，建毕回本步复判；通道已在 ⇒ 直接下一步。
 3. **取发布包**：`bash scripts/env-detect.sh` → `source ~/wbtmp/vmdeploy-env.sh` → `bash scripts/download-verify.sh`（gitee latest 主源）→ 记下末行 `PKG_ROOT=`。此步后 ssh2 后端自动可解析（`$PKG_ROOT/delivery/ssh2-resolve.mjs` + 包内 `node_modules/ssh2`，且 download-verify 默认落点与 ssh2-conn 兜底候选路径同源）。
 4. **按动词路由（v1.3.0 一键往返模板，优先于分步 driver）**：LLM 只在「取 VM_HOST/VM_USER + 发一次后台命令 + 读末块汇报」三处介入，其余全在模板脚本内——
    - **`VM_HOST=<ip> ACTION=<full|deploy|undeploy|verify> bash scripts/roundtrip.sh`**（后台 run_in_background 一次调用跑完；full=取包→拆→装→验、deploy=取包+装+验、undeploy=只拆、verify=只验；动态参数仅此：`RELEASE_TAG=`空现解 latest、`SKIP_DOWNLOAD=1` 用现役包根、`VM_USER` 默认 User）。完成后**只读末块 `== ROUNDTRIP_RESULT ==`**（含 VERDICT/WALL_S/各角色 PASS/FAIL/TOP5 计时），勿分段轮询中间态。
@@ -78,6 +78,29 @@ bash scripts/undeploy.sh --apply         # 真拆：19 项核验+U4 独立复核
 bash scripts/verify.sh                   # 三探针 38 项 + 终态矩阵（fresh/disabledTools=8/隧道/health/skills=8/VM 点；⚠ skills=0 ⇒ 宿主侧外部擦除非 VM 问题，install-host --yes 幂等恢复，run15g 实证）
 bash scripts/step.sh report              # 计时汇总；交付报告=总表+Top5+问题清单直接成文
 ```
+
+## SSH 免密通道生命周期（创建/验证/拆除 = 外委 hos-winvm-ssh-tunnel，v1.4.0）
+
+**分工定界**：鸿蒙宿主 WorkBuddy 沙箱 → Windows VM 的 **SSH 免密通道从零创建、验证、精确拆除**，权威指引=**hos-winvm-ssh-tunnel skill**（独立技能仓，OS 原生能力实现，不依赖 MCP/桥）。本技能只负责**通道的使用**（vm-conn.sh 双通道探测/vmssh/vmscp、ssh2 后端、WEDGE 灭窗诊断阶梯）与使用层判据；**不重复造建通道轮子**。
+
+**引用入口（一句话让 WorkBuddy 装起并跑完通道循环）**：
+
+> 请按照 https://raw.githubusercontent.com/athronix/skills/main/INSTALL_PROMPT.md 安装 hos-winvm-ssh-tunnel skill 并在其指引下完成 创建/验证/拆除 鸿蒙宿主机workbuddy 沙箱端 到 VM windows 端的ssh 免密通道
+
+其三步主线（细节以该 skill SKILL.md 为准，勿凭本段记忆执行）：`host-generate-key.sh`（宿主机生成密钥+打印「公钥已填好」的 VM 一键脚本 → **用户在 VM 管理员 PowerShell 粘贴执行一次=唯一人工步骤**）→ `verify-tunnel.sh <VM_IP> <user>`（四段式验收）→ 拆除 `DRYRUN=1 destroy-tunnel.sh` 预演后真跑（journal v2 逐条回滚，他人密钥无损）。
+
+**与本技能三处衔接口**：
+1. **deploy C1 `无通道` FAIL** → 走上方引用入口建通道，建毕复跑本轮 deploy（勿按旧文案手工 ssh-copy-id）。
+2. **undeploy U0.1 `通道失效`**（P-2）→ 同样外委重建，先报告审批再建。
+3. **undeploy U5 存留项「SSH 密钥」** → 用户选"删除"时用 hos `destroy-tunnel.sh`（对称回滚、只撤自己那份）替代旧 vm-rmkey.ps1 手工子流程（后者保留=hos 不在场的兜底）。
+
+**接口适配注记（两技能契约差异，实装前必读，11-11 实核）**：
+- **密钥接线（最重要）**：本技能找密钥的两条路径都默认 `~/.ssh/id_ed25519`——①vm-conn.sh key 通道不传 `-i`（靠 ssh 默认搜索）；②ssh2 后端 `ssh2-conn.mjs` 读 `WINVM_VM_KEY || ~/.ssh/id_ed25519`。而 **hos 默认建专用密钥 `~/.ssh/id_ed25519_winvm`**。二选一接线，勿双密钥并存都试：
+  - **路 A（推荐，零改配置）**=按 hos 脚本第 1 参显式传旧路径：`sh $S/host-generate-key.sh ~/.ssh/id_ed25519`（其设计本就支持 KEY="${1:-...winvm}"；⚠ 若 id_ed25519 兼 GitHub 推送凭据=先按 deploy.prompt 纪律用 id_ed25519_github 分离后再建，勿覆盖已有私钥——脚本幂等=已存在不重建，公钥已在 VM 则等于复用）。
+  - **路 B**=hos 默认 `id_ed25519_winvm`，则**每个调用 winvm driver 的会话必须 `export WINVM_VM_KEY=~/.ssh/id_ed25519_winvm`**（roundtrip/deploy/undeploy 前置注入；注意 ssh 二进制兜底 key 通道不带 `-i` 会失败，保险丝只剩密码通道——本宿主恒 ssh2 后端，可接受，如实知晓）。
+- **验证判读**：hos `verify-tunnel.sh`/`destroy-tunnel.sh` 走 **ssh 二进制**——本宿主 WB 沙箱 ssh 对 VM 呈相位性挂起（见下「ssh2 后端」）。**verify 失败 ≠ 通道没建好**（可能是灭窗指纹）⇒ 用本技能 ssh2 后端复核定论：`VM_HOST=.. VM_USER=.. [WINVM_VM_KEY=..] node scripts/ssh2-conn.mjs ping`。destroy 同受影响：灭窗期 VM 侧回滚可能连不上，按 A 表止损等窗，勿误判"通道没拆"。
+- **密码前提差异**：hos 底线=「账户保持空密码、公钥认证不核对密码」；本 VM 现役 User 为**非空密码**且通道已建——两拓扑都支持公钥，无冲突；仅当你在**新宿主机**按 hos 全流程从零建时，遵循 hos 自己的空密码纪律即可，勿回头找密码。
+- **红线共守**：绝不主动重启 VM/guest（两技能一致）。
 
 ## 通道后端与包根选择（run17~20 定版，v1.2.0）
 
@@ -149,4 +172,4 @@ bash scripts/self-rescue.sh rhythm-check      # 交替采样二分定性（run14
 
 ## 权威文档关系
 
-本技能是**流程编排层**：判据细节、参数表、发布链以 `docs/deploy/deploy.prompt`、`docs/deploy/undeploy.prompt`、`docs/deploy/deploy-strategy.md`、用户实跑复盘 `docs/deploy/deploy-reports/` 为准。两 .prompt 每次升版（发布面改动，pack V11 机械化断言保障入包），本技能流程/脚本如有出入以新版 .prompt 为准并同步回改本技能。
+本技能是**流程编排层**，其中**免密通道生命周期（创建/验证/拆除）再外委 hos-winvm-ssh-tunnel skill**（见「SSH 免密通道生命周期」章）。判据细节、参数表、发布链以 `docs/deploy/deploy.prompt`、`docs/deploy/undeploy.prompt`、`docs/deploy/deploy-strategy.md`、用户实跑复盘 `docs/deploy/deploy-reports/` 为准。两 .prompt 每次升版（发布面改动，pack V11 机械化断言保障入包），本技能流程/脚本如有出入以新版 .prompt 为准并同步回改本技能。

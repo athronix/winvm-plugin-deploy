@@ -44,7 +44,7 @@ STEP end P0 0 0 PASS "GREEN/YELLOW" "none"
 
 # ── Step 1 通道 ──
 STEP begin C1 1.5 "免密/密码通道判定"
-vm_channel_probe || { STEP end C1 1.5 1 FAIL "无通道" "现象=both fail/证据=probe 输出/处置=deploy.prompt Step 1 建免密（密码仅 env 注入）"; exit 1; }
+vm_channel_probe || { STEP end C1 1.5 1 FAIL "无通道" "现象=both fail/证据=probe 输出/处置=外委 hos-winvm-ssh-tunnel skill 建通道（SKILL.md 通道生命周期章引用入口；兜底=deploy.prompt Step 1，密码仅 env 注入）"; exit 1; }
 STEP end C1 1.5 0 PASS "channel=${VM_CHANNEL}" "none"
 
 # ── Step 2 取包/校验 ──

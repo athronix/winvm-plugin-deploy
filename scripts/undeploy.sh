@@ -34,7 +34,7 @@ FAILED_STEPS=""
 _fail_note() { FAILED_STEPS="$FAILED_STEPS $1"; }
 
 STEP begin U0 0.1 "免密通道仍在（拆除器 VM 相位依赖）"
-vm_channel_probe || { STEP end U0 0.1 1 FAIL "通道失效" "P-2：重建=deploy.prompt Step 1（先报告审批）；勿在拆到一半时重建"; exit 1; }
+vm_channel_probe || { STEP end U0 0.1 1 FAIL "通道失效" "P-2：重建=外委 hos-winvm-ssh-tunnel skill（SKILL.md 通道生命周期章；兜底=deploy.prompt Step 1）先报告审批；勿在拆到一半时重建"; exit 1; }
 STEP end U0 0.1 0 PASS "channel=${VM_CHANNEL}" "none"
 
 STEP begin U0 0.2 "WINVM_DRY_RUN=0 确认"
