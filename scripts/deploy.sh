@@ -25,13 +25,22 @@ done
 : "${VM_HOST:?VM_HOST 未设 → 执行协议 P-1：问用户}"
 : "${VM_USER:=User}"; : "${VM_SSH_PORT:=22}"
 NODE="${NODE:?缺少健康 node → 先跑 scripts/env-detect.sh}"
-LOGD="${VMDEPLOY_LOG_DIR:-$HOME/wbtmp/vmdeploy-run-default}"; mkdir -p "$LOGD"
+# e2e2R4+：LOGD 对齐 step.sh 的 RUN_DIR（旧=default 目录与 VMDEPLOY_RUN_DIR 分裂，
+# 日志双落点各写一份、R2 单点扫描落空=11-12 e2e2 实锤；VMDEPLOY_LOG_DIR 仍可显式覆写）
+LOGD="${VMDEPLOY_LOG_DIR:-${VMDEPLOY_RUN_DIR:-$HOME/wbtmp/vmdeploy-run-$(date +%Y%m%d)}}"; mkdir -p "$LOGD"
 
 _step_log() { STEP log "$1" < "$2" 2>/dev/null || true; }
 # run17 D-3 假绿止血：不即时阻断的段失败（如实记 FAIL 后仍按原流程走完）汇入 FAILED_STEPS，
 # 末尾聚合出链非零——steps.tsv 判定列必须可信；硬阻断段（C1/C2 取包/C3.2/C3.3/C4.1）维持即时 exit 1 不变。
 FAILED_STEPS=""
 _fail_note() { FAILED_STEPS="$FAILED_STEPS $1"; }
+
+# ── E2R4b：拆→装往返续命（位置=一切通道动作之前：P0 preflight 也依赖 vm-conn.json 的
+# R1 三级链——S7 终轮实锤本块初版误放 Step 1 之后=preflight 先失明 RED 早退）──
+if [ ! -f "$HOME/.workbuddy/winvm/vm-conn.json" ] && [ -f "$HOME/.workbuddy/winvm/vm-conn.json.roundtrip" ]; then
+  cp -f "$HOME/.workbuddy/winvm/vm-conn.json.roundtrip" "$HOME/.workbuddy/winvm/vm-conn.json"
+  echo "[R4] vm-conn.json 已从 .roundtrip 快照恢复"
+fi
 
 # ── Step 0 体检 ──
 STEP begin P0 0 "preflight 五项体检"
@@ -184,7 +193,10 @@ fi
 # E2R2（11-12 E2E Q4）：交付待办清单——prepare/vmcheck 日志的 [MANUAL] 人工项必须显形到
 # 终端摘要（旧=埋在大 log 里，装"成"后 VM 侧 codebuddy 登录这类结构性人工项被漏）。
 TODO=""
-for _lg in "$LOGD/prepare-vm.log" "$LOGD/vmcheck.log"; do
+# e2e2R4+：日志双落点都扫（LOGD=VMDEPLOY_LOG_DIR 缺省位 vs step.sh RUN_DIR 位，
+# LOG_SAVED 实际走后者——首轮 R2 只扫 LOGD=落空未显形，11-12 e2e2 实锤）
+RUN2="${VMDEPLOY_RUN_DIR:-$HOME/wbtmp/vmdeploy-run-$(date +%Y%m%d)}"
+for _lg in "$LOGD/prepare-vm.log" "$LOGD/vmcheck.log" "$RUN2/logs/prepare-vm.log" "$RUN2/logs/vmcheck.log"; do
   [ -f "$_lg" ] || continue
   _m="$(grep -oE "DB-4[^↔]*|\[MANUAL\][^↔]*" "$_lg" 2>/dev/null | head -2 | tr '\n' ';')"
   [ -n "$_m" ] && TODO="$TODO\n  · [$_lg] $_m"

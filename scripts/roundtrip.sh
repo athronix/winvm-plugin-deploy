@@ -77,6 +77,15 @@ if [ "$ACTION" = full ] || [ "$ACTION" = undeploy ]; then
 fi
 
 # ── 序列三：安装（C5 通过会写探针 stamp 供 R4 复用） ─────────────────
+# e2e2R6（11-12 e2e2 三例实锤 S8/S9/S10）：拆机重启 sshd 后存在认证段瞬态窗
+# （光谱=124 挂起/111 瞬拒/255 拒——124 文案只写"VM 开机期"覆盖不全），背靠背装
+# 必撞 RED 早退。full 模式在拆与装之间插入判稳（wait-channel 连击 2×4，预算 ~8min；
+# 不稳不阻断——deploy 自带 preflight 重试语义，撞窗则如实 FAIL 由调用方决策重跑）。
+if [ "$ACTION" = full ]; then
+  _step "R2.5 wait-channel 判稳（拆后瞬态窗）"
+  timeout 560 bash "$_here/wait-channel.sh" 2 4 > "$RUN_DIR/wait-channel.log" 2>&1 || true
+  say "R2.5 STABILITY=$(grep -oE 'STABLE|UNSTABLE' "$RUN_DIR/wait-channel.log" | tail -1)"
+fi
 if [ "$ACTION" = full ] || [ "$ACTION" = deploy ]; then
   _step "R3 deploy --apply"
   VMDEPLOY_PROBE_STAMP="$STAMP" bash "$_here/deploy.sh" --apply > "$RUN_DIR/deploy.log" 2>&1; RC=$?

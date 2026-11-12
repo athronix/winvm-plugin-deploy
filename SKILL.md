@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端一键安装、拆除、复验专用技能。封装三主流程一键往返模板 roundtrip.sh（固定链 取包→拆→装→验 连成一脚本、动态参数仅 VM_HOST/VM_USER/ACTION/tag、探针新鲜复用）、分步 driver、双通道连接（ssh2 后端免疫灭相位）、远端 PowerShell 铁律执行器、一键体检、取包校验、分步计时与数十个实战问题的现象根因解法百科。Use when: 用户要求部署、安装、重装、拆除或卸载 winvm-plugin 到 VM；给出本技能的 URL 或目录要求按其安装/卸载/验证；跑 deploy.prompt 或 undeploy.prompt；验证 VM 插件安装；或处理发布包下载慢/失败、VM ssh 连不上、不稳定、挂起、安装前置检查与环境体检。"
-version: 1.4.2
+version: 1.4.3
 agent_created: true
 ---
 
@@ -9,7 +9,7 @@ agent_created: true
 
 把「鸿蒙宿主 ⇄ Windows VM 安装 WinVM Bridge」从长 Prompt 升级为**分环节可执行流程 + 高效脚本 + 问题百科**。本技能是本项目部署/安装/启动/验证/卸载**全部环节的唯一执行权威**（迭代28，11-11 用户裁定；旧 deploy.prompt/undeploy.prompt 智能体安装脚本已降级退役=历史决策档案，不再随发布包分发）；技能负责跑得**快**（driver+计时）、**稳**（通道/超时/避坑内建）、**卡住秒级定位**（troubleshooting 按现象查表），免密通道生命周期再外委 hos-winvm-ssh-tunnel。
 
-**版本史**（当前 v1.4.2）：v1.4.2=E2E 整改批（11-12 real-test-2026-11-12-e2e）：R1 vm-conn 密钥三级链 env>vm-conn.json>默认+二进制通道注入 -i IdentitiesOnly（既成环境钥迁移自动消费）；R2 deploy C6 交付待办清单显形（[MANUAL]/DB-4 结构性人工项不再埋 log）；R3 B 表两新行（ensure-node 超时假完成/env-check 重载期假 FAIL）。v1.4.1=迭代28 用户裁定旧模式降级退役——本技能升格为**唯一执行权威**（.prompt 降历史档案，不再入发布包）；v1.4.0=SSH 免密通道生命周期外委 hos-winvm-ssh-tunnel（创建/验证/拆除权威指引+密钥接线 A/B 注记）；v1.3.0 时间预算战役=roundtrip 一键往返模板+探针新鲜复用；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 战役沉淀（通道判稳器/能力通道自救/rhythm-check/ssh2 后端/包根三级/预算纪律）。canonical 仓=`athronix/winvm-plugin-deploy`（skill 矩阵规范见其 README），发布包形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
+**版本史**（当前 v1.4.3）：v1.4.3=E2E 第二轮整改批（real-test-2026-11-12-e2e2）：R4 往返续命（undeploy 自动快照 vm-conn.json→deploy P0 前恢复，含 R4b 位置修正）；R4+ LOGD 统一 RUN_DIR+交付待办双落点扫描；R6 roundtrip full 拆后 R2.5 判稳插段+A 表瞬态窗三形态行（124/111/255）。v1.4.2=E2E 整改批（11-12 real-test-2026-11-12-e2e）：R1 vm-conn 密钥三级链 env>vm-conn.json>默认+二进制通道注入 -i IdentitiesOnly（既成环境钥迁移自动消费）；R2 deploy C6 交付待办清单显形（[MANUAL]/DB-4 结构性人工项不再埋 log）；R3 B 表两新行（ensure-node 超时假完成/env-check 重载期假 FAIL）。v1.4.1=迭代28 用户裁定旧模式降级退役——本技能升格为**唯一执行权威**（.prompt 降历史档案，不再入发布包）；v1.4.0=SSH 免密通道生命周期外委 hos-winvm-ssh-tunnel（创建/验证/拆除权威指引+密钥接线 A/B 注记）；v1.3.0 时间预算战役=roundtrip 一键往返模板+探针新鲜复用；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 战役沉淀（通道判稳器/能力通道自救/rhythm-check/ssh2 后端/包根三级/预算纪律）。canonical 仓=`athronix/winvm-plugin-deploy`（skill 矩阵规范见其 README），发布包形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
 
 ## URL 单指令入口（v1.2.1：用户只发一句「请依据 skill {skill_url} 安装/卸载/验证 winvm-plugin」）
 
