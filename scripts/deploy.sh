@@ -181,6 +181,20 @@ else
   STEP end C6 6.1 0 PASS "计数=$SKCNT" "none"
 fi
 
+# E2R2（11-12 E2E Q4）：交付待办清单——prepare/vmcheck 日志的 [MANUAL] 人工项必须显形到
+# 终端摘要（旧=埋在大 log 里，装"成"后 VM 侧 codebuddy 登录这类结构性人工项被漏）。
+TODO=""
+for _lg in "$LOGD/prepare-vm.log" "$LOGD/vmcheck.log"; do
+  [ -f "$_lg" ] || continue
+  _m="$(grep -oE "DB-4[^↔]*|\[MANUAL\][^↔]*" "$_lg" 2>/dev/null | head -2 | tr '\n' ';')"
+  [ -n "$_m" ] && TODO="$TODO\n  · [$_lg] $_m"
+done
+if [ -n "$TODO" ]; then
+  echo "==== 交付待办（结构性人工项，非失败）===="
+  printf '%b\n' "$TODO"
+  echo "（VM 内一次交互登录等=deploy 设计内残留人工步骤，完成后可 verify 复跑确认 provider 态）"
+fi
+
 STEP report
 # run17 D-3 聚合出链：非硬阻断段失败（FAILED_STEPS 在场）→ 如实非零退出（旧=恒 0 假绿）
 if [ -n "$FAILED_STEPS" ]; then

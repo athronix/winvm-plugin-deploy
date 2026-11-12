@@ -55,7 +55,18 @@ _scp_shape() { # $1=a1 $2=a2 → stdout put|get|unknown
   case "$out" in put|get) printf '%s\n' "$out" ;; *) printf 'unknown\n' ;; esac
 }
 
-_ssh_common=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no)
+# E2R1（11-12 E2E Q1）：VM 私钥三级链=env WINVM_VM_KEY > vm-conn.json identityFile（存在才用）
+# > ~/.ssh/id_ed25519 默认。既成环境钥迁移（hos 路B 建 id_ed25519_winvm 类）时 driver 自动消费
+# 运行态事实，二进制兜底/回合一发也带 -i（旧=靠 ssh 默认搜索，错钥 Permission denied 且无提示）。
+if [ -z "${WINVM_VM_KEY:-}" ]; then
+  _vck="${HOME}/.workbuddy/winvm/vm-conn.json"
+  if [ -f "$_vck" ] && [ -n "${_ssh2n:-}" ]; then
+    WINVM_VM_KEY="$("$_ssh2n" -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const p=j&&j.identityFile;if(p&&require("fs").existsSync(p))process.stdout.write(p)}catch(e){}' "$_vck" 2>/dev/null || true)"
+  fi
+fi
+[ -n "${WINVM_VM_KEY:-}" ] || WINVM_VM_KEY="${HOME}/.ssh/id_ed25519"
+export WINVM_VM_KEY
+_ssh_common=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no -i "$WINVM_VM_KEY" -o IdentitiesOnly=yes)
 
 # key 通道：BatchMode（无交互）；部分沙箱 ~/.ssh 属主漂移 → 用独立 UserKnownHosts 文件避免权限类失败
 # 二进制兜底一发（ssh2/auto 三试尽后走；VM_CHANNEL 未定时按 key 形态——ssh2 通道本就密钥，兜底同理）

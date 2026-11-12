@@ -19,7 +19,7 @@
 | ssh 传 `/End` 变 `C:/.../End`、`$_` 变路径 | 远端默认壳=Git-Bash/MSYS 改写 | 铁律通道（见 B 首行） |
 | 内联 PowerShell 报 ParserError/怪值 | 双引号命令串里 `$_`/`$p` 被**本地** bash 先展开（run11 0.4 实测） | 与远端同权对待：单引号 heredoc 写 `.ps1` → ps-run；短片段 `-c` 走 EncodedCommand |
 
-## B. 安装/拆除流程
+## B. 安装/拆除
 
 | 现象 | 根因 | 解法 |
 |---|---|---|
@@ -32,6 +32,8 @@
 | E7 `EXECUTION_TIMEOUT` 且 durationMs≈120000 | 服务端能力闸 120s（I-6.14，客户端修好后露出的下一层） | ≥V1.4.17 盘扫族 300s；勿再当"瞬态"复跑放行 |
 | 探针链总时长比基线慢 ~50-100s | 冷启带宽：llmSession/ps-bridge starting 拖慢 E4/E7 首批（run12：深冷 239s vs 热 97s） | 判据=零超时零复跑；X-5 三档带（~97/~145/≤250s）内勿误判回归 |
 | BUILD 相位 exit 127 整链 rc=1 | 发布包不随发 typescript（白名单本意），纯净宿主无法 npm run build；且 dist 预构建其实可用（X-7 假败） | ≥V1.4.20 自动降级 SKIP；或恒用 `--skip-build`（发布包标准入口） |
+| **prepare-vm --ensure-node 显示完成但 node 仍缺**（`vm -v` 报找不到；TEMP 有完整 node.zip 而 `C:\nodejs` 空） | E2Q2：远端下载+解压超 ssh2 exec 300s 硬窗 → 超时回落二进制一发（若钥又不符=Permission denied 静默）⇒ **rc=0 假完成**，解压段被截断。判据=zip 完整在 %TEMP% 而 node.exe 缺 | 补跑解压段（铁律 .ps1：Expand-Archive→Copy 到 C:\nodejs→Machine PATH 前置→`node.exe -v` 实判 v24.21.0）；勿整跑 apply 赌重下（zip 已在场解压段 <60s）。delivery 异步化（fire+poll 落盘标记）在册 backlog |
+| **env-check（C3.0）rc=124 而首跑曾 PASS** | E2Q3：VM 重载期（node 装机/服务重启）短命令排队超 VST=通道拥塞连锁**假 FAIL**；非配置问题 | 判读=同轮 C3.2 之后各段仍 PASS ⇒ 不阻断（聚合出链 rc=1 属如实）；幂等复跑 env-check 或整链即收敛，勿据此查通道 |
 | `.env` 填了 WINVM_VM_PASSWORD 隧道仍要密码失败 | ≤V1.4.19 setup 只读 process.env 不回注（X-6） | ≥V1.4.20 凭据自动回注（白名单+env 优先）；旧版=运行前 source 一个含 export 的 env.sh |
 | 隧道段 V8 FATAL errno=12 | $NODE 选中脆弱 hnp node（.mjs 执行崩、-e 正常） | v3.0.x 探测冒烟门禁自动避开；旧版手动 export NODE 到 bundle node 再 `tunnel ensure` |
 | deploy 中途 VM 重启/断电后一切卡住 | sshd 未起+hypervisor 层状态 | 恢复 VM → vm_channel_probe → 从失败相位重跑（全链幂等；setup 重试吸收此类瞬态） |
