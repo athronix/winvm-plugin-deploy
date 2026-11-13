@@ -1,0 +1,29 @@
+﻿# winvm-plugin-deploy · action catalog (v1.7.0)
+# Machine-readable decision base: every basic maintenance action, its exact command,
+# executor, environment, precondition, next step on ok/fail, and mergeability.
+# Consumed by step.sh (to enrich actions.tsv) and action-report.sh (process table).
+# Columns: key(phase/step) | process | command | subject | env | precondition | next_ok | next_fail | mergeable(Y/N)
+# NOTE: "next_fail" is a DETERMINISTIC command, never an open-ended instruction.
+P0/0	部署	bash scripts/preflight.sh	workbuddy命令调用	鸿蒙workbuddy沙箱	VM_HOST/VM_USER已冻结,node健康	C1/1.5	bash scripts/preflight.sh 重跑并照其 RED 项修复(勿硬跑)	Y
+C1/1.5	部署	bash scripts/channel.sh ensure	workbuddy命令调用	鸿蒙workbuddy沙箱	context已冻结WINVM_VM_KEY	C2/2	NEED_USER_ACTION=1: 用户在VM管理员PowerShell粘贴一次 -> bash scripts/channel.sh confirm -> 重跑 deploy.sh --apply	Y
+C2/2	部署	bash scripts/download-verify.sh + verify-manifest.py	workbuddy命令调用	鸿蒙workbuddy沙箱	DEPLOY_ROOT可写,gitee可达	C3/3.0	PKG_ROOT=<合法包根> bash deploy.sh --apply(离线回退)	Y
+C3/3.0	部署	bash scripts/ps-run.sh <pkg>/qa/deploy-probes/vm-env-check.ps1	workbuddy命令调用	VM Windows(经ssh2)	通道在,包根qa/deploy-probes齐备	C3/3.2	照 troubleshooting P-2 处置(BLOCKERS=none 后重跑本相位)	Y
+C3/3.2	部署	node delivery/bootstrap.mjs prepare-vm --apply --ensure-node && node delivery/setup.mjs --apply --skip-build	workbuddy命令调用	鸿蒙workbuddy沙箱+VM Windows	.env就位,通道在	C3/3.3	查 setup.log 失败相位名(troubleshooting B表); 只重跑本相位	Y
+C3/3.3	部署	bash scripts/ps-run.sh <pkg>/qa/deploy-probes/vmcheck.ps1	workbuddy命令调用	VM Windows(经ssh2)	setup rc=0,18443已监听	C4/4.1	task=Ready+listen=0 -> schtasks /End+/Run 重触发; 僵而不绑=420s僵尸处置	Y
+C4/4.1	部署	node delivery/install-host.mjs --yes --vm-host/--vm-user/--vm-ssh-port	workbuddy命令调用	鸿蒙workbuddy沙箱	vmcheck七判据过	C4/4.5	connector-states噪声放行(X-4); errno=12=换健康node重跑	Y
+C4/4.5	部署	node delivery/install-host.mjs --check-fresh + curl 127.0.0.1:18443/health	workbuddy命令调用	鸿蒙workbuddy沙箱	install-host rc=0	C5/5	查 delivery/tunnel-daemon.mjs 与 ~/.workbuddy/winvm/tunnel.log	Y
+C5/5	部署	for pr in mcp-probe a2a-probe example-probe; do python3 qa/deploy-probes/$pr.py; done	workbuddy命令调用	鸿蒙workbuddy沙箱	health=200,探针脚本齐备	C6/6.1	区分 EXECUTION_TIMEOUT(服务端闸) vs timed out(客户端); VERIFY_FORCE_PROBE=1 冷跑	C6/6.1
+C6/6.1	部署	ls ~/.workbuddy/connectors/skills/connector-winvm | wc -l	workbuddy命令调用	鸿蒙workbuddy沙箱	探针38项全绿	VERIFY/5-*	node delivery/deploy-shared-skills.mjs 或 bash scripts/../../delivery/install-host.mjs --yes 幂等恢复	Y
+U1/1	卸载	node delivery/uninstall.mjs --apply (隐藏vm-conn.json只跑host相位)	workbuddy命令调用	鸿蒙workbuddy沙箱	PKG_ROOT可解析; 无需通道	U2/2	查 apply-host.log 的 [FAIL] HOST 行; 只重跑 U1	Y
+U2/2	卸载	vmscp vm-remove-local.ps1 + bash scripts/ps-run.sh -c '& .\vm-remove-local.ps1 -Apply'	workbuddy命令调用	VM Windows(经ssh2)	U1 PASS 且 CHANNEL_UP=1	U3/3	通道灭窗 -> bash scripts/build-vm-bundle.sh(绝不重建通道)	Y
+U3/3	卸载	bash scripts/channel.sh post 或 --keep-tunnel 跳过	workbuddy命令调用	鸿蒙workbuddy沙箱+VM Windows	U2 完成	U4/4.2	POST_ROLLBACK_FAILED -> bash scripts/build-vm-bundle.sh 交用户(VM本机执行RUN-ME.ps1)	Y
+U4/4.2	卸载	curl health + mcp.json winvm键 + ps-run VM五点	workbuddy命令调用	鸿蒙workbuddy沙箱+VM Windows	三段完成	VERIFY/5-*	health!=000 / GLOBAL_MCP_CLEAN缺失 -> 查 apply-host.log, 只重跑 U1	Y
+VERIFY/5-mcp-probe	验证	python3 qa/deploy-probes/mcp-probe.py 或 REUSED	workbuddy命令调用	鸿蒙workbuddy沙箱	deploy ready(stamp deploy_ok=1)	VERIFY/5-a2a-probe	VERIFY_FORCE_PROBE=1 bash scripts/verify.sh(只重跑失败探针)	Y
+VERIFY/5-a2a-probe	验证	python3 qa/deploy-probes/a2a-probe.py 或 REUSED	workbuddy命令调用	鸿蒙workbuddy沙箱	同上	VERIFY/5-example-probe	VERIFY_FORCE_PROBE=1 bash scripts/verify.sh	Y
+VERIFY/5-example-probe	验证	python3 qa/deploy-probes/example-probe.py 或 REUSED	workbuddy命令调用	鸿蒙workbuddy沙箱	同上	VERIFY/6	VERIFY_FORCE_PROBE=1 bash scripts/verify.sh	Y
+VERIFY/6	验证	install-host --check-fresh + disabledTools + health + skills + ps-run VM终态	workbuddy命令调用	鸿蒙workbuddy沙箱+VM Windows	探针全绿	DONE	ENV_WINDOW=1 -> 等健康窗只重跑 verify.sh(绝不重启VM); health!=200 -> 查 tunnel.log	Y
+R1/1	编排	bash scripts/download-verify.sh	workbuddy命令调用	鸿蒙workbuddy沙箱	gitee可达	R2/2	SKIP_DOWNLOAD=1 ACTION=full bash scripts/run-flow.sh(用冻结PKG_ROOT)	Y
+R2/2	编排	bash scripts/undeploy.sh --apply --keep-tunnel	workbuddy命令调用	鸿蒙workbuddy沙箱	context已冻结	R2.5/2.5	ACTION=undeploy bash scripts/run-flow.sh 定点重跑	Y
+R2.5/2.5	编排	bash scripts/wait-channel.sh 2 4 + bash scripts/channel.sh confirm	workbuddy命令调用	鸿蒙workbuddy沙箱	R2 PASS	R3/3	GATE: 等健康窗重跑 run-flow.sh(绝不重启VM)	Y
+R3/3	编排	bash scripts/deploy.sh --apply	workbuddy命令调用	鸿蒙workbuddy沙箱	判稳通过	R4/4	ACTION=deploy bash scripts/run-flow.sh 定点重跑	Y
+R4/4	编排	bash scripts/verify.sh	workbuddy命令调用	鸿蒙workbuddy沙箱	R3 PASS	DONE	ACTION=verify bash scripts/run-flow.sh 定点重跑	Y

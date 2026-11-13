@@ -43,6 +43,7 @@ export VMDEPLOY_PROBE_STAMP="$STAMP"
 T0=$(date +%s)
 say(){ echo "[$(date +%H:%M:%S)] $*"; }
 _step(){ say "RT-STEP $*"; }
+STEP(){ bash "$_here/step.sh" "$@"; }   # v1.7.0: orchestration-layer action trace
 
 case "$ACTION" in cycle) ACTION=full;; esac
 case "$ACTION" in full|deploy|undeploy|verify) ;; *) echo "ACTION 非法：$ACTION（full|deploy|undeploy|verify）" >&2; exit 2;; esac
@@ -60,12 +61,14 @@ RES_U="SKIP"; RES_D="SKIP"; RES_V="SKIP"; PKG_NOTE="(当前包根)"
 # ── 序列一：取发布包（RELEASE_TAG 现解+隔离重解+校验，全固定） ──────
 if [ "$ACTION" = full ] || { [ "$ACTION" = deploy ] && [ "$SKIP_DOWNLOAD" != 1 ]; }; then
   _step "R1 download-verify（tag=${RELEASE_TAG:-latest 现解}）"
+  STEP begin R1 1 "R1 download-verify（tag=${RELEASE_TAG:-latest 现解}）"
   RT=0
   if [ -n "$RELEASE_TAG" ]; then RELEASE_TAG="$RELEASE_TAG" bash "$_here/download-verify.sh" > "$RUN_DIR/download-verify.log" 2>&1 || RT=$?
   else bash "$_here/download-verify.sh" > "$RUN_DIR/download-verify.log" 2>&1 || RT=$?; fi
-  if [ $RT -ne 0 ]; then say "FAIL R1 download-verify rc=$RT → 查 $RUN_DIR/download-verify.log（troubleshooting A/D 族）"; exit 4; fi
+  if [ $RT -ne 0 ]; then STEP end R1 1 $RT FAIL "download-verify rc=$RT" "查 $RUN_DIR/download-verify.log（troubleshooting A/D 族）"; say "FAIL R1 download-verify rc=$RT"; exit 4; fi
   PKG_NOTE="$(grep -E '^PKG_ROOT=' "$RUN_DIR/download-verify.log" | tail -1)"
   say "OK R1 $PKG_NOTE（$(grep -E '^\[download\] tag=' "$RUN_DIR/download-verify.log" | tail -1)）"
+  STEP end R1 1 0 PASS "${PKG_NOTE:-取包完成}" "none"
 fi
 
 # ── 序列二：拆除 ──────────────────────────────────────────────────────
@@ -78,7 +81,9 @@ if [ "$ACTION" = full ] || [ "$ACTION" = undeploy ]; then
     say "R2 full 默认 --keep-tunnel（保留通道供 R3 自动部署；ROUNDTRIP_KEEP_TUNNEL=0 可关）"
   fi
   _step "R2 undeploy $UARGS"
+  STEP begin R2 2 "R2 undeploy $UARGS"
   bash "$_here/undeploy.sh" $UARGS > "$RUN_DIR/undeploy.log" 2>&1; RC=$?
+  STEP end R2 2 $RC "$([ $RC -eq 0 ] && echo PASS || echo FAIL)" "UNDEPLOY_DONE / UNDEPLOY_WITH_FAILURES" "$([ $RC -eq 0 ] && echo none || echo '查 undeploy.log 的 U1~U4 行, 用 ACTION=undeploy bash scripts/run-flow.sh 定点重跑')"
   RES_U=$([ $RC -eq 0 ] && echo PASS || echo "FAIL(rc=$RC)")
   [ $RC -ne 0 ] && { FAILED="$FAILED undeploy"; say "FAIL R2 → 查 $RUN_DIR/undeploy.log（troubleshooting kept/僵尸行）"; }
   say "R2 $RES_U"
@@ -93,8 +98,10 @@ fi
 # 但先用 ssh2 新建连接实测复核，避免二进制判稳自身错钥/相位挂造成误停。
 if [ "$ACTION" = full ]; then
   _step "R2.5 wait-channel 判稳（拆后瞬态窗）"
+  STEP begin R2.5 2.5 "R2.5 wait-channel 判稳（拆后瞬态窗）"
   timeout 600 bash "$_here/wait-channel.sh" 2 4 > "$RUN_DIR/wait-channel.log" 2>&1; WRC=$?
   STAB="$(grep -oE 'STABLE|UNSTABLE' "$RUN_DIR/wait-channel.log" | tail -1)"
+  STEP end R2.5 2.5 $WRC "$([ $WRC -eq 0 ] && echo PASS || echo FAIL)" "STABILITY=${STAB:-UNKNOWN}" "$([ $WRC -eq 0 ] && echo none || echo 'channel.sh confirm 权威复核; 均败则等健康窗(绝不重启VM)')"
   say "R2.5 STABILITY=${STAB:-UNKNOWN} rc=$WRC"
   if [ "$WRC" -ne 0 ]; then
     # F-09：连击判稳失败 != 通道不存在（旧裸 ssh 错钥/相位挂）。用 ssh2 新建连接
@@ -115,7 +122,9 @@ if [ "$ACTION" = full ]; then
 fi
 if [ "$ACTION" = full ] || [ "$ACTION" = deploy ]; then
   _step "R3 deploy --apply"
+  STEP begin R3 3 "R3 deploy --apply"
   VMDEPLOY_PROBE_STAMP="$STAMP" bash "$_here/deploy.sh" --apply > "$RUN_DIR/deploy.log" 2>&1; RC=$?
+  STEP end R3 3 $RC "$([ $RC -eq 0 ] && echo PASS || echo FAIL)" "DEPLOY_APPLY_DONE / DEPLOY_APPLY_WITH_FAILURES" "$([ $RC -eq 0 ] && echo none || echo '查 deploy.log 的 C1~C6 行, 用 ACTION=deploy bash scripts/run-flow.sh 定点重跑')"
   RES_D=$([ $RC -eq 0 ] && echo PASS || echo "FAIL(rc=$RC)")
   [ $RC -ne 0 ] && { FAILED="$FAILED deploy"; say "FAIL R3 → 查 $RUN_DIR/deploy.log + steps.tsv（ENV_PRECHECK/P-2 口径）"; }
   say "R3 $RES_D"
@@ -128,10 +137,14 @@ if [ "$ACTION" = full ] || [ "$ACTION" = verify ] || [ "$ACTION" = deploy ]; the
     RES_V=SKIP
   else
     _step "R4 verify"
+    STEP begin R4 4 "R4 verify"
     bash "$_here/verify.sh" > "$RUN_DIR/verify.log" 2>&1; RC=$?
+    STEP end R4 4 $RC "$([ $RC -eq 0 ] && echo PASS || echo FAIL)" "VERIFY=PASS / VERIFY=FAIL / VERIFY=INCOMPLETE" "$([ $RC -eq 0 ] && echo none || echo 'ENV_WINDOW=1 等健康窗重跑; 否则查 verify.log 用 ACTION=verify bash scripts/run-flow.sh 定点重跑')"
     RES_V=$([ $RC -eq 0 ] && echo PASS || echo "FAIL(rc=$RC)")
     [ $RC -ne 0 ] && FAILED="$FAILED verify"
-    say "R4 $RES_V（探针复用=$(grep -c 'REUSED' "$RUN_DIR/verify.log" 2>/dev/null || echo 0)/3）"
+    # F-20: same grep -c || echo 0 false-value pattern (display only, but keep clean).
+    REUSED_N="$(awk '/REUSED/{n++} END{print n+0}' "$RUN_DIR/verify.log" 2>/dev/null)"; : "${REUSED_N:=0}"
+    say "R4 $RES_V（探针复用=$REUSED_N/3）"
   fi
 fi
 

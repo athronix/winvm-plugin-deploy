@@ -119,15 +119,44 @@ fi
 
 # ── Step 3 VM 侧（prepare-vm 补齐 + setup 七相位；X-6/X-7 修复后 .env/密码/BUILD 均免手工） ──
 STEP begin C3 3.0 "ENV_PRECHECK 硬门禁"
-# run17 D-3：旧=`|| true` 吞非零后无条件 PASS（run17 活体假绿：env-check.log=VMS scp 失败仍 PASS）。
-# 现 capture rc 入判定；判据=rc≠0 或日志缺 ENV_PRECHECK 行 → FAIL（不即时阻断，聚合出链非零）。
-( cd "$PKG" && "${BASH_OK:-bash}" "$_here/ps-run.sh" "$PKG/qa/deploy-probes/vm-env-check.ps1" > "$LOGD/env-check.log" 2>&1 ); ERC=$?
+# run17 D-3：旧=`|| true` 吞非零后无条件 PASS（run17 活体假绿）。
+# F-21 (E2E3)：旧判据 `grep -q ENV_PRECHECK` 连 `ENV_PRECHECK=FAIL` 都命中=假绿；
+#   现要求 ENV_PRECHECK=PASS **且** BLOCKERS=none。
+# F-20 (E2E3)：通道瞬态窗把 ps-run 的 30s timeout 打断时，日志有 NODE_OK/CLI_OK
+#   但缺 ENV_PRECHECK 行。旧实现直接 FAIL 并汇入 FAILED_STEPS ⇒ deploy rc=1
+#   ⇒ R3 FAIL ⇒ R4 verify 被 SKIP（假红拖垮整链）。现给一条**确定性幂等复跑**：
+#   仅当 rc∈{124,111,255} 且 NODE_OK/CLI_OK 在场（=VM 探测主体已跑通、只是
+#   尾部传输被截断）才复跑一次 env-check（只读、幂等），复跑达标即 PASS(RETRY=1)；
+#   配置性失败（BLOCKERS≠none / NODE_OK=false）绝不吞，按 P-2 处置。
+_envcheck_ok() {
+  grep -q "ENV_PRECHECK=PASS" "$LOGD/env-check.log" 2>/dev/null \
+    && grep -q "BLOCKERS=none" "$LOGD/env-check.log" 2>/dev/null
+}
+_run_envcheck() {
+  ( cd "$PKG" && "${BASH_OK:-bash}" "$_here/ps-run.sh" "$PKG/qa/deploy-probes/vm-env-check.ps1" > "$LOGD/env-check.log" 2>&1 )
+}
+ERC=0; _run_envcheck || ERC=$?
+RETRY=0
+if [ "$ERC" -ne 0 ] || ! _envcheck_ok; then
+  TRANSIENT=0
+  case "$ERC" in 124|111|255) TRANSIENT=1;; esac
+  grep -q 'vmssh: ssh2 传输层失败' "$LOGD/env-check.log" 2>/dev/null && TRANSIENT=1
+  if [ "$TRANSIENT" = "1" ] \
+     && grep -q "NODE_OK=true" "$LOGD/env-check.log" 2>/dev/null \
+     && grep -q "CLI_OK=true" "$LOGD/env-check.log" 2>/dev/null; then
+    cp -f "$LOGD/env-check.log" "$LOGD/env-check.attempt1.log" 2>/dev/null || true
+    echo "[C3.0] TRANSIENT_TRUNCATION rc=$ERC NODE_OK/CLI_OK 在场 → 确定性幂等复跑 1 次（勿重跑整链）"
+    RETRY=1; ERC2=0; _run_envcheck || ERC2=$?; ERC=$ERC2
+    _OKNOW=0; _envcheck_ok && _OKNOW=1
+    echo "[C3.0] RETRY=$RETRY rc=$ERC envcheck_ok=$_OKNOW"
+  fi
+fi
 grep -E "ENV_PRECHECK|BLOCKERS|NODE_OK|CLI_OK" "$LOGD/env-check.log" | head -5; _step_log env-check "$LOGD/env-check.log"
-if [ $ERC -ne 0 ] || ! grep -q "ENV_PRECHECK" "$LOGD/env-check.log" 2>/dev/null; then
-  STEP end C3 3.0 "$([ $ERC -ne 0 ] && echo $ERC || echo 1)" FAIL "env-check rc=$ERC/无 ENV_PRECHECK 行" "照 troubleshooting P-2 处置（BLOCKERS≠none 或通道失败=先修通道重跑）"
+if [ "$ERC" -ne 0 ] || ! _envcheck_ok; then
+  STEP end C3 3.0 "$([ $ERC -ne 0 ] && echo $ERC || echo 1)" FAIL "env-check rc=$ERC/ENV_PRECHECK 未达标 retry=$RETRY" "照 troubleshooting P-2 处置（BLOCKERS≠none 或通道失败=ACTION=deploy bash scripts/run-flow.sh 定点重跑；绝不重启 VM）"
   _fail_note "C3/3.0-env-check"
 else
-  STEP end C3 3.0 0 PASS "见日志（BLOCKERS≠none 时照 troubleshooting P-2 处置）" "none"
+  STEP end C3 3.0 0 PASS "ENV_PRECHECK=PASS BLOCKERS=none retry=$RETRY" "none"
 fi
 
 STEP begin C3 3.2 "prepare-vm --ensure-node + setup --apply --skip-build"

@@ -82,25 +82,55 @@ STEP begin U1 1 "PART 1/3 - host removal"
 # uninstall.mjs is two-end. With no VM target resolvable it SKIPS the VM phase
 # (counting 1 expected failure) while still executing every host cleanup step.
 # Hide vm-conn.json temporarily and unset the env chain so resolveVmTarget()=null.
+# F-18 (e2e3): uninstall.mjs resolveVmTarget has a FOURTH fallback = package
+# .env (VM_HOST/VM_USER). Hiding only vm-conn.json + unsetting the env chain
+# still let PART 1 run its OWN full VM phase (duplicate work with PART 2, and
+# a dead channel would hang this phase). Hide .env too, with a trap that
+# restores it on ANY exit path so deploy C3.2 keeps its credential re-injection.
+ENV_HIDDEN=""
+if [ -n "$PKG" ] && [ -f "$PKG/.env" ]; then
+  ENV_HIDDEN="$PKG/.env.host-phase-hidden"
+  "$NODE" -e 'require("fs").renameSync(process.argv[1],process.argv[2])' "$PKG/.env" "$ENV_HIDDEN" 2>/dev/null \
+    || mv -f "$PKG/.env" "$ENV_HIDDEN" || true
+fi
+restore_env() {
+  if [ -n "$ENV_HIDDEN" ] && [ -f "$ENV_HIDDEN" ]; then
+    "$NODE" -e 'require("fs").renameSync(process.argv[1],process.argv[2])' "$ENV_HIDDEN" "${ENV_HIDDEN%.host-phase-hidden}" 2>/dev/null \
+      || mv -f "$ENV_HIDDEN" "${ENV_HIDDEN%.host-phase-hidden}" || true
+  fi
+  return 0
+}
+trap restore_env EXIT
 if [ -f "$VMC" ]; then
   "$NODE" -e 'require("fs").renameSync(process.argv[1],process.argv[2])' "$VMC" "$VMC.host-phase-hidden" 2>/dev/null \
     || mv -f "$VMC" "$VMC.host-phase-hidden" || true
 fi
 if [ -n "$PKG" ]; then
-  ( cd "$PKG" && unset WINVM_VM_HOST WINVM_VM_USER && "$NODE" delivery/uninstall.mjs --apply > "$LOGD/apply-host.log" 2>&1 ); HRC=$?
+  # F-18: outer timeout so the HOST phase can never hang on a dead channel.
+  ( cd "$PKG" && unset WINVM_VM_HOST WINVM_VM_USER WINVM_VM_SSH_PORT \
+      && timeout 180 "$NODE" delivery/uninstall.mjs --apply > "$LOGD/apply-host.log" 2>&1 ); HRC=$?
 else
   HRC=1; echo "[HOST] no package root: skipping uninstall.mjs (nothing installed locally?)" | tee "$LOGD/apply-host.log"
 fi
-HOST_PASS="$(grep -c '\[PASS\] HOST' "$LOGD/apply-host.log" 2>/dev/null || echo 0)"
-HOST_FAIL="$(grep -c '\[FAIL\] HOST' "$LOGD/apply-host.log" 2>/dev/null || echo 0)"
-echo "HOST_PASS=$HOST_PASS HOST_FAIL=$HOST_FAIL uninstall_rc=$HRC (rc=1 expected: VM phase skipped on purpose)"
-grep -E '\[FAIL\] HOST|APPLY' "$LOGD/apply-host.log" | head -6 || true
+# F-17 (e2e3 baseline false-red): `grep -c ... || echo 0` prints 0 AND returns
+# rc=1 on zero matches -> the fallback appends a SECOND 0 => $'0\n0', so
+# HOST_FAIL != "0" was always true and U1 failed at 162s with [PASS]=11/[FAIL]=0.
+# awk emits exactly one integer and always returns 0.
+HOST_PASS="$(awk '/\[PASS\] HOST/{n++} END{print n+0}' "$LOGD/apply-host.log" 2>/dev/null)"; : "${HOST_PASS:=0}"
+HOST_FAIL="$(awk '/\[FAIL\] HOST/{n++} END{print n+0}' "$LOGD/apply-host.log" 2>/dev/null)"; : "${HOST_FAIL:=0}"
+HOST_VRF="$(awk '/POST-CLEANUP VERIFICATION CHECKLIST/{n++} END{print n+0}' "$LOGD/apply-host.log" 2>/dev/null)"; : "${HOST_VRF:=0}"
+VM_PHASE="$(awk '/^--- VM: .* generated .ps1 pushed via scp/{n++} END{print n+0}' "$LOGD/apply-host.log" 2>/dev/null)"; : "${VM_PHASE:=0}"
+echo "HOST_PASS=$HOST_PASS HOST_FAIL=$HOST_FAIL HOST_VRF=$HOST_VRF VM_PHASE_IN_HOST=$VM_PHASE uninstall_rc=$HRC (rc=1 expected: VM phase skipped on purpose)"
+grep -E '\[FAIL\] HOST|APPLY|vm target' "$LOGD/apply-host.log" | head -8 || true
 STEP log apply-host < "$LOGD/apply-host.log" >/dev/null
 [ -f "$VMC.host-phase-hidden" ] && "$NODE" -e 'require("fs").unlinkSync(process.argv[1])' "$VMC.host-phase-hidden" 2>/dev/null || true
-if [ "$HOST_FAIL" != "0" ] || [ "$HOST_PASS" -lt 11 ]; then
-  STEP end U1 1 1 FAIL "HOST_PASS=$HOST_PASS HOST_FAIL=$HOST_FAIL" "check $LOGD/apply-host.log"; note "U1/host"
+restore_env; trap - EXIT
+# Judge on HOST verification rows ONLY. With a genuinely host-only phase the
+# overall rc is 1 by design (VM phase skipped -> failures++ -> no APPLY complete).
+if [ "$HOST_FAIL" != "0" ] || [ "$HOST_PASS" -lt 11 ] || [ "$HOST_VRF" -lt 1 ] || [ "$VM_PHASE" != "0" ]; then
+  STEP end U1 1 1 FAIL "HOST_PASS=$HOST_PASS HOST_FAIL=$HOST_FAIL VRF=$HOST_VRF VM_PHASE=$VM_PHASE" "check $LOGD/apply-host.log; VM_PHASE!=0 表示 .env 未屏蔽干净(F-18)"; note "U1/host"
 else
-  STEP end U1 1 0 PASS "HOST_PASS=$HOST_PASS (VM phase intentionally skipped)" "none"
+  STEP end U1 1 0 PASS "HOST_PASS=$HOST_PASS HOST_FAIL=0 host-only verified (VM phase skipped)" "none"
 fi
 
 STEP begin U2 2 "PART 2/3 - VM removal"

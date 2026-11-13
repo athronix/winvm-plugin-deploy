@@ -35,7 +35,11 @@ vmscp "$PS_LOCAL" "${VM_USER}@${VM_HOST}:${base}" >/dev/null 2>&1 || { echo "VMS
 _tmp="$(mktemp)"
 _ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}" > "$_tmp" 2>&1; rc=$?
 # 清理远端临时件走 EncodedCommand（Remove-Item 含 -LiteralPath，避免壳吞参）
-_enc="$("$NODE" -e 'process.stdout.write(Buffer.from(`Remove-Item -LiteralPath "${base}" -Force -ErrorAction SilentlyContinue`,"utf16le").toString("base64"))')"
+# F-19 (E2E3): the old JS template literal referenced an undefined `base`
+# (it is a BASH var, never a JS var) -> ReferenceError on EVERY remote PS call,
+# an empty EncodedCommand, a leaked temp .ps1 and one wasted ssh2 round trip.
+# Pass the filename via process.argv: zero shell/JS interpolation surface.
+_enc="$("$NODE" -e 'process.stdout.write(Buffer.from("Remove-Item -LiteralPath \"" + process.argv[1] + "\" -Force -ErrorAction SilentlyContinue","utf16le").toString("base64"))' "$base")"
 _ps_cmd "powershell -NoProfile -NonInteractive -EncodedCommand ${_enc}" >/dev/null 2>&1 || true
 [ -n "$OUT" ] && cat "$_tmp" > "$OUT"
 cat "$_tmp"; rm -f "$_tmp" 2>/dev/null || "$NODE" -e 'require("fs").unlinkSync(process.argv[1])' "$_tmp" 2>/dev/null

@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
-description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端安装/卸载/复验的唯一执行权威。v1.6.0 起 SSH 免密通道生命周期能力**内置**（独立技能 hos-winvm-ssh-tunnel v2.3.0 的 SKILL.md 全文 + 6 脚本 + 5 参考文档已整体并入，部署只需安装本技能一个，无需再装第二个 skill）+ 三流程职责定界：卸载=host 端+vm 端+ssh 通道三段且通道坏时绝不重建（VM 侧两件合并成一个用户脚本）；部署=通道保障（在则不建，不在才引导内置一键脚本让用户配合）+两端自动部署；verify=deploy ready 后由 WorkBuddy 自调的健康与功能性监测。封装 roundtrip.sh 一键往返模板、channel.sh 通道单一动作、VM 侧本地卸载 ps1 与合并包、ssh2 后端、远端 PowerShell 铁律执行器、分步计时与问题百科。Use when: 部署/重装/卸载 winvm-plugin；按技能 URL 安装/卸载/验证；VM ssh 连不上、通道已毁、发布包下载失败、安装前置体检、插件健康复验；需要构建/验证/拆除 VM 免密 SSH 通道。"
-version: 1.6.0
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端安装/卸载/复验的唯一执行权威；v1.7.0 起提供一次执行的统一入口 run-flow.sh + 环境事实前置冻结 context.sh + 动作级日志/过程执行环节信息表（默认前台只打最终表）。v1.6.0 起 SSH 免密通道生命周期能力**内置**（独立技能 hos-winvm-ssh-tunnel v2.3.0 的 SKILL.md 全文 + 6 脚本 + 5 参考文档已整体并入，部署只需安装本技能一个，无需再装第二个 skill）+ 三流程职责定界：卸载=host 端+vm 端+ssh 通道三段且通道坏时绝不重建（VM 侧两件合并成一个用户脚本）；部署=通道保障（在则不建，不在才引导内置一键脚本让用户配合）+两端自动部署；verify=deploy ready 后由 WorkBuddy 自调的健康与功能性监测。封装 roundtrip.sh 一键往返模板、channel.sh 通道单一动作、VM 侧本地卸载 ps1 与合并包、ssh2 后端、远端 PowerShell 铁律执行器、分步计时与问题百科。Use when: 部署/重装/卸载 winvm-plugin；按技能 URL 安装/卸载/验证；VM ssh 连不上、通道已毁、发布包下载失败、安装前置体检、插件健康复验；需要构建/验证/拆除 VM 免密 SSH 通道。"
+version: 1.7.0
 agent_created: true
 ---
 
@@ -16,6 +16,25 @@ agent_created: true
 | **undeploy** | **只判状态，绝不重建**；通道坏是正常输入 | WorkBuddy 本地卸载（无需通道） | 通道在→WorkBuddy 自己卸；通道不在→**与通道卸载合并成一份 VM 侧脚本**交给用户 | 仅通道坏时：用户在 VM 管理员 PowerShell 执行 `RUN-ME.ps1` 一次 |
 | **deploy** | **在则不建**；不在才按内置一键脚本让用户配合建立 | WorkBuddy 经通道部署 | WorkBuddy 经通道部署 | 仅从零建通道：用户 VM 粘贴一次 |
 | **verify** | 只用现役通道，不建不修 | — | — | **无**，deploy ready 后由 WorkBuddy 自己调用 `verify.sh` |
+
+## 一次执行统一入口（v1.7.0 · 用户 2026-11-13 裁定 · 默认首选）
+
+**默认就用这一条命令**，连续动作全部合并进一个脚本，同一环境（鸿蒙 WB 沙箱）、同一执行主体（WorkBuddy 命令调用），链内无需用户或 LLM 决策：
+
+```bash
+VM_HOST=172.16.100.2 bash scripts/run-flow.sh            # 卸载 → 安装 → 验证，一次调用
+VM_HOST=... ACTION=deploy  bash scripts/run-flow.sh      # 失败时定点重跑单过程
+VM_HOST=... ACTION=verify VERBOSE=1 bash scripts/run-flow.sh   # 测试：前台输出中间信息
+VM_HOST=... REGISTRY_FIX=1 bash scripts/run-flow.sh      # 同时修复同名 skill 重复注册
+```
+
+- **动态参数前置冻结**：`context.sh collect` 一次性解析 `VM_HOST` / `VM_USER` / `VM_SSH_PORT` / `WINVM_VM_KEY`（三级链）/ `NODE` / `PY` / `BASH_OK` / `DEPLOY_ROOT` / `RELEASE_TAG` / `PROBE_FRESH_BUDGET_S` / `SKILL_VERSION`，落 `~/wbtmp/vmdeploy-context.env` 后作为**参数植入**每个下游动作；`vm-conn.json` 被卸载删除时自动从 `.roundtrip` 快照恢复（已卸态自举）。`PKG_ROOT` 刻意不导出，由 R1 现解最新发布包，避免冻结旧包根。**密钥实测择优（F-22）**：`WINVM_VM_KEY` 不是无条件采信 `vm-conn.json.identityFile`（部署端默认探测可能写成未授权的 `id_ed25519`），而是对候选钥逐一做 1 发 ssh2 ping 新建连接实测，冻结第一个 READY；context.env 记 `VM_KEY_PROBE=READY|ALL_FAILED`。双钥 rc 对照是区分「密钥漂移」与「真灭窗」的唯一判据。
+- **全分支确定性路由**：`scripts/action-catalog.tsv` 是机器可读决策底座——每个基本维护动作都有确切命令、执行主体、环境、成功/失败下一步（**是具体命令而非开放指令**）、可合并性；`run-flow.sh` 末段对 `NEED_USER_ACTION=1` / `ENV_WINDOW=1` / `channel-unstable` / 链失败给出确定的下一条命令，agent 不需要自行发挥。
+- **日志分流（用户裁定）**：中间详细信息（`console.log` / `steps.tsv` / `actions.tsv` / `logs/*.log` / `states/*` 前后状态 / 错误摘录 / 前后全量快照）**全部写入 `VMDEPLOY_RUN_DIR`**；前台**只打印最终「过程执行环节信息列表」**。`VERBOSE=1` 时额外输出中间信息（测试过程使用）。
+- **动作级留痕**：`step.sh` 在每个 `begin/end` 自动采集前后轻量状态、耗时、rc、判据、错误摘录，并从 catalog 补齐命令/主体/环境/下一分支/可合并性；`action-report.sh` 汇总成 `process-actions.md`（含四元组失败分析与合并效率分析）。`steps.tsv` 旧格式保持不变，分步 driver 可继续单独用。
+- **C3.0 硬门禁三修（v1.7.0 · E2E3 实证 F-19/F-20/F-21）**：判据=`ENV_PRECHECK=PASS` **且** `BLOCKERS=none`（旧 `grep -q ENV_PRECHECK` 连 FAIL 也命中=假绿）；仅当 rc∈{124,111,255} 或日志含 `vmssh: ssh2 传输层失败`、且 `NODE_OK=true`/`CLI_OK=true` 在场（探测主体已跑通、只是尾部传输被截断）才触发**一次有界幂等复跑**，首试日志留 `env-check.attempt1.log`，达标即 PASS 且不拖垮 R4；`ps-run.sh` 远端清理 EncodedCommand 改 `process.argv[1]` 零插值。配置性失败绝不吞，按 P-2 处置、**绝不重启 VM**。四用例行为守卫见 `references/troubleshooting.md` B 表。
+
+**版本史**：v1.7.0=统一入口 + 参数前置冻结 + 动作级日志/环节表 + 全分支决策表 + F-17/F-18 修复 + skill 注册漂移自证；v1.7.0 补丁轮=E2E3 实证 F-19/F-20/F-21 三修（清理串零插值 / C3.0 有界幂等复跑 / 判据收紧）+ 四用例行为守卫 ALL_GREEN；F-22 第二轮实证（密钥实测择优，杜绝把密钥漂移误报成环境灭窗）；F-23/F-24/F-25 第三轮实证（动作级观测链：`step.sh log` 记 epoch→名索引，`end` 按本动作时间窗解析真实驱动日志，修复 log_path/error_excerpt 恒为 `-`；错误摘录空结果归一化为 `-`（管道退出码坑）；沙箱 `getcwd/chdir` 噪声白名单，避免 PASS 行被伪错误污染）。**E2E3 真机全绿**：`ACTION=full UNDEPLOY=PASS DEPLOY=PASS VERIFY=PASS VERDICT=YES` 994s/23 动作 0 失败。
 
 **卸载 = 恰好三段，顺序不可换**：① host 端 ② vm 端 ③ ssh 通道。②③ 可合并。
 - 通道**在**：② 由 WorkBuddy 经 ssh2 完成；③ 把内置 `-Rollback` 设为 **VM 侧 SYSTEM post 动作**（`WbTunnelRollback` 计划任务），让 VM Windows 在本会话断开后自己执行——避免拆 sshd 时自断通道。
@@ -47,6 +66,9 @@ agent_created: true
 8. **密码只走环境变量**（askpass / `WINVM_VM_PASSWORD`），不落盘不进命令行。
 9. **通道拆除恒为 VM 侧 post 动作**（SYSTEM 计划任务），或合并进用户 bundle；不在宿主侧同步拆 sshd。
 10. **每步判据不过=停**，按四元组（现象/根因/证据/处置）记录并查表，不跳步硬推。
+11. **计数判据禁用 `grep -c ... || echo 0`**：零匹配时 grep 输出 `0` 且 rc=1，兜底会追加第二个 `0` ⇒ `$'0\n0'` ⇒ 字符串比较恒真 ⇒ 假红（E2E3 baseline U1 在 162s 掐断整链实证）。一律 `awk '/<pat>/{n++} END{print n+0}'` + `: "${VAR:=0}"`。
+12. **U1 host 相位必须屏蔽全部四级 VM 目标源**：`vm-conn.json`、env 链、`WINVM_VM_HOST/USER`、以及**包根 `.env`**（`uninstall.mjs resolveVmTarget` 有第四级回退）。否则 U1 会偷偷跑完整 VM 卸载、与 U2 重复，且通道坏时挂死；用 trap 保证 `.env` 任何退出路径都恢复。
+13. **skill 版本自证**：`context.sh collect` 检测同名 skill 重复注册（`.skill-list-cache.json` 命中数 >1 = 加载了旧版指引）；`REGISTRY_FIX=1` 隔离重复项并使缓存失效。**不要用旧备份目录里的 SKILL.md 当判据**。
 
 ## 卸载主流程（三段，v1.5.0）
 
@@ -135,6 +157,9 @@ bash scripts/step.sh report           # 计时汇总
 | 现象 | 根因 | 处置 |
 |---|---|---|
 | 卸载时通道不通 | 正常输入，不是故障 | 不重建；HOST 本地卸 + VM 合并包给用户 |
+| `HOST_FAIL=0 0` / U1 假 FAIL（实际 `[PASS] HOST=11`） | `grep -c ... \|\| echo 0` 双 0（F-17） | 已修：awk 单值计数；`ACTION=undeploy bash scripts/run-flow.sh` 定点重跑 |
+| U1 出现 `--- VM: ... pushed via scp` / 卸载耗时翻倍 | 包根 `.env` 泄漏 VM 目标（F-18） | 已修：U1 临时移走 `.env` + trap 恢复；判据新增 `VM_PHASE=0` |
+| Skill 工具加载出旧版 SKILL.md（如 v1.2.2） | 同名 skill 重复注册命中旧备份 | `bash scripts/context.sh collect --fix-registry`（或 `REGISTRY_FIX=1 bash scripts/run-flow.sh`）；重启会话触发重扫 |
 | ssh 无输出无限挂起 | VM sshd 连接位占满 | 外层 timeout（已内建）；灭窗用 ssh2 |
 | 远端 PS ParserError / `$_` 变怪值 | 本地或远端壳吞改写 | 只走 `ps-run.sh` |
 | `ensure-node` rc=0 但 node 仍缺 | 远端长任务超 ssh2 exec 300s 窗 | 按 B 表补跑解压段；delivery 异步化在册 |
@@ -154,6 +179,11 @@ bash scripts/step.sh report           # 计时汇总
 | `vm-conn.sh` / `ssh2-conn.mjs` / `ps-run.sh` | 双通道+ssh2 后端、后端实体、远端 PS 铁律执行器 |
 | `preflight.sh` / `wait-channel.sh` / `probe-fresh.sh` / `step.sh` | 体检、判稳器（gate）、探针新鲜四防线、计时留痕 |
 | `self-rescue.sh` / `env.example` | 能力通道自救（restart-guest 禁用）、`.env` 模板 |
+| **`run-flow.sh`**（v1.7.0 首选） | 一次执行统一入口：环境事实冻结 → 卸载 → 安装 → 验证 → 环节表；前台只打最终表，`VERBOSE=1` 出中间信息 |
+| **`context.sh`** | 动态参数一次性采集冻结 + 前后状态快照（light/full）+ skill 版本自证与注册漂移修复 |
+| **`action-catalog.tsv`** | 全分支决策底座：每个基本维护动作的命令/主体/环境/前置/成功下一步/失败下一步/可合并性 |
+| **`action-report.sh`** | 由 `actions.tsv` 生成「过程执行环节信息列表」Markdown（含前后状态差异、耗时、rc、错误摘录、四元组、合并分析） |
+| `step.sh`（v1.7.0 增强） | 原有计时不变；新增动作级 `actions.tsv` + `states/*-pre/post.txt` + catalog 元数据补齐 |
 | **内置通道组（v1.6.0）** `host-generate-key.sh` / `winvm-setup-sshd-and-key.ps1` / `verify-tunnel.sh` / `destroy-tunnel.sh` / `host-rollback.sh` / `vm-diag.ps1` | 免密通道创建 / VM 侧 build·`-Rollback`·`-Continue` / 四段验收 / 精确拆除 / 宿主回滚 / 只读体检（原 `hos-winvm-ssh-tunnel` v2.3.0；脚本内 `SKILLDIR` 自定位到本技能根） |
 
 ## references（按需加载）
