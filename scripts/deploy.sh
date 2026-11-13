@@ -72,7 +72,7 @@ if [ $CRC -eq 2 ]; then
   STEP report; exit 2
 fi
 if [ $CRC -ne 0 ]; then
-  STEP end C1 1.5 $CRC FAIL "channel ensure rc=$CRC" "检查 hos-winvm-ssh-tunnel skill 是否安装（SKILL.md「SSH 免密通道生命周期」章入口）"
+  STEP end C1 1.5 $CRC FAIL "channel ensure rc=$CRC" "检查内置通道脚本是否在场（winvm-plugin-deploy v1.6.0+ 已并入 hos-winvm-ssh-tunnel；见 SKILL.md「SSH 免密通道生命周期」）"
   exit 1
 fi
 STEP end C1 1.5 0 PASS "channel=${VM_CHANNEL:-key} 复用现役通道，未重建" "none"

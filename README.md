@@ -3,8 +3,8 @@
 WinVM Bridge（[workbuddy-virtual-win-plugin](https://github.com/athronix/workbuddy-virtual-win-plugin)）鸿蒙宿主 ⇄ Windows VM **双端一键安装 / 拆除 / 复验**专用技能（athronix skill 矩阵成员，canonical 独立仓）。
 
 - 技能主体：`SKILL.md`（frontmatter 触发元数据 + 主流程/子流程编排 + 铁律）
-- `scripts/` — 可执行 driver：`roundtrip.sh`（一键往返模板，动态参数仅 VM_HOST/VM_USER/ACTION/tag）、`deploy.sh`/`undeploy.sh`/`verify.sh` 三流程、`channel.sh`（通道单一动作 status/ensure/confirm/post）、`vm-remove-local.ps1` + `build-vm-bundle.sh`（通道坏时 VM 侧合并包）、download-verify、preflight、env-detect、ssh2 通道后端、计时 step 等
-- `references/` — `troubleshooting.md` 问题百科（现象→根因→解法，30+ 实战条目）与 `known-good-flow.md` 耗时基线带
+- `scripts/` — 可执行 driver：`roundtrip.sh`（一键往返模板，动态参数仅 VM_HOST/VM_USER/ACTION/tag）、`deploy.sh`/`undeploy.sh`/`verify.sh` 三流程、`channel.sh`（通道单一动作 status/ensure/confirm/post）、`vm-remove-local.ps1` + `build-vm-bundle.sh`（通道坏时 VM 侧合并包）、download-verify、preflight、env-detect、ssh2 通道后端、计时 step 等；**v1.6.0 起另含内置通道组** `host-generate-key.sh` / `winvm-setup-sshd-and-key.ps1` / `verify-tunnel.sh` / `destroy-tunnel.sh` / `host-rollback.sh` / `vm-diag.ps1`（并入自 `hos-winvm-ssh-tunnel` v2.3.0）
+- `references/` — `troubleshooting.md` 问题百科（现象→根因→解法，30+ 实战条目）、`known-good-flow.md` 耗时基线带，以及 **v1.6.0 并入的通道生命周期六件套** `hos-winvm-ssh-tunnel.md`（原独立技能 `SKILL.md` 全文）+ `hos-operations.md` / `hos-rollback-contract.md` / `hos-verification.md` / `hos-pitfalls.md` / `hos-troubleshooting.md`
 
 ## 消费方式（任意 AI Agent）
 
@@ -20,4 +20,4 @@ WinVM Bridge（[workbuddy-virtual-win-plugin](https://github.com/athronix/workbu
 
 ## 版本纪律
 
-frontmatter `version` 为唯一版本源（SemVer：文案 PATCH / 兼容能力 MINOR / 破坏结构 MAJOR）；发布走 skill-dev-git 通道（package → tag `v*` → GitHub Release asset → 双聚合仓同步）。**当前 v1.5.0**：三流程职责定界（卸载三段且通道坏绝不重建 / 部署通道在则不建 / verify 仅 deploy ready 后自调）+ `channel.sh` 通道单一动作 + VM 侧合并包 + F-02/03/05/07/09 缺陷修复。历史：v1.4.3 E2E2 整改 · v1.4.2 E2E1 整改 · v1.4.1 旧 .prompt 退役 · v1.3.0 roundtrip 模板+探针新鲜复用。
+frontmatter `version` 为唯一版本源（SemVer：文案 PATCH / 兼容能力 MINOR / 破坏结构 MAJOR）；发布走 skill-dev-git 通道（package → tag `v*` → GitHub Release asset → 双聚合仓同步）。**当前 v1.6.0**：SSH 免密通道生命周期**内置**——独立技能 `hos-winvm-ssh-tunnel` v2.3.0 的 `SKILL.md` 全文与 6 脚本 + 5 参考文档整体并入，`HOS` 默认指向本技能根，**部署只需装本技能一个**；三流程职责定界与判据不变。历史：v1.5.0 三流程职责定界（卸载三段且通道坏绝不重建 / 部署通道在则不建 / verify 仅 deploy ready 后自调）+ `channel.sh` 通道单一动作 + VM 侧合并包 + F-02/03/05/07/09 缺陷修复 · v1.4.3 E2E2 整改 · v1.4.2 E2E1 整改 · v1.4.1 旧 .prompt 退役 · v1.3.0 roundtrip 模板+探针新鲜复用。

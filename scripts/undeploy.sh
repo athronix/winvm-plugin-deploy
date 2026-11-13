@@ -5,7 +5,7 @@
 #   1) HOST  - WorkBuddy removes its own plugin/cache/mcp/tunnel locally.
 #   2) VM    - remove WinVMBridge; done by WorkBuddy if a channel exists,
 #              otherwise merged into ONE user bundle (no channel rebuild).
-#   3) SSH   - teardown the passwordless tunnel via hos -Rollback, scheduled as
+#   3) SSH   - teardown the passwordless tunnel via the built-in -Rollback, scheduled as
 #              a VM-side SYSTEM POST ACTION when a channel exists (so the VM
 #              finishes it after this ssh session dies), merged into the same
 #              bundle when the channel is down.
@@ -45,7 +45,11 @@ fi
 NODE="${NODE:?run env-detect.sh first}"
 LOGD="${VMDEPLOY_LOG_DIR:-${VMDEPLOY_RUN_DIR:-$HOME/wbtmp/vmdeploy-undeploy-$(date +%Y%m%d)}}"; mkdir -p "$LOGD"
 VMC="$HOME/.workbuddy/winvm/vm-conn.json"
-HOS="${HOS_TUNNEL_SKILL:-$HOME/.workbuddy/skills/hos-winvm-ssh-tunnel}"
+# v1.6.0: the tunnel lifecycle is INTERNAL (hos-winvm-ssh-tunnel v2.3.0
+# merged into this skill). HOS_TUNNEL_SKILL stays a backward-compatible
+# override pointing at a standalone skill root; default = THIS skill root,
+# so every "$HOS/scripts/..." resolves to our own scripts/ directory.
+HOS="${HOS_TUNNEL_SKILL:-$(dirname "$_here")}"
 
 echo "==== undeploy v1.5.0 / three-part plan ===="
 echo "  1 HOST  : local, no channel needed"
@@ -66,7 +70,7 @@ fi
 
 if [ $APPLY -eq 0 ]; then
   echo "DRY-RUN: no changes. Review the three parts above, then add --apply."
-  echo "  CH_UP=1  => WorkBuddy removes VM side + schedules hos -Rollback as a VM SYSTEM post action."
+  echo "  CH_UP=1  => WorkBuddy removes VM side + schedules the built-in -Rollback as a VM SYSTEM post action."
   echo "  CH_UP=0  => WorkBuddy removes HOST only; build-vm-bundle.sh emits ONE directory for the user"
   echo "              (vm-remove-local.ps1 + wb-rollback.ps1 + RUN-ME.ps1). No channel is rebuilt."
   STEP report; exit 0

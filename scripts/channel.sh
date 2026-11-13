@@ -5,11 +5,11 @@
 #             Exit 0=channel up / 1=channel down. Two NEW connections max
 #             (1 ssh2 ping + 1 binary); NEVER vm_channel_probe()'s five-try
 #             fallback (>2min on a dead channel = undeploy's normal input).
-#   ensure  : DEPLOY only - channel up => do nothing; down => emit hos one-click PS
+#   ensure  : DEPLOY only - channel up => do nothing; down => emit the built-in one-click PS
 #             for the user's single manual paste, then stop with rc=2.
-#   confirm : called by WorkBuddy after the user pasted; hos four-stage verify +
+#   confirm : called by WorkBuddy after the user pasted; built-in four-stage verify +
 #             ssh2 ping as the authoritative verdict (binary failure != no channel).
-#   post    : UNDEPLOY only - schedule hos -Rollback as a VM-side SYSTEM task so the
+#   post    : UNDEPLOY only - schedule the built-in -Rollback as a VM-side SYSTEM task so the
 #             VM executes the tunnel teardown itself AFTER the ssh session dies.
 #
 # Hard rule: undeploy NEVER calls ensure / host-generate-key / rebuild. A broken
@@ -27,7 +27,11 @@ export VM_SSH_BACKEND="${VM_SSH_BACKEND:-ssh2}"
 # variable is NOT visible to the node child. Export the whole connection contract
 # once, here, so status/ensure/confirm/post and ps-run.sh all agree on one key.
 export VM_HOST VM_USER VM_SSH_PORT WINVM_VM_KEY VM_CHANNEL VM_SSH_BACKEND
-HOS="${HOS_TUNNEL_SKILL:-$HOME/.workbuddy/skills/hos-winvm-ssh-tunnel}"
+# v1.6.0: the tunnel lifecycle is INTERNAL (hos-winvm-ssh-tunnel v2.3.0
+# merged into this skill). HOS_TUNNEL_SKILL stays a backward-compatible
+# override pointing at a standalone skill root; default = THIS skill root,
+# so every "$HOS/scripts/..." resolves to our own scripts/ directory.
+HOS="${HOS_TUNNEL_SKILL:-$(dirname "$_here")}"
 OUTD="${VMDEPLOY_RUN_DIR:-$HOME/wbtmp}"; mkdir -p "$OUTD"
 ACT="${1:-status}"
 
@@ -69,11 +73,11 @@ case "$ACT" in
       exit 0
     fi
     [ -f "$HOS/scripts/host-generate-key.sh" ] || {
-      echo "NO_HOS_SKILL: $HOS not installed. See SKILL.md 'SSH 免密通道生命周期' for the INSTALL_PROMPT.md entry." >&2
+      echo "NO_TUNNEL_SCRIPTS: $HOS/scripts/host-generate-key.sh missing from this skill package - reinstall winvm-plugin-deploy v1.6.0+." >&2
       exit 3
     }
     # host-generate-key.sh arg1 = key path. Reuse WINVM_VM_KEY so the three-level
-    # chain (env > vm-conn.json > default) and the hos key never diverge.
+    # chain (env > vm-conn.json > default) and the built-in key never diverge.
     sh "$HOS/scripts/host-generate-key.sh" "$WINVM_VM_KEY" "$VM_USER" "$VM_SSH_PORT" "$VM_HOST" \
       > "$OUTD/host-generate-key.txt" 2>&1
     echo "NEED_USER_ACTION=1"
@@ -100,7 +104,7 @@ case "$ACT" in
     TPL="$HOS/scripts/winvm-setup-sshd-and-key.ps1"
     RB="$OUTD/wb-rollback.ps1"
     [ -f "$TPL" ] || {
-      echo "NO_HOS_TEMPLATE: $TPL missing; fall back to build-vm-bundle.sh (VM-side merged bundle)" >&2
+      echo "NO_ROLLBACK_TEMPLATE: $TPL missing from this skill; fall back to build-vm-bundle.sh (VM-side merged bundle)" >&2
       exit 3
     }
     cp -f "$TPL" "$RB"
