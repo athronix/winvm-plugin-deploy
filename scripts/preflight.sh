@@ -66,4 +66,4 @@ fi
 echo "==== 结论 ===="
 if [ "$RED" -gt 0 ]; then echo "READINESS=RED（$RED 项硬阻塞）→ 先解决 RED 项或问用户，勿硬跑 setup"; 
 elif [ "$YELLOW" -gt 0 ]; then echo "READINESS=YELLOW（$YELLOW 项可自动补齐/有兜底）→ deploy Step 3 prepare-vm --ensure-node 处理，或按需审批";
-else echo "READINESS=GREEN → 可直接进 deploy.prompt Step 1→6 / scripts/deploy.sh"; fi
+else echo "READINESS=GREEN → 可直接进 scripts/deploy.sh（SKILL.md 安装主流程）"; fi

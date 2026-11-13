@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# winvm-plugin-deploy · 主部署 driver（对应 deploy.prompt Step 0→6）
+# winvm-plugin-deploy · 主部署 driver（对应 SKILL.md 安装主流程 C0→C6）
 # 用法：VM_HOST=<ip> [VM_USER=User] bash deploy.sh [--apply] [--pkg <PKG_ROOT>] [--tag V1.4.x]
 # 默认 DRY-RUN=只体检+出计划不写任何东西；--apply 才真执行。全程 step.sh 计时留痕，
 # 判据不过即停（打印后退出），绝不跳步硬推。
 set -u
 _here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 : "${VMDEPLOY_ENV_SH:=${HOME}/wbtmp/vmdeploy-env.sh}"; [ -f "$VMDEPLOY_ENV_SH" ] && . "$VMDEPLOY_ENV_SH"
+# v1.5.0 F-02：vm-conn.sh 默认后端是 key（原路径零冲击保留），但 deploy/undeploy/
+# verify/wait-channel 四个动词必须统一走 ssh2（鸿蒙沙箱 OpenSSH 认证段相位挂免疫）。
+# 必须在 source vm-conn.sh 之前 export，否则读到的是 key。
+export VM_SSH_BACKEND="${VM_SSH_BACKEND:-ssh2}"
 # shellcheck disable=SC1090
 . "$_here/vm-conn.sh"
 # shellcheck disable=SC1090
@@ -49,12 +53,29 @@ tail -12 "$LOGD/preflight.log"; _step_log preflight "$LOGD/preflight.log"
 grep -q "READINESS=RED" "$LOGD/preflight.log" && { STEP end P0 0 $PRC FAIL "READINESS=RED" "按 preflight 输出的修复指引处置后重跑；勿硬跑"; exit 1; }
 STEP end P0 0 0 PASS "GREEN/YELLOW" "none"
 
-[ $APPLY -eq 0 ] && { echo "DRY-RUN：体检通过，加 --apply 执行 通道→取包→prepare→setup→vmcheck→host→探针→交付 全链。"; STEP report; exit 0; }
+[ $APPLY -eq 0 ] && { echo "DRY-RUN：体检通过，加 --apply 执行 通道保障→取包→prepare→setup→vmcheck→host→探针→交付 全链。"; STEP report; exit 0; }
 
-# ── Step 1 通道 ──
-STEP begin C1 1.5 "免密/密码通道判定"
-vm_channel_probe || { STEP end C1 1.5 1 FAIL "无通道" "现象=both fail/证据=probe 输出/处置=外委 hos-winvm-ssh-tunnel skill 建通道（SKILL.md 通道生命周期章引用入口；兜底=deploy.prompt Step 1，密码仅 env 注入）"; exit 1; }
-STEP end C1 1.5 0 PASS "channel=${VM_CHANNEL}" "none"
+# ── v1.5.0 F-03：开跑即作废旧 stamp ──
+# 中途硬阻断（C3.2/C4.1 等 exit 1）或末尾半绿都绝不能留下可被 verify 复用的假绿标记。
+PROBE_STAMP="${VMDEPLOY_PROBE_STAMP:-$HOME/wbtmp/vmdeploy-probes-stamp.txt}"
+"$NODE" -e 'try{require("fs").unlinkSync(process.argv[1])}catch{}' "$PROBE_STAMP" 2>/dev/null || true
+
+# ── Step 1 通道保障（v1.5.0：deploy 是唯一有权「保障通道」的动词）──
+# 在则不建；不在才按 hos 的 host-generate-key.sh 输出一次用户粘贴脚本并停。
+# undeploy 永不进此分支（通道坏是它的正常输入），verify 也永不建/修通道。
+STEP begin C1 1.5 "通道保障（在则不建，不在才引导 hos 一键脚本）"
+bash "$_here/channel.sh" ensure > "$LOGD/channel-ensure.log" 2>&1; CRC=$?
+cat "$LOGD/channel-ensure.log"; _step_log channel-ensure "$LOGD/channel-ensure.log"
+if [ $CRC -eq 2 ]; then
+  STEP end C1 1.5 2 WAIT_USER "NEED_USER_ACTION=1（通道未建立；已输出 hos 一键脚本）" "用户在 VM 管理员 PowerShell 粘贴一次 → bash scripts/channel.sh confirm → 重跑 deploy.sh --apply；勿重启 VM"
+  echo "DEPLOY_NEED_USER_ACTION=1（未部署任何一端；后续两端部署将经该通道自动完成）"
+  STEP report; exit 2
+fi
+if [ $CRC -ne 0 ]; then
+  STEP end C1 1.5 $CRC FAIL "channel ensure rc=$CRC" "检查 hos-winvm-ssh-tunnel skill 是否安装（SKILL.md「SSH 免密通道生命周期」章入口）"
+  exit 1
+fi
+STEP end C1 1.5 0 PASS "channel=${VM_CHANNEL:-key} 复用现役通道，未重建" "none"
 
 # ── Step 2 取包/校验 ──
 STEP begin C2 2 "包根判定/取包三件套"
@@ -115,7 +136,7 @@ STEP begin C3 3.2 "prepare-vm --ensure-node + setup --apply --skip-build"
 tail -4 "$LOGD/prepare.log"; _step_log prepare-vm "$LOGD/prepare.log"
 # run17 D-3：prepare rc 旧仅展示在 PASS 判据里=吞没；现入聚合（不阻断：setup 成功可覆盖补齐面，人工对照 prepare.log）
 if [ $PRC2 -ne 0 ]; then _fail_note "C3/3.2-prepare(rc=$PRC2)"; fi
-# .env 就位（缺失→从样本生成骨架；字段核对仍按 deploy.prompt 3.1 人工过目）
+# .env 就位（缺失→从样本生成骨架；字段核对按 SKILL.md 安装主流程人工过目）
 [ -f "$PKG/.env" ] || cp "$PKG/delivery/env.example" "$PKG/.env" 2>/dev/null || echo "⚠ 无 .env 也无 env.example→按 prompt 3.1 手建"
 ( cd "$PKG" && "$NODE" delivery/setup.mjs --apply --skip-build > "$LOGD/setup.log" 2>&1 ); SRC=$?
 grep -E "部署全部完成|个步骤失败|降级 SKIP|凭据回注|VM_START_SWEEP" "$LOGD/setup.log" | head -6
@@ -170,21 +191,24 @@ STEP end C5 5 $PRC_ALL "$([ -z "$PROBLEMS" ] && echo PASS || echo FAIL)" "38 项
 [ -z "$PROBLEMS" ] || { echo "⚠ 探针失败:$PROBLEMS —— 按 troubleshooting 对应行处置（EXECUTION_TIMEOUT vs timed out 两形态勿混）"; }
 # v1.3.0 时间预算战役（run22 账本=装完立即 verify 会把同 3 探针冷跑第二遍，浪费 ~240s）：
 # C5 全过 ⇒ 落「探针新鲜 stamp」，verify.sh 在新鲜窗（PROBE_FRESH_BUDGET_S 默认 600s）且同包根时
-# 复用结果只跑终态矩阵。防假绿三防线=①时效窗②同 PKG ③VERIFY_FORCE_PROBE=1 可强制冷跑。
-PROBE_STAMP="${VMDEPLOY_PROBE_STAMP:-$HOME/wbtmp/vmdeploy-probes-stamp.txt}"
+# 复用结果只跑终态矩阵。防假绿四防线=①stamp.deploy_ok=1（全链零 FAIL）②时效窗③同 PKG ④VERIFY_FORCE_PROBE=1 强制冷跑。
+# v1.5.0 F-03：探针全过只写 deploy_ok=0；只有末尾全链零 FAIL 才升为 1。
+# probe-fresh.sh 第四防线读的就是这一行（旧格式 stamp 一律 REUSE=0）。
 if [ -z "$PROBLEMS" ]; then
   mkdir -p "$(dirname "$PROBE_STAMP")" 2>/dev/null || true
-  printf 'epoch=%s\npkg=%s\nrun=%s\n' "$(date +%s)" "$PKG" "${VMDEPLOY_RUN_DIR:-}" > "$PROBE_STAMP" 2>/dev/null || true
-  echo "[probe-stamp] 新鲜标记已落 $PROBE_STAMP（verify 600s 内同包根将复用 3 探针结果）"
+  printf 'epoch=%s\npkg=%s\nrun=%s\ndeploy_ok=0\n' "$(date +%s)" "$PKG" "${VMDEPLOY_RUN_DIR:-}" > "$PROBE_STAMP" 2>/dev/null || true
+  echo "[probe-stamp] 候选标记已落 $PROBE_STAMP（deploy_ok=0；全链零 FAIL 后升 1 才可被 verify 复用）"
+else
+  echo "[probe-stamp] 探针未全绿：不写标记（开跑时旧标记已作废）"
 fi
 
 # ── Step 6 交付 ──
 STEP begin C6 6.1 "skill 交付判据"
 SKCNT="$(ls "$HOME/.workbuddy/connectors/skills/connector-winvm/" 2>/dev/null | wc -l)"
 echo "connector-winvm skills=$SKCNT"
-# run17 D-3：计数判据入判定（旧=无条件 PASS）；≠8 记 FAIL 聚合出链（口径见 deploy.prompt Step 6）
+# run17 D-3：计数判据入判定（旧=无条件 PASS）；≠8 记 FAIL 聚合出链（口径见 SKILL.md 安装主流程 C6）
 if [ "$SKCNT" -lt 8 ]; then
-  STEP end C6 6.1 1 FAIL "skills=$SKCNT（期望≥8）" "skill 交付缺口：重跑 delivery/deploy-shared-skills.mjs 或对照 deploy.prompt Step 6"
+  STEP end C6 6.1 1 FAIL "skills=$SKCNT（期望≥8）" "skill 交付缺口：重跑 delivery/deploy-shared-skills.mjs 或对照 SKILL.md 安装主流程 C6"
   _fail_note "C6/6.1-skills"
 else
   STEP end C6 6.1 0 PASS "计数=$SKCNT" "none"
@@ -213,5 +237,10 @@ if [ -n "$FAILED_STEPS" ]; then
   echo "DEPLOY_APPLY_WITH_FAILURES:$FAILED_STEPS PKG_ROOT=$PKG"
   echo "⚠ steps.tsv 判定列含 FAIL（硬阻断段已过；失败段明细见上与 logs/），出链 rc=1"
   exit 1
+fi
+# v1.5.0 F-03：只有全链零 FAIL 才把候选标记升为 deploy_ok=1（verify 复用唯一合法来源）
+if [ -f "$PROBE_STAMP" ]; then
+  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];let s=fs.readFileSync(p,"utf8");s=s.replace(/^deploy_ok=.*$/m,"deploy_ok=1");if(!/^deploy_ok=/m.test(s))s+="deploy_ok=1\n";fs.writeFileSync(p,s)' "$PROBE_STAMP" 2>/dev/null || true
+  echo "[probe-stamp] deploy_ok=1（verify 仅在此全绿部署后可复用探针）"
 fi
 echo "DEPLOY_APPLY_DONE PKG_ROOT=$PKG"

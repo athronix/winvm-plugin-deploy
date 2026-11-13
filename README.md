@@ -3,7 +3,7 @@
 WinVM Bridge（[workbuddy-virtual-win-plugin](https://github.com/athronix/workbuddy-virtual-win-plugin)）鸿蒙宿主 ⇄ Windows VM **双端一键安装 / 拆除 / 复验**专用技能（athronix skill 矩阵成员，canonical 独立仓）。
 
 - 技能主体：`SKILL.md`（frontmatter 触发元数据 + 主流程/子流程编排 + 铁律）
-- `scripts/` — 可执行 driver：`roundtrip.sh`（一键往返模板，动态参数仅 VM_HOST/VM_USER/ACTION/tag）、deploy/undeploy/verify、download-verify、preflight、env-detect、ssh2 通道后端、计时 step 等
+- `scripts/` — 可执行 driver：`roundtrip.sh`（一键往返模板，动态参数仅 VM_HOST/VM_USER/ACTION/tag）、`deploy.sh`/`undeploy.sh`/`verify.sh` 三流程、`channel.sh`（通道单一动作 status/ensure/confirm/post）、`vm-remove-local.ps1` + `build-vm-bundle.sh`（通道坏时 VM 侧合并包）、download-verify、preflight、env-detect、ssh2 通道后端、计时 step 等
 - `references/` — `troubleshooting.md` 问题百科（现象→根因→解法，30+ 实战条目）与 `known-good-flow.md` 耗时基线带
 
 ## 消费方式（任意 AI Agent）
@@ -16,8 +16,8 @@ WinVM Bridge（[workbuddy-virtual-win-plugin](https://github.com/athronix/workbu
 
 - 本仓 `core.sshCommand=~/.workbuddy/git-ssh.sh`（host-aware 密钥分流，裸 `git push` 即用对钥；勿依赖 ~/.ssh/config——hmdfs 属主权限 ssh 拒用）。
 - 远端=athronix/winvm-plugin-deploy（private）；gh CLI 缺位时发布走 skill_dev.py 的 API 通道（`via:"api"`），token=hosts.yml（scope 含 workflow）。
-- 发布链：改内容落 canonical → `skill_dev.py commit`/`push` → version 变则 `package`+`release`（API 建 tag/release/asset）→ 聚合仓 sync dispatch → **核验=API 读 marketplace.json 版本一致**（raw CDN 有缓存假象；dispatch 与 release 有时序竞态，必要时二次触发）。
+- 发布链：改内容落 canonical → `skill_dev.py commit`/`push` → version 变则 `package`+`release`（gh 主路径，缺位自动 API 降级）→ **GitHub `athronix/skills` 聚合仓 sync dispatch 并等 run 完成** → API 读 `marketplace.json` 核对该条 version（raw CDN 有缓存假象）→ **Gitee `athronix/skills` 从 GitHub 聚合仓镜像同步（remote_mirror/pull）+ 双端 HEAD 追平确认**。`release` 默认内置后两段轮询；`--no-wait` 只跳过确认。
 
 ## 版本纪律
 
-frontmatter `version` 为唯一版本源（SemVer：文案 PATCH / 兼容能力 MINOR / 破坏结构 MAJOR）；发布走 skill-dev-git 通道（package → tag `v*` → GitHub Release asset）。当前 v1.3.1：roundtrip 模板+探针新鲜复用（时间预算战役）+ symlink 兼容修复。
+frontmatter `version` 为唯一版本源（SemVer：文案 PATCH / 兼容能力 MINOR / 破坏结构 MAJOR）；发布走 skill-dev-git 通道（package → tag `v*` → GitHub Release asset → 双聚合仓同步）。**当前 v1.5.0**：三流程职责定界（卸载三段且通道坏绝不重建 / 部署通道在则不建 / verify 仅 deploy ready 后自调）+ `channel.sh` 通道单一动作 + VM 侧合并包 + F-02/03/05/07/09 缺陷修复。历史：v1.4.3 E2E2 整改 · v1.4.2 E2E1 整改 · v1.4.1 旧 .prompt 退役 · v1.3.0 roundtrip 模板+探针新鲜复用。

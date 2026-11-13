@@ -55,7 +55,7 @@ case "${1:-check}" in
     # 交替采样 6×60s（run13 定谳法）：ssh 新连 rc=124 持续 而 tunnel_health 稳定 200
     #   ⇒ guest vCPU 在跑（HTTP 有应答）但 sshd 监听栈周期性冻 =【hypervisor 自动暂停
     #   反复把 VM 挂起】指纹——restart sshd / reboot guest 只能短暂复活，根治必须去
-    #   虚拟机管理端把「自动暂停」设为从不（deploy.prompt Step 0.3），勿在 driver 里耗轮次。
+    #   虚拟机管理端把「自动暂停」设为从不（SKILL.md 铁律/通道坏的定位阶梯），勿在 driver 里耗轮次。
     S1=0; S0=0
     for i in 1 2 3 4 5 6; do
       timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=8 "${VM_USER:-User}@${VM_HOST:-172.16.100.2}" whoami >/dev/null 2>&1 && R=OK || R=124

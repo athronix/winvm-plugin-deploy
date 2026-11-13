@@ -1,175 +1,165 @@
 ---
 name: winvm-plugin-deploy
-description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端一键安装、拆除、复验专用技能。封装三主流程一键往返模板 roundtrip.sh（固定链 取包→拆→装→验 连成一脚本、动态参数仅 VM_HOST/VM_USER/ACTION/tag、探针新鲜复用）、分步 driver、双通道连接（ssh2 后端免疫灭相位）、远端 PowerShell 铁律执行器、一键体检、取包校验、分步计时与数十个实战问题的现象根因解法百科。Use when: 用户要求部署、安装、重装、拆除或卸载 winvm-plugin 到 VM；给出本技能的 URL 或目录要求按其安装/卸载/验证；跑 deploy.prompt 或 undeploy.prompt；验证 VM 插件安装；或处理发布包下载慢/失败、VM ssh 连不上、不稳定、挂起、安装前置检查与环境体检。"
-version: 1.4.3
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端安装/卸载/复验的唯一执行权威。v1.5.0 三流程职责定界：卸载=host 端+vm 端+ssh 通道三段且通道坏时绝不重建（VM 侧两件合并成一个用户脚本）；部署=通道保障（在则不建，不在才引导 hos 一键脚本让用户配合）+两端自动部署；verify=deploy ready 后由 WorkBuddy 自调的健康与功能性监测。封装 roundtrip.sh 一键往返模板、channel.sh 通道单一动作、VM 侧本地卸载 ps1 与合并包、ssh2 后端、远端 PowerShell 铁律执行器、分步计时与问题百科。Use when: 部署/重装/卸载 winvm-plugin；按技能 URL 安装/卸载/验证；VM ssh 连不上、通道已毁、发布包下载失败、安装前置体检、插件健康复验。"
+version: 1.5.0
 agent_created: true
 ---
 
 # WinVM 插件部署技能（winvm-plugin-deploy）
 
-把「鸿蒙宿主 ⇄ Windows VM 安装 WinVM Bridge」从长 Prompt 升级为**分环节可执行流程 + 高效脚本 + 问题百科**。本技能是本项目部署/安装/启动/验证/卸载**全部环节的唯一执行权威**（迭代28，11-11 用户裁定；旧 deploy.prompt/undeploy.prompt 智能体安装脚本已降级退役=历史决策档案，不再随发布包分发）；技能负责跑得**快**（driver+计时）、**稳**（通道/超时/避坑内建）、**卡住秒级定位**（troubleshooting 按现象查表），免密通道生命周期再外委 hos-winvm-ssh-tunnel。
+把「鸿蒙宿主 ⇄ Windows VM 安装 WinVM Bridge」做成**可执行流程 + 脚本 + 问题百科**。本技能是本项目部署/安装/启动/验证/卸载**全部环节的唯一执行权威**（迭代28 用户裁定；旧 `deploy.prompt`/`undeploy.prompt` 已退役=历史档案，不再是判据来源、不入发布包）。免密通道的**创建/验证/精确拆除**外委 `hos-winvm-ssh-tunnel`。
 
-**版本史**（当前 v1.4.3）：v1.4.3=E2E 第二轮整改批（real-test-2026-11-12-e2e2）：R4 往返续命（undeploy 自动快照 vm-conn.json→deploy P0 前恢复，含 R4b 位置修正）；R4+ LOGD 统一 RUN_DIR+交付待办双落点扫描；R6 roundtrip full 拆后 R2.5 判稳插段+A 表瞬态窗三形态行（124/111/255）。v1.4.2=E2E 整改批（11-12 real-test-2026-11-12-e2e）：R1 vm-conn 密钥三级链 env>vm-conn.json>默认+二进制通道注入 -i IdentitiesOnly（既成环境钥迁移自动消费）；R2 deploy C6 交付待办清单显形（[MANUAL]/DB-4 结构性人工项不再埋 log）；R3 B 表两新行（ensure-node 超时假完成/env-check 重载期假 FAIL）。v1.4.1=迭代28 用户裁定旧模式降级退役——本技能升格为**唯一执行权威**（.prompt 降历史档案，不再入发布包）；v1.4.0=SSH 免密通道生命周期外委 hos-winvm-ssh-tunnel（创建/验证/拆除权威指引+密钥接线 A/B 注记）；v1.3.0 时间预算战役=roundtrip 一键往返模板+探针新鲜复用；v1.2.2 URL 入口 ssh2 候选链动态化；v1.2.1 入口引导章；v1.2.0 run13~21 战役沉淀（通道判稳器/能力通道自救/rhythm-check/ssh2 后端/包根三级/预算纪律）。canonical 仓=`athronix/winvm-plugin-deploy`（skill 矩阵规范见其 README），发布包形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
+## 三流程职责定界（v1.5.0 · 用户 2026-11-13 裁定 · 最高优先级）
 
-## URL 单指令入口（v1.2.1：用户只发一句「请依据 skill {skill_url} 安装/卸载/验证 winvm-plugin」）
+| 动词 | SSH 通道 | host 端 | vm 端 | 人工介入 |
+|---|---|---|---|---|
+| **undeploy** | **只判状态，绝不重建**；通道坏是正常输入 | WorkBuddy 本地卸载（无需通道） | 通道在→WorkBuddy 自己卸；通道不在→**与通道卸载合并成一份 VM 侧脚本**交给用户 | 仅通道坏时：用户在 VM 管理员 PowerShell 执行 `RUN-ME.ps1` 一次 |
+| **deploy** | **在则不建**；不在才按 hos 一键脚本让用户配合建立 | WorkBuddy 经通道部署 | WorkBuddy 经通道部署 | 仅从零建通道：用户 VM 粘贴一次 |
+| **verify** | 只用现役通道，不建不修 | — | — | **无**，deploy ready 后由 WorkBuddy 自己调用 `verify.sh` |
 
-收到这种指令时，按下述引导序列自主完成，**全程不要反问流程问题**（只按 P-1 问缺的环境事实）：
+**卸载 = 恰好三段，顺序不可换**：① host 端 ② vm 端 ③ ssh 通道。②③ 可合并。
+- 通道**在**：② 由 WorkBuddy 经 ssh2 完成；③ 把 hos 的 `-Rollback` 设为 **VM 侧 SYSTEM post 动作**（`WbTunnelRollback` 计划任务），让 VM Windows 在本会话断开后自己执行——避免拆 sshd 时自断通道。
+- 通道**不在**：① 仍由 WorkBuddy 本地完成；②③ 由 `build-vm-bundle.sh` 合成**一个目录**（`vm-remove-local.ps1` + `wb-rollback.ps1` + `RUN-ME.ps1`），用户一次执行即可。**绝不为了卸载去重建通道**（旧 P-2「通道失效→外委重建」已废止）。
 
-1. **取技能本体**（⚠ 若技能已由系统加载/已在 `~/.workbuddy/skills/` 在场——含开发机 symlink 挂载形态——**跳过本步**，直接第 2 步；勿用 unzip 覆盖 symlink 挂载点）：`mkdir -p ~/wbtmp && curl -fsSL --connect-timeout 20 --max-time 300 -o ~/wbtmp/winvm-plugin-deploy-skill.zip "<skill_url>"`（⚠ `-o` 必须用资产原名=URL 尾段，旁挂 sha256 内登记的是原名，改名会让 `sha256sum -c` 假失败；gitee 下载 302→foruda 一次性签名，**禁 `-C -` 断点续传**，失败整文件重试；sha256 旁挂同 URL 加 `.sha256` 后缀可取，先校验）。解压到用户级技能目录：`unzip -o <zip> -d ~/.workbuddy/skills/`（zip 内根=`winvm-plugin-deploy/`，解出即标准 skill 布局）。**后续所有 `scripts/…` 相对路径 = `~/.workbuddy/skills/winvm-plugin-deploy/`**（技能以其它位置加载时=该技能目录）。
-2. **环境事实**：`VM_HOST` / `VM_USER`（未知 → P-1 问用户，这是唯一允许的提问点）；密码/私钥按 vm-conn.sh 双通道现探。**无免密通道（从零建/通道已毁）** ⇒ 不自行造轮子：按下方「SSH 免密通道生命周期（外委）」用 hos-winvm-ssh-tunnel skill 建通道，建毕回本步复判；通道已在 ⇒ 直接下一步。
-3. **取发布包**：`bash scripts/env-detect.sh` → `source ~/wbtmp/vmdeploy-env.sh` → `bash scripts/download-verify.sh`（gitee latest 主源）→ 记下末行 `PKG_ROOT=`。此步后 ssh2 后端自动可解析（`$PKG_ROOT/delivery/ssh2-resolve.mjs` + 包内 `node_modules/ssh2`，且 download-verify 默认落点与 ssh2-conn 兜底候选路径同源）。
-4. **按动词路由（v1.3.0 一键往返模板，优先于分步 driver）**：LLM 只在「取 VM_HOST/VM_USER + 发一次后台命令 + 读末块汇报」三处介入，其余全在模板脚本内——
-   - **`VM_HOST=<ip> ACTION=<full|deploy|undeploy|verify> bash scripts/roundtrip.sh`**（后台 run_in_background 一次调用跑完；full=取包→拆→装→验、deploy=取包+装+验、undeploy=只拆、verify=只验；动态参数仅此：`RELEASE_TAG=`空现解 latest、`SKIP_DOWNLOAD=1` 用现役包根、`VM_USER` 默认 User）。完成后**只读末块 `== ROUNDTRIP_RESULT ==`**（含 VERDICT/WALL_S/各角色 PASS/FAIL/TOP5 计时），勿分段轮询中间态。
-   - **探针新鲜复用**（v1.3.0 省 ~240s）：deploy C5 全过落 stamp，verify 600s 内同包根自动 3×REUSED 只跑矩阵；强制冷跑 `VERIFY_FORCE_PROBE=1`、窗调 `PROBE_FRESH_BUDGET_S`。
-   - 分步 driver（deploy.sh/undeploy.sh/verify.sh/download-verify.sh）**保留**=排障时定点重跑失败环节、细粒度计时用；roundtrip 内部即按序调用它们（单一事实源，勿复制逻辑）。
-5. **卡住**：查 `references/troubleshooting.md` 现象表；通道灭相位**不是**停跑理由（ssh2 后端免疫），红线勿越——绝不主动重启 VM。
+> 版本史：v1.5.0=三流程语义重构 + 通道单一动作 + VM 侧合并包 + F-02/03/05/07/09 修复；v1.4.3=E2E2 整改（R4 快照/R4b 位置/R6 判稳插段）；v1.4.2=E2E1 整改（密钥三级链/交付待办显形）；v1.4.1=旧模式退役、本技能升唯一权威；v1.4.0=通道生命周期外委 hos；v1.3.0=roundtrip 模板+探针新鲜复用。canonical=`athronix/winvm-plugin-deploy`，发布形态=双端 release 资产 `winvm-plugin-deploy-skill.zip`。
 
-> 技能包 URL 的权威来源 = 双端 release 资产 `winvm-plugin-deploy-skill.zip`（gitee 主：`https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-plugin-deploy-skill.zip`；≥V1.4.24 随每个 tag 发布，与 overall 包同 tag 同批；**V1.4.24 首发版有 ssh2 候选链缺陷，latest 现解天然规避——只要 latest ≥V1.4.25 即拿到修复版**）。用户只给仓库页或说"最新版"时，`curl https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest` 现解 tag 再拼 URL。
+## URL 单指令入口（用户只发一句「请依据 skill {skill_url} 安装/卸载/验证 winvm-plugin」）
 
+1. **取技能本体**（技能已加载/已在 `~/.workbuddy/skills/` 在场——含 symlink——**跳过**；勿用 unzip 覆盖 symlink）：`curl -fsSL --connect-timeout 20 --max-time 300 -o ~/wbtmp/winvm-plugin-deploy-skill.zip "<skill_url>"`（`-o` 必须用资产原名，旁挂 sha256 内登记原名；gitee 302→foruda 一次性签名，**禁 `-C -`**，失败整文件重试）→ `unzip -o <zip> -d ~/.workbuddy/skills/`。后续 `scripts/…` 相对 `~/.workbuddy/skills/winvm-plugin-deploy/`。
+2. **环境事实**：`VM_HOST` / `VM_USER`（未知 → P-1 问用户，唯一允许的流程提问点）。**此处不判通道、不建通道**——通道归属由动词决定（见上表）。
+3. **取发布包**：`bash scripts/env-detect.sh` → `source ~/wbtmp/vmdeploy-env.sh` → `bash scripts/download-verify.sh` → 记末行 `PKG_ROOT=`。
+4. **按动词路由**：`VM_HOST=<ip> ACTION=<full|deploy|undeploy|verify> bash scripts/roundtrip.sh`（后台一次调用；完成后**只读末块 `== ROUNDTRIP_RESULT ==`**，含 `VERDICT`/`WALL_S`/三段 PASS/FAIL/TOP5，勿分段轮询）。动态参数仅 `RELEASE_TAG`/`SKIP_DOWNLOAD`/`VM_USER`/`PROBE_FRESH_BUDGET_S`。
+   - `full` 的卸载段**默认 `--keep-tunnel`**（往返重装不拆通道，省掉第二次人工建通道）；单独 `undeploy` 才默认拆通道（可用 `--keep-tunnel` 保留）。
+   - 分步 driver（deploy/undeploy/verify/download-verify）保留=排障定点重跑；roundtrip 内部按序调用它们（单一事实源）。
+5. **卡住**：查 `references/troubleshooting.md`；通道灭相位不是停跑理由（ssh2 免疫）；红线——绝不主动重启 VM。
 
-## 铁律（任何环节先遵守）
+> 技能包 URL 权威来源 = 双端 release 资产 `winvm-plugin-deploy-skill.zip`（gitee 主：`https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-plugin-deploy-skill.zip`；≥V1.4.24 随每 tag 发布）。只给仓库页/说「最新版」时，`curl https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest` 现解 tag 再拼 URL。
 
-1. **取包 gitee 主源、github 备源**；tag 以 `releases/latest` 现解为准（gitee API），示例值仅参考。
-2. **远端 PowerShell 铁律**：复合逻辑=写 `.ps1` → scp → `powershell -File`；短片段=`-EncodedCommand`（base64 UTF-16LE）。**任何情况下不双引号内联含 `$` 的 PS**——本地 bash 与远端壳都会吞改（R8 安装链 183 次失败、run11 本地 `$_` 展开两案定谳）。本技能一律经 `scripts/ps-run.sh`。
-3. **宿主删文件禁 `rm`**（部分鸿蒙宿主坏 shim=`bad interpreter`）→ `fs_rm`（node fs）。禁 `rm -rf <目录>` 式清理——**误写 `rm -f ~/.config` 类通配/目录删除可能被沙箱提权批准后真执行**；清理具体文件用 `node -e 'fs.unlinkSync(路径)'`（存在性先判断，幂等）。
-4. **ssh/scp 必须外层 timeout**：VM sshd 连接位占满时 TCP 层**无限挂起**（连 BatchMode 不退，实测卡死 8 分钟）——`vm-conn.sh` 已内建 `VM_SSH_TIMEOUT=25`。
-5. **shell 拼接纪律**：命令行内嵌 python/sed 含嵌套单引号会被 eval 撕碎（run13 实证：token 提取一行式炸整链 exit 127）→ 复杂逻辑一律先写脚本文件再执行；令牌经文件/环境变量中转并即删。
-6. **密码只走环境变量**（askpass / `WINVM_VM_PASSWORD`），不落盘不进命令行；`.env` 凭据 V1.4.20 起自动回注（旧包=外部 export 后跑 setup）。
-7. **每步判据自检不过 = 停**：按四元组（现象/根因/证据/处置）记录并查 `references/troubleshooting.md`，不跳步硬推；缺信息问用户（P-1）。
+## 铁律
 
-## 安装主流程（对应 deploy.prompt Step 0→6）
+1. **三流程职责以「三流程职责定界」表为准**；卸载路径出现 `ensure`/`host-generate-key`/「重建通道」字样即为违规。
+2. **取包** gitee 主、github 备；tag 现解 `releases/latest`。
+3. **远端 PowerShell 铁律**：复合逻辑=写 `.ps1` → scp → `powershell -File`；短片段=`-EncodedCommand`（base64 UTF-16LE）。禁双引号内联含 `$` 的 PS；一律经 `scripts/ps-run.sh`。VM 侧脚本**全 ASCII**（ps-run.sh 有门禁）。
+4. **宿主删文件禁 `rm`** → `node -e 'fs.unlinkSync(...)'`；禁 `rm -rf <目录>`。
+5. **ssh/scp 必包外层 timeout**（`vm-conn.sh` 内建 `VM_SSH_TIMEOUT=25`）。
+6. **统一后端**：`channel.sh`/`deploy.sh`/`undeploy.sh`/`verify.sh`/`roundtrip.sh` 一律 `export VM_SSH_BACKEND=ssh2`（v1.5.0 起由脚本自身保证，勿再手工 export）。
+7. **密钥单一事实源**：`WINVM_VM_KEY` 三级链 env > `~/.workbuddy/winvm/vm-conn.json` identityFile > `~/.ssh/id_ed25519`；`channel.sh ensure` 把该值作为 hos 第 1 参，禁止双钥并存都试。
+8. **密码只走环境变量**（askpass / `WINVM_VM_PASSWORD`），不落盘不进命令行。
+9. **通道拆除恒为 VM 侧 post 动作**（SYSTEM 计划任务），或合并进用户 bundle；不在宿主侧同步拆 sshd。
+10. **每步判据不过=停**，按四元组（现象/根因/证据/处置）记录并查表，不跳步硬推。
 
-> **首选 = 一键往返模板 `roundtrip.sh`**（v1.3.0，用户裁定「固定相连操作连成一脚本，LLM 只取信息/探测/决策」）：
-> ```bash
-> # 一次后台调用跑完 取包→(拆)→装→验，动态参数仅此四个；完成后只读末块 ROUNDTRIP_RESULT
-> VM_HOST=<ip> ACTION=deploy bash scripts/roundtrip.sh   # 装+验；ACTION=full 含前置拆除；ACTION=undeploy 只拆；ACTION=verify 只验
-> ```
-> 内部即按序调用下方分步 driver（单一事实源），探针新鲜复用（deploy 完 600s 内 verify 只跑矩阵，省 ~240s）。排障/细粒度计时才用分步 driver。
+## 卸载主流程（三段，v1.5.0）
 
-分步 driver（roundtrip 的组成，可独立重入）：
 ```bash
-```bash
-cd <包根或仓库>            # 包根缺失先：bash scripts/download-verify.sh [--tag V1.4.x]
-export VM_HOST=<ip> VM_USER=<user>          # 未知 → P-1 问用户
-bash scripts/env-detect.sh                  # 运行时冒烟探测（NODE/PY/BASH，D1 教训产品化）
-# shellcheck disable=SC1090
-source ~/wbtmp/vmdeploy-env.sh
-bash scripts/preflight.sh                   # Step0 体检：RED/YELLOW/GREEN+修复指引
-bash scripts/deploy.sh                      # DRY-RUN：体检+通道+计划预览
-bash scripts/deploy.sh --apply              # 真执行：通道→取包→prepare→setup→vmcheck→host→38探针→交付
+VM_HOST=<ip> bash scripts/undeploy.sh                 # DRY-RUN：打印三段计划 + CHANNEL_UP
+VM_HOST=<ip> bash scripts/undeploy.sh --apply        # 执行三段
+VM_HOST=<ip> bash scripts/undeploy.sh --apply --keep-tunnel      # 保留 ssh 通道
+VM_HOST=<ip> bash scripts/undeploy.sh --apply --purge-workspace  # 破坏性：连 C:/WinVMWorkspace 一起删
 ```
 
-- 每环节自动计时留痕到 `~/wbtmp/vmdeploy-run-<日期>/steps.tsv`（显式指定 `export VMDEPLOY_RUN_DIR=~/wbtmp/vmdeploy-run13-<日期>` 使多日/多轮不混算）；收尾打 Top5/问题行/失败行。
-- run19 R-3 注记：同一 `VMDEPLOY_RUN_DIR` 多轮混跑时，steps.tsv 按 begin/end 行的 `begin_utc` 时间戳分段读（同 step-id 多行=多轮各记一行，勿把旧轮 FAIL 混入本轮判读）；推荐**每轮独立 RUN_DIR**（`vmdeploy-runN`）从根上免混算。
-- 幂等：任一相位失败 → 查表处置后**只重跑失败相位**（deploy.sh 各步独立可重入）。
-- BUILD 假败（缺 typescript）、.env 密码不回注 两坑已在 ≥V1.4.20 包内根除；旧包按 troubleshooting B 表绕行。
+| 段 | 动作 | 通道在 | 通道不在 |
+|---|---|---|---|
+| **1 host** | `delivery/uninstall.mjs --apply` 的 host 相位（无 VM 目标→VM 相位按设计跳过），判据=`[PASS] HOST` ≥11 且零 `[FAIL] HOST` | 同 | 同（**不需要通道**） |
+| **2 vm** | 推 `scripts/vm-remove-local.ps1` → `ps-run.sh -c "& .\vm-remove-local.ps1 -Apply"`，判据 `VM_CLEANUP_DONE` + POST STATUS | WorkBuddy 执行 | `build-vm-bundle.sh` 产出 `VM_BUNDLE=`，标 `NEED_USER_ACTION=1` |
+| **3 ssh 通道** | hos `winvm-setup-sshd-and-key.ps1 -Rollback` + 宿主 `host-rollback.sh`；判据=免密登录不再可用（**不是** 22 端口关了） | `channel.sh post`：scp 模板 → VM SYSTEM 任务 `WbTunnelRollback` → 宿主回滚 | 已合并进 `RUN-ME.ps1`（`-ScheduleTunnelRollback`），宿主侧仍由 WorkBuddy 跑 `host-rollback.sh` |
 
-## 拆除主流程（undeploy.sh，对应 undeploy.prompt U0→U4）
+**通道不在时交给用户的唯一动作**：把 `VM_BUNDLE` 目录拷到 VM → 管理员 PowerShell 执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\RUN-ME.ps1`。目录内已含 vm 卸载 + 通道回滚两件，`PASTE-THIS.txt` 有完整说明。宿主侧 `vm-conn.json` 拆前留 `.roundtrip` 快照（供后续 deploy 的 P0 前恢复）。
 
-```bash
-bash scripts/undeploy.sh                 # DRY-RUN：基线+dry 清单核对
-bash scripts/undeploy.sh --apply         # 真拆：19 项核验+U4 独立复核；存留项全默认保留
-# 存留项（SSH 密钥/trash/下载物）逐项问用户（U5；删密钥走 undeploy.prompt 的 vm-rmkey 子流程）
-```
+**独立复核（U4）**：`health=000` / `GLOBAL_MCP_CLEAN` / VM 五点 `False False 0 * True`；通道不在时 VM 终态标 `PENDING_USER`（不算失败）。存留项（trash / 下载物）默认保留。
 
-## 复验与汇报
+## 安装主流程（通道保障 + 两端部署）
 
 ```bash
-bash scripts/verify.sh                   # 三探针 38 项 + 终态矩阵（fresh/disabledTools=8/隧道/health/skills=8/VM 点；⚠ skills=0 ⇒ 宿主侧外部擦除非 VM 问题，install-host --yes 幂等恢复，run15g 实证）
-bash scripts/step.sh report              # 计时汇总；交付报告=总表+Top5+问题清单直接成文
+# 首选：一次后台调用，LLM 只在 取环境事实 / 发命令 / 读末块 三处介入
+VM_HOST=<ip> ACTION=deploy bash scripts/roundtrip.sh
+# 分步（排障/细粒度计时）
+bash scripts/channel.sh ensure        # 通道在→CHANNEL_EXISTS=1 直接过；不在→打印 hos 一键脚本，rc=2 等用户粘贴
+#   ... 用户在 VM 管理员 PowerShell 粘贴一次 ...
+bash scripts/channel.sh confirm       # hos 四段验收 + ssh2 ping 复核定论
+bash scripts/deploy.sh --apply        # 通道→取包→ENV_PRECHECK→prepare/setup→vmcheck→install-host→三探针→交付
 ```
+
+- `channel.sh ensure` 只做「在/不在」判定；**通道已建立就不再建立**，也不会重装密钥（hos 脚本幂等，但仍不调用）。
+- 两端部署全部经现役通道由 WorkBuddy 完成；`deploy.sh` 的 C1 不再自行探测通道（复用 `channel.sh` 结果），消除重复 probe。
+- C5 三探针全过先落 `deploy_ok=0` 候选 stamp，**只有末尾全链零 FAIL（`FAILED_STEPS` 为空）才升为 `deploy_ok=1`**；开跑即作废旧 stamp，中途硬阻断也不留可复用假绿。`probe-fresh.sh` 第四防线读该字段，杜绝「部分失败却 verify 复用 PASS」。
+- 交付待办（`[MANUAL]` / `DB-4` VM 内 codebuddy 登录）由 C6 显形到终端并落 `handoff` 行，属结构性人工项、不阻断。
+
+## 复验与汇报（verify）
+
+```bash
+bash scripts/verify.sh                # 仅在 deploy ready 后由 WorkBuddy 自调；不建通道、不修通道
+bash scripts/step.sh report           # 计时汇总
+```
+
+三探针 38 项（**仅当 stamp 带 `deploy_ok=1`** 且新鲜窗 600s 内同包根才 3×REUSED）+ 终态矩阵（fresh / disabledTools=8 / health=200 / skills=8 / VM 三点）。VM 通道落在瞬态窗时标 `ENV_WINDOW=1` → `VERIFY=INCOMPLETE rc=2`（环境问题非功能失败，既不误报 FAIL 也不假绿 PASS）；等健康窗只重跑 `verify.sh`，绝不重启 VM。`skills=0` ⇒ 宿主侧外部擦除，`install-host --yes` 幂等恢复（非 VM 问题）。
 
 ## SSH 免密通道生命周期（创建/验证/拆除 = 外委 hos-winvm-ssh-tunnel，v1.4.0）
 
-**分工定界**：鸿蒙宿主 WorkBuddy 沙箱 → Windows VM 的 **SSH 免密通道从零创建、验证、精确拆除**，权威指引=**hos-winvm-ssh-tunnel skill**（独立技能仓，OS 原生能力实现，不依赖 MCP/桥）。本技能只负责**通道的使用**（vm-conn.sh 双通道探测/vmssh/vmscp、ssh2 后端、WEDGE 灭窗诊断阶梯）与使用层判据；**不重复造建通道轮子**。
+**分工定界**：鸿蒙宿主 WorkBuddy 沙箱 → Windows VM 的 **SSH 免密通道从零创建、验证、精确拆除**，权威指引=**hos-winvm-ssh-tunnel skill**（OS 原生能力，不依赖 MCP/桥）。本技能只负责**通道的使用**与三流程内的接线，不重复造轮子。
 
-**引用入口（一句话让 WorkBuddy 装起并跑完通道循环）**：
+**引用入口**：
 
 > 请按照 https://raw.githubusercontent.com/athronix/skills/main/INSTALL_PROMPT.md 安装 hos-winvm-ssh-tunnel skill 并在其指引下完成 创建/验证/拆除 鸿蒙宿主机workbuddy 沙箱端 到 VM windows 端的ssh 免密通道
 
-其三步主线（细节以该 skill SKILL.md 为准，勿凭本段记忆执行）：`host-generate-key.sh`（宿主机生成密钥+打印「公钥已填好」的 VM 一键脚本 → **用户在 VM 管理员 PowerShell 粘贴执行一次=唯一人工步骤**）→ `verify-tunnel.sh <VM_IP> <user>`（四段式验收）→ 拆除 `DRYRUN=1 destroy-tunnel.sh` 预演后真跑（journal v2 逐条回滚，他人密钥无损）。
+其主线（细节以该 skill SKILL.md 为准）：`host-generate-key.sh [key_path] [vm_user] [vm_port] [vm_ip]` 生成密钥并打印「公钥已填好」的 VM 一键脚本 → **用户在 VM 管理员 PowerShell 粘贴执行一次=唯一人工步骤** → `verify-tunnel.sh <VM_IP> <user> <key> <port>` 四段验收（none 必被拒优先于公钥成功）→ 拆除用 `destroy-tunnel.sh`（`DRYRUN=1` 预演；内部 VM 侧即 `schtasks /Create /TN WbTunnelRollback … /RU SYSTEM` 的 post 动作 + 宿主 `host-rollback.sh`）。
 
-**与本技能三处衔接口**：
-1. **deploy C1 `无通道` FAIL** → 走上方引用入口建通道，建毕复跑本轮 deploy（勿按旧文案手工 ssh-copy-id）。
-2. **undeploy U0.1 `通道失效`**（P-2）→ 同样外委重建，先报告审批再建。
-3. **undeploy U5 存留项「SSH 密钥」** → 用户选"删除"时用 hos `destroy-tunnel.sh`（对称回滚、只撤自己那份）替代旧 vm-rmkey.ps1 手工子流程（后者保留=hos 不在场的兜底）。
+**三处衔接口（v1.5.0 改写，旧 P-2 已废止）**：
+1. **deploy 通道不在** → `channel.sh ensure` 调 hos `host-generate-key.sh "$WINVM_VM_KEY" …`，打印整段给用户；用户粘贴后 `channel.sh confirm` 验收。
+2. **undeploy 通道不在** → **不建通道**；`build-vm-bundle.sh` 把 hos 的 `winvm-setup-sshd-and-key.ps1` 复制为 `wb-rollback.ps1`，与 vm 卸载脚本合并给用户一次执行。
+3. **undeploy 通道在** → `channel.sh post` 把同一模板推到 VM 并以 SYSTEM 计划任务触发 `-Rollback`；宿主侧 `host-rollback.sh` 精确撤销本 skill 创建的私钥/known_hosts/基线。
 
-**接口适配注记（两技能契约差异，实装前必读，11-11 实核）**：
-- **密钥接线（最重要）**：本技能找密钥的两条路径都默认 `~/.ssh/id_ed25519`——①vm-conn.sh key 通道不传 `-i`（靠 ssh 默认搜索）；②ssh2 后端 `ssh2-conn.mjs` 读 `WINVM_VM_KEY || ~/.ssh/id_ed25519`。而 **hos 默认建专用密钥 `~/.ssh/id_ed25519_winvm`**。二选一接线，勿双密钥并存都试：
-  - **路 A（推荐，零改配置）**=按 hos 脚本第 1 参显式传旧路径：`sh $S/host-generate-key.sh ~/.ssh/id_ed25519`（其设计本就支持 KEY="${1:-...winvm}"；⚠ 若 id_ed25519 兼 GitHub 推送凭据=先按 deploy.prompt 纪律用 id_ed25519_github 分离后再建，勿覆盖已有私钥——脚本幂等=已存在不重建，公钥已在 VM 则等于复用）。
-  - **路 B**=hos 默认 `id_ed25519_winvm` ⇒ **v1.4.2 起自动适配**：vm-conn.sh 密钥三级链 env `WINVM_VM_KEY` > `~/.workbuddy/winvm/vm-conn.json` 的 identityFile（install-host 部署期固化）> `~/.ssh/id_ed25519`，且 ssh 二进制通道恒带 `-i $WINVM_VM_KEY -o IdentitiesOnly=yes`（兜底/回合一发不再靠默认搜索；11-12 E2E Q1 整改）。
-- **验证判读**：hos `verify-tunnel.sh`/`destroy-tunnel.sh` 走 **ssh 二进制**——本宿主 WB 沙箱 ssh 对 VM 呈相位性挂起（见下「ssh2 后端」）。**verify 失败 ≠ 通道没建好**（可能是灭窗指纹）⇒ 用本技能 ssh2 后端复核定论：`VM_HOST=.. VM_USER=.. [WINVM_VM_KEY=..] node scripts/ssh2-conn.mjs ping`。destroy 同受影响：灭窗期 VM 侧回滚可能连不上，按 A 表止损等窗，勿误判"通道没拆"。
-- **密码前提差异**：hos 底线=「账户保持空密码、公钥认证不核对密码」；本 VM 现役 User 为**非空密码**且通道已建——两拓扑都支持公钥，无冲突；仅当你在**新宿主机**按 hos 全流程从零建时，遵循 hos 自己的空密码纪律即可，勿回头找密码。
-- **红线共守**：绝不主动重启 VM/guest（两技能一致）。
+**接口适配注记（11-11 / 11-13 两次实核，勿凭记忆改）**：
+- **密钥接线**：hos 默认 `~/.ssh/id_ed25519_winvm`；本技能 vm-conn.sh/ssh2 后端默认 `~/.ssh/id_ed25519`。`channel.sh ensure` 显式把 `$WINVM_VM_KEY`（三级链结果）作为 hos 第 1 参，两技能因此共用同一把钥；`vm-conn.sh` 恒带 `-i $WINVM_VM_KEY -o IdentitiesOnly=yes`。
+- **`-Rollback` 不需要公钥**：hos 模板按 journal v2 逆序撤销（公钥行 blob 已记在 journal），故通道已断也能在 VM 本机执行；这正是「通道不在也能拆通道」的依据。
+- **验证判读**：hos `verify-tunnel.sh` / `destroy-tunnel.sh` 走 **ssh 二进制**，本宿主 WB 沙箱对 VM 呈相位挂起 ⇒ **二进制失败 ≠ 通道没建好**，一律用 `node scripts/ssh2-conn.mjs ping` 复核定论。
+- **禁止误用**：hos `destroy-tunnel.sh` 在「22 可达但免密不通」时会提示「a) 先重建再 destroy」——**本技能卸载路径禁走 a)**，只走 b)（VM 管理员本机执行 `-Rollback`）。
+- **密码前提**：hos 底线=账户空密码、公钥认证不核对密码；本 VM 现役 User 非空密码且通道已建，两拓扑都支持公钥，无冲突。
+- **红线共守**：绝不主动重启 VM/guest。
 
-## 通道后端与包根选择（run17~20 定版，v1.2.0）
+## 通道后端与包根选择
 
-**ssh2 后端（本宿主的正解）**：鸿蒙 WB 沙箱的 OpenSSH 二进制对 VM 呈相位性挂起（灭窗 rc=124 空 stderr，与参数/密度/退避/静置全无关；好窗又全通）——同秒实锤：ssh2 库 READY 654ms+exec rc=0 而二进制 124。凡在 WB 沙箱跑 driver，**export VM_SSH_BACKEND=ssh2**（vm-conn.sh 的 vmssh/vmscp/probe 全走 ssh2-conn.mjs：exec/put/get/ping，env 契约 VM_HOST/VM_USER/VM_SSH_PORT/WINVM_VM_KEY，凭据零打印；基础设施失败 rc=111 三试 5s 间隔→二进制兜底一发有界 <40s）。默认 key=原二进制（发布面零冲击）；HiShell 等其它 App 通道不受此相位影响，勿拿它们的通来否定 WB 的灭。
+**ssh2 后端**：鸿蒙 WB 沙箱 OpenSSH 二进制对 VM 相位挂起（灭窗 rc=124 空 stderr），同秒实测 ssh2 库 READY 654ms 而二进制 124。`vm-conn.sh` 的 `vmssh/vmscp/probe` 在 `VM_SSH_BACKEND=ssh2` 时全走 `ssh2-conn.mjs`（exec/put/get/ping；基础设施 rc=111 三试 5s → 二进制兜底一发）。v1.5.0 起各 driver 自行 export，无需手工设置。
 
-**包根三级默认（pkg-root.sh 单一事实源）**：`resolve_pkg_root` = 显式 env PKG_ROOT/--pkg > 状态文件 `$DEPLOY_ROOT/pkg-root.txt`（download-verify/deploy 两产出者写） > 现探（内层优先、MANIFEST 版本匹配） > 报错带处置文案（undeploy 不静默 exit 2）。历史坑：手工「上提一层」复制品+隔离重解并存时，硬编码外层=「Cannot find module uninstall.mjs」类假阻（run19 定谳）。
+**包根三级默认（pkg-root.sh 单一事实源）**：env `PKG_ROOT` > `$DEPLOY_ROOT/pkg-root.txt` > 现探（内层优先、MANIFEST 版本匹配） > 报错带处置文案。日志统一 `LOGD="${VMDEPLOY_LOG_DIR:-${VMDEPLOY_RUN_DIR:-…}}"`，三 driver 与 step.sh 同径（v1.5.0 修复日志双落点分裂）。
 
-## 通道自救路径（run13 定谳：ssh 通道死、MCP 隧道活的组合态）
+## 通道坏的定位阶梯（简）
 
-> ⚠ **红线（用户明令 2026-11-04，最高优先级）：绝不主动重启 VM/guest**——`self-rescue.sh restart-guest`、`shutdown /r`、taskkill sshd 树等复位手段**一律禁用**，除非用户当次明确要求。通道坏了的正确姿势=**探测并利用健康窗口**跑最短链（隧道 ensure→undeploy→deploy→verify 一气呵成），无窗则止损上报等用户处置，不许用重启赌窗口。（run15g 升级实证：**连用户手动整机重启也只能开 3 分钟窗**——重启连『制造窗口』的资格都已失去，WEDGE 进持久态时唯一正确动作=拿 MCP 隧道侧完成可完成的一切+移交 VM 桌面排查清单，见 troubleshooting A 表恶化曲线两行。）
-
-判据形态：`ssh` TCP 秒连但 **banner 8s 不吐**（node 裸探针可证）、sshd 服务 Running、`restart sshd` 无效、RDP 亦超时——= guest 监听栈僵死/半开堆积，**旧长连接仍可用来救场**。此时**先走能力通道，勿找 hypervisor**：
-
-```bash
-bash scripts/self-rescue.sh check              # health=200? sshd Running? banner 8s 不吐?（形态确认）
-bash scripts/self-rescue.sh restart-guest 8    # 能力通道发 shutdown /r /t 8 /f（审计在册）
-bash scripts/wait-channel.sh 3 10              # 稀疏轮询判稳（75s 间隔 3 连击）；⚠ 外层 timeout ≥ rounds×120、reboot 后睡 240s 再测（run14 课）
-bash scripts/self-rescue.sh rhythm-check      # 交替采样二分定性（run14 修正）：
-                                              #  ssh 灭+隧道【稳 200】=SSHD_STACK_WEDGE（vCPU 活着≠暂停！监听栈坏死，
-                                              #  整机重启续命 ~7-11min 窗，抢不进 driver 即环境级上报）；
-                                              #  ssh 与隧道【都】间歇挂=真暂停指纹（查 Step 0.3）
-# 隧道若 DEGRADED：node delivery/winvm-plugin.mjs tunnel ensure（自检自动重建）
-```
-
-预算纪律（run13 亲犯两次的课）：**外层 `timeout` ≥ 内层最坏耗时总和**——probe 五试最坏 5×(VST+15s)≈275s，包它的 timeout 给 300s 起；外层先杀=整段白跑还留下"失败假象"误导诊断。
-
-## 通道坏的定位阶梯（run15h 定版：先分层再动手，勿再治 sshd）
-
-1. **sshd 无罪快速自证**（能力通道，30 秒）：guest 内 `TcpClient` 自连 `127.0.0.1:22` 和 `自身LAN IP:22`——都秒回 banner ⇒ 问题不在 guest，转步骤 2；不回 ⇒ 才是 sshd 层（restart-service 路径）。
-2. **banner 能到=数据面无罪**（v1.1.7 更正，用户质疑证伪旧『数据面丢包』判）：run15i 14:59 全链认证成功 + 15:16-18 裸 TCP 连测 28/28 秒回 banner——banner 能流的时刻 vSwitch/防火墙全健康。灭窗的形态=**banner 之后、认证完成之前挂起**（rc=124 stderr 空），即 sshd **子进程/会话建立段**（Windows OpenSSH: 父监听进程出 banner，子进程走 lsass 建登录令牌——嫌疑集中在子进程 spawn/lsass/PerSource 节流），**不是网络层**。旧「关 NIC offload/重置 vSwitch」指示作废勿执行。判别实验=灭窗内让用户从其它 App（如 HiShell）**新开**一条：秒通⇒问题在本 App 沙箱出口侧；同样挂⇒坐实 VM sshd 认证段。
-3. **已建立连接 ≠ 新建连接**：隧道/保活长连全程健康不能推出新连接可用（run15h：keepalive 活 8min、期间新建五试全灭）。窗口判定永远用新建连接实测。
+1. **永不重启 VM**（用户最高红线）。通道坏=探测并利用健康窗跑最短链，无窗则止损上报。
+2. **banner 能到=数据面无罪**；灭窗坏在 sshd 认证/会话建立段（124 挂起 / 111 瞬拒 / 255 公钥拒三形态），非网络层。窗口判定必用**新建连接实测**（长连健康≠新建可用）。
+3. **判稳器作 gate**：`wait-channel.sh 2 4` 复用 `vm-conn.sh` 的密钥链与 ssh2 后端（新建连接实测）；`CHANNEL_UNSTABLE` 时 roundtrip 先用 `channel.sh confirm` 的 ssh2 ping 权威复核——复核通则继续（二进制判稳失败≠通道不存在），复核也败才 **止损退出**，不再背靠背硬跑 deploy。
 
 ## 卡住时（先查表再动手）
 
-`references/troubleshooting.md`：按现象组织（A 通道网络 / B 安装拆除 / C 宿主特例 / D gitee 发布面 / E 版本门槛速查）。高频五例：
+`references/troubleshooting.md`（A 通道 / B 安装拆除 / C 宿主特例 / D gitee / E 版本门槛）。高频：
 
-| 现象 | 一句话根因 | 处置 |
+| 现象 | 根因 | 处置 |
 |---|---|---|
-| ssh 无输出无限挂起 | VM sshd 连接位占满（TCP 层不退） | 一切 ssh 外层 timeout（已内建）；持续则 VM 内 `Restart-Service sshd`；多 agent 禁并发同 VM |
-| 远端 PS 报 ParserError/`$_` 变怪值 | 本地或远端壳吞改写 | 只走 `ps-run.sh`（铁律） |
-| 420s 未监听/拆不净+杀不掉 | 僵而不绑/僵尸 node（三式强杀免疫） | ≥V1.4.16 签名清扫根治；旧包：重跑本相位 / VM `shutdown /r /t 5 /f` 重启复拆 |
-| E7 `EXECUTION_TIMEOUT`（≈120000ms） | 服务端能力闸（≠客户端 timed out） | ≥V1.4.17 族 300s；两形态勿混（X-5 带宽） |
-| `.env` 填了密码隧道仍要密码 | ≤V1.4.19 不回注 process.env | ≥V1.4.20 自动回注；旧版先 source 含 export 的 env.sh |
+| 卸载时通道不通 | 正常输入，不是故障 | 不重建；HOST 本地卸 + VM 合并包给用户 |
+| ssh 无输出无限挂起 | VM sshd 连接位占满 | 外层 timeout（已内建）；灭窗用 ssh2 |
+| 远端 PS ParserError / `$_` 变怪值 | 本地或远端壳吞改写 | 只走 `ps-run.sh` |
+| `ensure-node` rc=0 但 node 仍缺 | 远端长任务超 ssh2 exec 300s 窗 | 按 B 表补跑解压段；delivery 异步化在册 |
+| C3.0 env-check rc=124 | VM 重载期通道排队假 FAIL | 不阻断，幂等复跑收敛 |
+| `VERIFY=FAIL` 但 health=200 | 旧账回显 / 二进制后端灭窗 | 只读本轮末块；verify 已统一 ssh2 |
 
 ## 脚本清单（scripts/）
 
 | 脚本 | 职责 |
 |---|---|
-| `env-detect.sh` | 运行时探测（node=.mjs 冒烟/py=-c/bash=可执行带 shebang 脚本/rm 可用性）→ 生成 `~/wbtmp/vmdeploy-env.sh` |
-| `vm-conn.sh` | 双通道（key 免密/password askpass）+ `vm_channel_probe` + `vmssh/vmscp`（三试+timeout）+ `fs_rm` |
-| `ps-run.sh` | 铁律执行器：`ps-run.sh x.ps1`（ASCII 门禁+推送+执行+远端清理）；`-c '单行'` EncodedCommand |
-| `preflight.sh` | Step 0 一键体检（信息/运行时/通道/VM 前置 sshd·node·防火墙），RED/YELLOW/GREEN+逐项修复命令 |
-| `download-verify.sh` | 取包三件套（gitee 主+github 备、sha256、解压、verify-manifest）→ `PKG_ROOT=` |
-| `wait-channel.sh` | 通道判稳器：稀疏轮询（75s 间隔）连击 N 判稳；冷开机/挂起期勿单发判死（run13 沉淀） |
-| `ssh2-conn.mjs` | **ssh2 通道后端**（exec/put/get/ping；VM_SSH_BACKEND=ssh2 时 vm-conn 全走它；本宿主相位挂的正解，run17~21 实锤） |
-| `pkg-root.sh` | 包根三级选根单一事实源（env PKG_ROOT>pkg-root.txt 状态>现探内层优先；三 driver 共用，run19 R-1 定版） |
-| `self-rescue.sh` | 能力通道自救三合一：check（health+sshd+banner 探针定谳挂起形态）/ restart-guest（shutdown /r 经 app.process.launch）/ restart-service；隧道健在时免碰 hypervisor（run13 实测 ~70s 复活） |
-| `deploy.sh` / `undeploy.sh` | 主流程 driver（默认 dry-run；--apply 真执行；全程 step 计时） |
-| `roundtrip.sh` | **一键往返模板（v1.3.0 首选）**：动态参数仅 VM_HOST/VM_USER/ACTION/RELEASE_TAG，固定链取包→拆→装→验连成一脚本；后台一次调用跑完，末块 `ROUNDTRIP_RESULT` 机器可读（LLM 介入=问环境+发命令+读末块三处，勿分段轮询）；C5/undeploy 失败即停定点报障 |
-| `probe-fresh.sh` | 探针新鲜复用判定单一事实源（三防线=时效窗/同包根/强制冷跑；stamp 缺/损坏/未来时钟=保守冷跑；verify.sh 调用，p8 单测钉边界） |
-| `verify.sh` | 三探针 + 终态矩阵（装后随时可跑；deploy 完 600s 内同包根探针自动 REUSED 只跑矩阵，`VERIFY_FORCE_PROBE=1` 强制冷跑） |
-| `step.sh` | 分步计时/留痕/汇总（begin/end/log/report） |
-| `env.example` | `.env` 模板（provider 选择与密码纪律注释齐） |
+| `channel.sh` | **v1.5.0 通道单一动作**：`status`（只判不建）/ `ensure`（deploy 通道保障）/ `confirm`（四段验收+ssh2 复核）/ `post`（VM SYSTEM post 动作拆通道） |
+| `vm-remove-local.ps1` | **v1.5.0 VM 端本地卸载**（对齐 `uninstall.mjs buildVmPs1`；`-Apply` / `-PurgeWorkspace` / `-ScheduleTunnelRollback`），全 ASCII |
+| `build-vm-bundle.sh` | **v1.5.0 通道坏时**产出 VM 侧合并包（vm 卸载 + hos `-Rollback` + `RUN-ME.ps1` + `PASTE-THIS.txt`） |
+| `roundtrip.sh` | 一键往返模板（首选入口）；full 卸载段默认保留通道；R2.5 判稳结果作 gate；末块 `ROUNDTRIP_RESULT` 机器可读 |
+| `deploy.sh` / `undeploy.sh` / `verify.sh` | 三流程 driver（deploy/undeploy 默认 dry-run、`--apply` 执行；verify 直接跑；全程 step 计时） |
+| `env-detect.sh` / `download-verify.sh` / `pkg-root.sh` | 运行时冒烟、取包三件套、包根三级选根单一事实源 |
+| `vm-conn.sh` / `ssh2-conn.mjs` / `ps-run.sh` | 双通道+ssh2 后端、后端实体、远端 PS 铁律执行器 |
+| `preflight.sh` / `wait-channel.sh` / `probe-fresh.sh` / `step.sh` | 体检、判稳器（gate）、探针新鲜四防线、计时留痕 |
+| `self-rescue.sh` / `env.example` | 能力通道自救（restart-guest 禁用）、`.env` 模板 |
 
 ## references（按需加载）
 
-- `troubleshooting.md` — 问题百科（现象→根因→解法，含 run/ISSUES 出处与版本门槛表）
-- `known-good-flow.md` — 每环节判据摘录 + 预期耗时带（run11/12 实测基线），判"慢是否异常"
+- `troubleshooting.md` — 现象→根因→解法百科（含版本门槛表）
+- `known-good-flow.md` — 判据摘录 + 预期耗时带（判「慢是否异常」）
 
 ## 权威文档关系
 
-本技能是**唯一执行权威**（部署/安装/启动/验证/卸载全流程，≥V1.4.26 发布包；免密通道生命周期再外委 hos-winvm-ssh-tunnel，见对应章）。母仓库侧 `docs/deploy/deploy-strategy.md`（策略与参数表）、`docs/deploy/deploy-reports/`（实跑复盘）仍作深参考；`deploy.prompt`/`undeploy.prompt` 自迭代28 起**降级退役**——仅存仓库作历史决策档案与无 Agent 场景纯粘贴参考，不再入发布包、不再是判据来源；与本技能有出入处**一律以技能为准**（历史 .prompt 内容仅存档不回改）。发布包完整性由 pack **V11（迭代28 重构版）** 机械化断言钉：技能四件+URL 入口章+roundtrip+通道外委章+四 driver 在场。
+本技能是**唯一执行权威**（部署/安装/启动/验证/卸载全流程；免密通道生命周期外委 hos-winvm-ssh-tunnel）。母仓库 `docs/deploy/deploy-strategy.md`、`docs/deploy/deploy-reports/` 仅作深参考；`deploy.prompt`/`undeploy.prompt` 自迭代28 起降级退役，**一律以本技能 SKILL.md 与 `references/troubleshooting.md` 为判据来源**（历史 .prompt 仅存档不回改、不再入发布包）。发布包完整性由 pack **V11** 断言钉：技能四件 + URL 入口章 + roundtrip + 通道外委章 + 四 driver 在场——v1.5.0 全部保留，新增脚本经白名单复制器自动入包。

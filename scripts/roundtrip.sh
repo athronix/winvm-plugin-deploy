@@ -8,6 +8,8 @@
 #   - 探针新鲜复用：deploy C5 通过后落 stamp，verify 在同包根 600s 内跳过重跑（省 ~240s）
 #   - 全程 ssh2 后端（灭相位免疫）；steps.tsv 子步计时统一进 RUN_DIR；机器可读末块供 LLM 一次解析
 #   - 失败即停+定点报障（对照 troubleshooting.md），不做无谓续跑
+# v1.5.0：full 卸载默认 --keep-tunnel（拆后要重装，通道不能拆，否则重装要人工建通道）；
+#   R2.5 UNSTABLE 先做 ssh2 新建连接权威复核，复核也失败才 GATE 停链（e2e2 805s 假 FAIL 实锤）。
 #
 # 用法：
 #   VM_HOST=172.16.100.2 bash roundtrip.sh                    # 默认 ACTION=full（取包+拆+装+验）
@@ -68,8 +70,15 @@ fi
 
 # ── 序列二：拆除 ──────────────────────────────────────────────────────
 if [ "$ACTION" = full ] || [ "$ACTION" = undeploy ]; then
-  _step "R2 undeploy --apply"
-  bash "$_here/undeploy.sh" --apply > "$RUN_DIR/undeploy.log" 2>&1; RC=$?
+  # v1.5.0：full = 拆了要立刻装回去，通道必须留着（undeploy 三段式里第 3 段显式跳过）。
+  # 否则拆完通道坏 → undeploy 会发 VM 合并包要求人工执行 → 一键链被人工步骤卡死。
+  UARGS="--apply"
+  if [ "$ACTION" = full ] && [ "${ROUNDTRIP_KEEP_TUNNEL:-1}" = "1" ]; then
+    UARGS="$UARGS --keep-tunnel"
+    say "R2 full 默认 --keep-tunnel（保留通道供 R3 自动部署；ROUNDTRIP_KEEP_TUNNEL=0 可关）"
+  fi
+  _step "R2 undeploy $UARGS"
+  bash "$_here/undeploy.sh" $UARGS > "$RUN_DIR/undeploy.log" 2>&1; RC=$?
   RES_U=$([ $RC -eq 0 ] && echo PASS || echo "FAIL(rc=$RC)")
   [ $RC -ne 0 ] && { FAILED="$FAILED undeploy"; say "FAIL R2 → 查 $RUN_DIR/undeploy.log（troubleshooting kept/僵尸行）"; }
   say "R2 $RES_U"
@@ -79,12 +88,30 @@ fi
 # ── 序列三：安装（C5 通过会写探针 stamp 供 R4 复用） ─────────────────
 # e2e2R6（11-12 e2e2 三例实锤 S8/S9/S10）：拆机重启 sshd 后存在认证段瞬态窗
 # （光谱=124 挂起/111 瞬拒/255 拒——124 文案只写"VM 开机期"覆盖不全），背靠背装
-# 必撞 RED 早退。full 模式在拆与装之间插入判稳（wait-channel 连击 2×4，预算 ~8min；
-# 不稳不阻断——deploy 自带 preflight 重试语义，撞窗则如实 FAIL 由调用方决策重跑）。
+# 必撞 RED 早退。full 模式在拆与装之间插入判稳（wait-channel 连击 2×4，预算 ~10min）。
+# v1.5.0 F-09：旧 `|| true` 把 UNSTABLE 吞掉仍进 R3 = 805s 假 FAIL；现改 GATE，
+# 但先用 ssh2 新建连接实测复核，避免二进制判稳自身错钥/相位挂造成误停。
 if [ "$ACTION" = full ]; then
   _step "R2.5 wait-channel 判稳（拆后瞬态窗）"
-  timeout 560 bash "$_here/wait-channel.sh" 2 4 > "$RUN_DIR/wait-channel.log" 2>&1 || true
-  say "R2.5 STABILITY=$(grep -oE 'STABLE|UNSTABLE' "$RUN_DIR/wait-channel.log" | tail -1)"
+  timeout 600 bash "$_here/wait-channel.sh" 2 4 > "$RUN_DIR/wait-channel.log" 2>&1; WRC=$?
+  STAB="$(grep -oE 'STABLE|UNSTABLE' "$RUN_DIR/wait-channel.log" | tail -1)"
+  say "R2.5 STABILITY=${STAB:-UNKNOWN} rc=$WRC"
+  if [ "$WRC" -ne 0 ]; then
+    # F-09：连击判稳失败 != 通道不存在（旧裸 ssh 错钥/相位挂）。用 ssh2 新建连接
+    # 单发 ping 作权威复核；仍失败才是真环境窗，必须 GATE，撞窗硬跑=805s 假 FAIL。
+    if bash "$_here/channel.sh" confirm > "$RUN_DIR/channel-confirm.log" 2>&1; then
+      say "R2.5 OVERRIDE=SSH2_READY（ssh2 新建连接实测通过；连击 UNSTABLE 不作 gate）"
+    else
+      FAILED="$FAILED channel-unstable"
+      say "R2.5 GATE：连击判稳与 ssh2 权威复核均败 → 不进 R3（等健康窗；绝不重启 VM）"
+      tail -4 "$RUN_DIR/channel-confirm.log" 2>/dev/null || true
+      echo "== ROUNDTRIP_RESULT =="
+      echo "ACTION=$ACTION UNDEPLOY=$RES_U DEPLOY=SKIP VERIFY=SKIP WALL_S=$(( $(date +%s) - T0 ))"
+      echo "RUN_DIR=$RUN_DIR PKG=$PKG_NOTE"
+      echo "VERDICT=NO FAILED:$FAILED"
+      exit 6
+    fi
+  fi
 fi
 if [ "$ACTION" = full ] || [ "$ACTION" = deploy ]; then
   _step "R3 deploy --apply"

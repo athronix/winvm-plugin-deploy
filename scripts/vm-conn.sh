@@ -4,7 +4,7 @@
 # 通道选择（vm_channel_probe 自动判定并设 VM_CHANNEL=key|password）：
 #   1) 免密在（BatchMode 可达）           → key   通道（最简，历轮标准拓扑）
 #   2) 免密不在 + WINVM_SSH_PASSWORD 在场 → password 通道（askpass，绕开 uid 漂移/密钥缺失）
-#   3) 都不满足                            → 返回 1：按执行协议 P-1 问用户建通道（deploy.prompt Step 1）
+#   3) 都不满足                            → 返回 1：按执行协议 P-1 问用户建通道（SKILL.md URL 单指令入口 / 通道保障章）
 # 密码纪律：只经环境变量传递，绝不写入文件/命令行参数/日志（askpass 子进程从 env 取）。
 # run16 新增：VM_SSH_BACKEND=key|ssh2|auto 后端开关（ssh2 走 ssh2-conn.mjs，绕开 OpenSSH 二进制相位挂）。
 set -u

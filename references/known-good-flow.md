@@ -1,7 +1,8 @@
 # 已知良好流程（判据摘录与耗时带宽）
 
 用途：判断「慢是不是异常」「这步本来该输出什么」。数据源=run8/11/12 真机实测（V1.4.16/17 代际）。
-判据权威原文始终以 docs/deploy/{deploy,undeploy}.prompt 为准，本文只摘数值与形态。
+**判据权威 = 本技能 `SKILL.md` + `references/troubleshooting.md`**（迭代28 起 `deploy.prompt`/`undeploy.prompt` 已降级退役，仅存档、不入发布包、不再回改）；本文只摘数值与形态。
+v1.5.0：卸载改为三段式（host / vm / ssh 通道），下表 U0~U4 旧编号仅作耗时带对照，实际判据见「五、v1.5.0 三段式卸载判据」。
 
 ## 一、各环节预期耗时带（干净场景，宿主→VM 全链）
 
@@ -36,3 +37,16 @@
 ## 四、拆除⇄安装回环验收基线
 
 一轮干净往返的"完全合格"= 上述环节**零重试、零人工纠正、每步 rc=0**（run10/12 达成态）；任何一次脚本面 RETRY 都要在报告 issues 列写明「现象/根因/方案」——driver 的 steps.tsv 即为该报告数据源（`step.sh report` 直出 Top5/问题行）。
+
+## 五、v1.5.0 三段式卸载判据（权威）
+
+| 段 | 输出锚点 | 判据 |
+|---|---|---|
+| 0 通道状态（只判不建） | `CHANNEL_UP=0|1 REBUILD=NO` | `REBUILD=NO` 必须在场；出现 `ensure` / `host-generate-key` /「重建通道」=违规 |
+| 1 host | `HOST_PASS=n HOST_FAIL=0` | `[PASS] HOST` ≥11 且零 `[FAIL] HOST`；`uninstall.mjs` rc=1 属预期（VM 相位按设计跳过） |
+| 2 vm（通道在） | `VM_CLEANUP_DONE` + POST STATUS | `BRIDGE_DIR=False / TASK_EXISTS=False / PORT_LISTEN=False / BRIDGE_NODE_LEFT=False`；SSHD 不作判据 |
+| 2 vm（通道不在） | `VM_BUNDLE=<dir>` + `NEED_USER_ACTION=1` | 目录四件齐全：`vm-remove-local.ps1` / `wb-rollback.ps1` / `RUN-ME.ps1` / `PASTE-THIS.txt`；VM 终态=`PENDING_USER`（不算失败） |
+| 3 ssh 通道 | `TUNNEL_POST_DONE` 或 `TUNNEL_POST_MERGED=1` | 成功判据=**免密登录不再可用**（不是 22 端口关闭）；VM 侧 SYSTEM 任务 `WbTunnelRollback` 在场 |
+| 收口 | `UNDEPLOY_DONE parts=host+vm+tunnel vm_mode=...` | `vm_mode=workbuddy|user-bundle`；`--keep-tunnel` 时该段显式跳过 |
+
+耗时带（v1.5.0 宿主侧预期）：通道状态判定 ≤20s（ssh2 ping 单发）；host 段 15~40s；VM 段通道在 ~30~60s、通道不在=合并包生成 <2s + 用户执行；通道 post 段 ~20~40s。显著超带先查 sshd 灭窗相位（ssh2 后端已免疫二进制挂起）。
