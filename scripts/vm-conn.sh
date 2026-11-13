@@ -11,7 +11,17 @@ set -u
 # 硬超时纪律：本宿主 ssh 在 sshd 连接位占满时会【无限挂起】（连 BatchMode 也不退，2026-11-03 实测卡 8 分钟）
 # ——所有远端调用必须包 timeout；VM_SSH_TIMEOUT 可调（默认 25s/次）。
 VM_SSH_TIMEOUT="${VM_SSH_TIMEOUT:-25}"
-_ssh_t() { timeout "$VM_SSH_TIMEOUT" "$@"; }
+# ── E2E4 定谳（11-13）：传输预算 ≠ 载荷预算，混用=确定性假红 ──
+# 旧实现只用 VM_SSH_TIMEOUT（25s）一个变量同时管「连接/握手」与「远端 PowerShell 执行」。
+# 实测 PowerShell 载荷自身耗时 47~56s（Get-ScheduledTask 全枚举 + Get-NetTCPConnection
+# 走 MSFT_NetTCPConnection + /health HTTP + PS 冷启），必然撞穿 30s 每次窗 → rc=124，
+# 且 `-File` 型载荷是「跑完才输出」，超时即**零输出**（vmcheck 153s rc=124 日志仅 2 行，
+# 被误读成通道坏）。⇒ 载荷执行走独立预算 VM_SSH_EXEC_TIMEOUT（调用方按需提升），
+# 默认回落 VM_SSH_TIMEOUT 保持既有轻量调用零冲击。
+VM_SSH_EXEC_TIMEOUT="${VM_SSH_EXEC_TIMEOUT:-$VM_SSH_TIMEOUT}"
+# 尝试次数可调（重载荷超时非瞬态：ps-run 传 2 而非 3，避免失败路径拖到 8min+）
+VM_SSH_TRIES="${VM_SSH_TRIES:-3}"
+_ssh_t() { timeout "${VM_SSH_EXEC_TIMEOUT:-$VM_SSH_TIMEOUT}" "$@"; }
 : "${VMDEPLOY_ENV_SH:=${HOME}/wbtmp/vmdeploy-env.sh}"; [ -f "$VMDEPLOY_ENV_SH" ] && . "$VMDEPLOY_ENV_SH"
 : "${VM_HOST:=}"; : "${VM_USER:=User}"; : "${VM_SSH_PORT:=22}"
 VM_CHANNEL="${VM_CHANNEL:-}"
@@ -93,17 +103,17 @@ vmssh() {
   # ── ssh2 后端（run17 D-4 定序）：三试（间隔 5s）→ 皆 111/124 → 二进制兜底一发 → 仍败透传 rc ──
   # 远端非零码（∉{111,124}）直通不重试不兜底（R8 语义与 key 通道一致）；timeout 外层包 node。
   if _use_ssh2; then
-    for i in 1 2 3; do
-      timeout $(( VM_SSH_TIMEOUT + 5 )) "$_ssh2n" "$SSH2_CONN_SH" exec "$@"; rc=$?
+    for i in $(seq 1 "${VM_SSH_TRIES:-3}"); do
+      timeout $(( ${VM_SSH_EXEC_TIMEOUT:-$VM_SSH_TIMEOUT} + 5 )) "$_ssh2n" "$SSH2_CONN_SH" exec "$@"; rc=$?
       [ "$rc" -eq 0 ] && return 0
       _ssh2_infra_rc "$rc" || return "$rc"
-      [ "$i" -lt 3 ] && sleep 5
+      [ "$i" -lt "${VM_SSH_TRIES:-3}" ] && sleep 5
     done
-    echo "vmssh: ssh2 传输层失败 rc=$rc（3 试尽）→ 二进制兜底一发" >&2
+    echo "vmssh: ssh2 传输层失败 rc=$rc（${VM_SSH_TRIES:-3} 试尽）→ 二进制兜底一发" >&2
     _ssh_bin_one "$@" && return 0
     return "$rc"
   fi
-  for i in 1 2 3; do
+  for i in $(seq 1 "${VM_SSH_TRIES:-3}"); do
     case "${VM_CHANNEL:-key}" in
       key) _ssh_t ssh -o BatchMode=yes "${_ssh_common[@]}" -p "$VM_SSH_PORT" "${VM_USER}@${VM_HOST}" "$@" && return 0 ;;
       password) _ssh_t _askpass_env ssh -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \

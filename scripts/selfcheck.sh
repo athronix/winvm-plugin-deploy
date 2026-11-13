@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# winvm-plugin-deploy · 自检门禁 (v1.8.0)
+# winvm-plugin-deploy · 自检门禁 (v1.8.0 起；v1.9.0 加 F-26 载荷预算分离)
 #
 # 一个命令跑完本技能的全部可本地验证断言（不需要 VM、不碰通道）：
 #   静态面 : bash -n / 控制字符 / frontmatter / V11 断言锚点 / 入包枚举 / 相对链接 / ASCII 载荷
@@ -52,7 +52,7 @@ os.makedirs(BASE, exist_ok=True)
 CLONE = os.path.join(BASE, "skill")
 shutil.copytree(SK, CLONE, ignore=shutil.ignore_patterns(".git", "dist", "__pycache__"))
 
-TARGETS = ["scripts/ps-run.sh", "scripts/deploy.sh", "scripts/step.sh", "SKILL.md"]
+TARGETS = ["scripts/ps-run.sh", "scripts/deploy.sh", "scripts/step.sh", "scripts/vm-conn.sh", "SKILL.md"]
 PRISTINE = {t: open(os.path.join(CLONE, t), encoding="utf-8").read() for t in TARGETS}
 
 
@@ -120,11 +120,18 @@ def m5():  # frontmatter 版本号非 SemVer
     open(p, "w", encoding="utf-8").write(s[:i] + "version: 1.x" + s[j:])
 
 
+def m6():  # F-26：载荷执行退回裸调用（预算分离失效 → E2E4 假红复发）
+    edit("scripts/ps-run.sh",
+         '_payload _ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}"',
+         '_ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}"')
+
+
 MUT = [("M1 F-19 插值回归", m1, "F-19 ps-run zero-interpolation (code lines)"),
        ("M2 F-21 判据放宽", m2, "F-21 strict verdict"),
        ("M3 F-24 空摘录不归一", m3, "F-23/24/25 action-trace guard"),
        ("M4 F-23 无日志索引", m4, "F-23/24/25 action-trace guard"),
-       ("M5 版本号非 SemVer", m5, "frontmatter name/version")]
+       ("M5 版本号非 SemVer", m5, "frontmatter name/version"),
+       ("M6 F-26 载荷预算回退", m6, "F-26 payload budget split")]
 
 print("=== baseline（未变异，必须 ALL_GREEN）===")
 reset()
@@ -217,7 +224,12 @@ missing = [s for s in NEED_STR if s not in skill_md]
 chk("V11 SKILL.md string anchors", not missing, "missing=%s" % missing)
 
 rel = lambda p: os.path.relpath(p, SK).replace(os.sep, "/")
-entries = ["winvm-plugin-deploy/SKILL.md", "winvm-plugin-deploy/RELEASE-VERSION.txt"]
+# 只登记**实际存在**的顶层件：无条件预置会让子断言恒真（RELEASE-VERSION.txt 由母项目 pack
+# 写入 staging zip，技能仓里没有；预置它=空断言）。该项现由母项目 V11 断言负责。
+entries = []
+for f in ("SKILL.md",):
+    if os.path.isfile(os.path.join(SK, f)):
+        entries.append("winvm-plugin-deploy/" + f)
 for sub in ("scripts", "references", "assets"):
     d = os.path.join(SK, sub)
     if os.path.isdir(d):
@@ -225,7 +237,7 @@ for sub in ("scripts", "references", "assets"):
             for f in fs:
                 entries.append("winvm-plugin-deploy/" + rel(os.path.join(dp, f)))
 NEED_FILE = ["SKILL.md", "scripts/ssh2-conn.mjs", "scripts/undeploy.sh", "references/troubleshooting.md",
-             "RELEASE-VERSION.txt", "scripts/roundtrip.sh", "scripts/probe-fresh.sh"]
+             "scripts/roundtrip.sh", "scripts/probe-fresh.sh"]
 missing = [x for x in NEED_FILE if "winvm-plugin-deploy/" + x not in entries]
 chk("V11 package file anchors", not missing, "missing=%s" % missing)
 
@@ -263,6 +275,34 @@ chk("F-21 strict verdict",
        "&&" in _body, dp.count("! _envcheck_ok")))
 cx = rd(os.path.join(SK, "scripts", "context.sh"))
 chk("F-22 key probe", "VM_KEY_PROBE" in cx and "READY" in cx)
+
+# ---------- F-26 传输预算 / 载荷预算分离（E2E4 定谳 11-13） ----------
+# 现象：vmcheck 153s rc=124，日志只有「VM_CHANNEL/传输层失败」两行、零载荷输出 → 被误判通道坏。
+# 实测：同通道 ssh2 ping 2.6s，而 vmcheck.ps1 自身耗时 47~56s（连测 47/53/56 三发），
+#   每次都撞穿 VM_SSH_TIMEOUT+5=30s 的**传输**窗；`-File` 型载荷「跑完才输出」⇒ 超时=零输出。
+# 断言形态（可证伪）：①ps-run 定义 VM_PS_TIMEOUT 且默认 >=120；②每一处 powershell 载荷执行
+# 都必须经 _payload 前缀（裸 _ps_cmd "powershell 计数须为 0）；③vm-conn 的 ssh2 exec 与 _ssh_t
+# 都认 VM_SSH_EXEC_TIMEOUT、重试次数认 VM_SSH_TRIES（否则预算抬了也被 25s 兜底杀）。
+vc = rd(os.path.join(SK, "scripts", "vm-conn.sh"))
+code_vc = "\n".join(l for l in vc.splitlines() if not l.lstrip().startswith("#"))
+_mps = re.search(r'VM_PS_TIMEOUT="\$\{VM_PS_TIMEOUT:-(\d+)\}"', code_ps)
+# 恰好两个载荷执行点必须带 _payload：-File 推文件、-c 的 EncodedCommand 载荷；
+# 远端临时件清理（-EncodedCommand ${_enc}）是轻调用，必须保持裸调用（25s 传输窗），
+# 否则清理挂起会白等 180s。
+_file_w = '_payload _ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}"' in code_ps
+_enc_w = ('_payload _ps_cmd "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass '
+          '-EncodedCommand ${ENC}"') in code_ps
+_clean_bare = '_ps_cmd "powershell -NoProfile -NonInteractive -EncodedCommand ${_enc}"' in code_ps
+_wired = len(re.findall(r'_payload _ps_cmd "powershell', code_ps))
+_vc_exec = code_vc.count("VM_SSH_EXEC_TIMEOUT:-")
+chk("F-26 payload budget split",
+    bool(_mps) and int(_mps.group(1)) >= 120
+    and _wired == 2 and _file_w and _enc_w and _clean_bare
+    and 'VM_SSH_EXEC_TIMEOUT="$VM_PS_TIMEOUT"' in code_ps
+    and "VM_SSH_TRIES=2" in code_ps
+    and _vc_exec >= 2 and "VM_SSH_TRIES:-" in code_vc,
+    "ps_timeout=%s wired=%d file=%s enc=%s clean=%s vc_exec=%d"
+    % (_mps.group(1) if _mps else "?", _wired, _file_w, _enc_w, _clean_bare, _vc_exec))
 
 # ---------- 11 F-19 EncodedCommand roundtrip (needs node) ----------
 JS = ('process.stdout.write(Buffer.from("Remove-Item -LiteralPath \\"" + process.argv[1] + '

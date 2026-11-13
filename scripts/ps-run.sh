@@ -18,10 +18,22 @@ if [ -z "${VM_CHANNEL:-}" ]; then vm_channel_probe || exit 1; fi
 
 _ps_cmd() { vmssh "$1"; }   # $1=已确保零本地展开的命令串
 
+# ── E2E4 定谳（11-13）：载荷执行走独立预算，不与 25s 传输窗混用 ──
+# 现象：vmcheck 153s rc=124、日志仅「VM_CHANNEL/传输层失败」两行、零载荷输出 → 被误判通道坏。
+# 实测：同一通道 ping 2.6s 通，而 vmcheck.ps1 自身耗时 47~56s（连测 47/53/56s 三次）——
+#   Get-ScheduledTask 全枚举 + Get-NetTCPConnection + /health HTTP + PS 冷启。
+# 每次尝试窗 = VM_SSH_TIMEOUT+5 = 30s < 载荷耗时 ⇒ 每次都被外层 timeout 杀，确定性假红。
+# 处置：载荷执行 VM_PS_TIMEOUT（默认 180s≈3x 余量）+ VM_SSH_TRIES=2（重载荷超时非瞬态，
+#   3 试会让真失败路径拖到 8min+）。scp/连接探测仍用 VM_SSH_TIMEOUT(25s)，语义不被污染。
+# 注意：`-File` 型载荷是「跑完才吐输出」，超时=零输出；故 workload 侧判据行必须前置
+#   （见 qa/deploy-probes/vm-env-check.ps1 verdict-first 改动），预算与前置是双保险。
+VM_PS_TIMEOUT="${VM_PS_TIMEOUT:-180}"
+_payload() { VM_SSH_EXEC_TIMEOUT="$VM_PS_TIMEOUT" VM_SSH_TRIES=2 "$@"; }
+
 if [ "${1:-}" = "-c" ]; then
   PS_LINE="${2:?-c 需要 PowerShell 语句}"
   ENC="$("$NODE" -e 'process.stdout.write(Buffer.from(process.argv[1],"utf16le").toString("base64"))' "$PS_LINE")"
-  _ps_cmd "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${ENC}"; exit $?
+  _payload _ps_cmd "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${ENC}"; exit $?
 fi
 
 PS_LOCAL="${1:?用法：ps-run.sh <file.ps1> [out] 或 ps-run.sh -c '<line>'}"
@@ -33,7 +45,7 @@ base="$(basename "$PS_LOCAL")"
 
 vmscp "$PS_LOCAL" "${VM_USER}@${VM_HOST}:${base}" >/dev/null 2>&1 || { echo "VMS scp 失败（先查 VM_CHANNEL）" >&2; exit 1; }
 _tmp="$(mktemp)"
-_ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}" > "$_tmp" 2>&1; rc=$?
+_payload _ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}" > "$_tmp" 2>&1; rc=$?
 # 清理远端临时件走 EncodedCommand（Remove-Item 含 -LiteralPath，避免壳吞参）
 # F-19 (E2E3): the old JS template literal referenced an undefined `base`
 # (it is a BASH var, never a JS var) -> ReferenceError on EVERY remote PS call,

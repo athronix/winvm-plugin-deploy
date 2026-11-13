@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
-description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端安装/卸载/复验的唯一执行权威；v1.8.0 起内置自检门禁 scripts/selfcheck.sh（15 项断言 + --mutate 变异自证，改完先跑它）；v1.7.0 起提供一次执行的统一入口 run-flow.sh + 环境事实前置冻结 context.sh + 动作级日志/过程执行环节信息表（默认前台只打最终表）。v1.6.0 起 SSH 免密通道生命周期能力**内置**（独立技能 hos-winvm-ssh-tunnel v2.3.0 的 SKILL.md 全文 + 6 脚本 + 5 参考文档已整体并入，部署只需安装本技能一个，无需再装第二个 skill）+ 三流程职责定界：卸载=host 端+vm 端+ssh 通道三段且通道坏时绝不重建（VM 侧两件合并成一个用户脚本）；部署=通道保障（在则不建，不在才引导内置一键脚本让用户配合）+两端自动部署；verify=deploy ready 后由 WorkBuddy 自调的健康与功能性监测。封装 roundtrip.sh 一键往返模板、channel.sh 通道单一动作、VM 侧本地卸载 ps1 与合并包、ssh2 后端、远端 PowerShell 铁律执行器、分步计时与问题百科。Use when: 部署/重装/卸载 winvm-plugin；按技能 URL 安装/卸载/验证；VM ssh 连不上、通道已毁、发布包下载失败、安装前置体检、插件健康复验；需要构建/验证/拆除 VM 免密 SSH 通道。"
-version: 1.8.0
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主与 Windows VM 双端安装/卸载/复验的唯一执行权威；v1.9.0 起把「传输预算」与「PowerShell 载荷执行预算」解耦（`VM_PS_TIMEOUT` 默认 180s，远端探针自身耗时 47~56s 曾被 30s 传输窗杀成假红）；v1.8.0 起内置自检门禁 scripts/selfcheck.sh（16 项断言 + --mutate 变异自证，改完先跑它）；v1.7.0 起提供一次执行的统一入口 run-flow.sh + 环境事实前置冻结 context.sh + 动作级日志/过程执行环节信息表（默认前台只打最终表）。v1.6.0 起 SSH 免密通道生命周期能力**内置**（独立技能 hos-winvm-ssh-tunnel v2.3.0 的 SKILL.md 全文 + 6 脚本 + 5 参考文档已整体并入，部署只需安装本技能一个，无需再装第二个 skill）+ 三流程职责定界：卸载=host 端+vm 端+ssh 通道三段且通道坏时绝不重建（VM 侧两件合并成一个用户脚本）；部署=通道保障（在则不建，不在才引导内置一键脚本让用户配合）+两端自动部署；verify=deploy ready 后由 WorkBuddy 自调的健康与功能性监测。封装 roundtrip.sh 一键往返模板、channel.sh 通道单一动作、VM 侧本地卸载 ps1 与合并包、ssh2 后端、远端 PowerShell 铁律执行器、分步计时与问题百科。Use when: 部署/重装/卸载 winvm-plugin；按技能 URL 安装/卸载/验证；VM ssh 连不上、通道已毁、发布包下载失败、安装前置体检、插件健康复验；需要构建/验证/拆除 VM 免密 SSH 通道。"
+version: 1.9.0
 agent_created: true
 ---
 
@@ -34,7 +34,7 @@ VM_HOST=... REGISTRY_FIX=1 bash scripts/run-flow.sh      # 同时修复同名 sk
 - **动作级留痕**：`step.sh` 在每个 `begin/end` 自动采集前后轻量状态、耗时、rc、判据、错误摘录，并从 catalog 补齐命令/主体/环境/下一分支/可合并性；`action-report.sh` 汇总成 `process-actions.md`（含四元组失败分析与合并效率分析）。`steps.tsv` 旧格式保持不变，分步 driver 可继续单独用。
 - **C3.0 硬门禁三修（v1.7.0 · E2E3 实证 F-19/F-20/F-21）**：判据=`ENV_PRECHECK=PASS` **且** `BLOCKERS=none`（旧 `grep -q ENV_PRECHECK` 连 FAIL 也命中=假绿）；仅当 rc∈{124,111,255} 或日志含 `vmssh: ssh2 传输层失败`、且 `NODE_OK=true`/`CLI_OK=true` 在场（探测主体已跑通、只是尾部传输被截断）才触发**一次有界幂等复跑**，首试日志留 `env-check.attempt1.log`，达标即 PASS 且不拖垮 R4；`ps-run.sh` 远端清理 EncodedCommand 改 `process.argv[1]` 零插值。配置性失败绝不吞，按 P-2 处置、**绝不重启 VM**。四用例行为守卫见 `references/troubleshooting.md` B 表。
 
-**版本史**：v1.8.0=自检门禁单文件化 `scripts/selfcheck.sh`（15 项静态+行为断言，`--mutate` 5 组变异自证可证伪；随技能分发，改完/发布前必跑）；v1.7.0=统一入口 + 参数前置冻结 + 动作级日志/环节表 + 全分支决策表 + F-17/F-18 修复 + skill 注册漂移自证；v1.7.0 补丁轮=E2E3 实证 F-19/F-20/F-21 三修（清理串零插值 / C3.0 有界幂等复跑 / 判据收紧）+ 四用例行为守卫 ALL_GREEN；F-22 第二轮实证（密钥实测择优，杜绝把密钥漂移误报成环境灭窗）；F-23/F-24/F-25 第三轮实证（动作级观测链：`step.sh log` 记 epoch→名索引，`end` 按本动作时间窗解析真实驱动日志，修复 log_path/error_excerpt 恒为 `-`；错误摘录空结果归一化为 `-`（管道退出码坑）；沙箱 `getcwd/chdir` 噪声白名单，避免 PASS 行被伪错误污染）。**E2E3 真机全绿**：`ACTION=full UNDEPLOY=PASS DEPLOY=PASS VERIFY=PASS VERDICT=YES` 994s/23 动作 0 失败。
+**版本史**：v1.9.0=**传输预算 / 载荷预算解耦**（E2E4 真机定谳）：`vm-conn.sh` 新增 `VM_SSH_EXEC_TIMEOUT`（默认回落 `VM_SSH_TIMEOUT`）与 `VM_SSH_TRIES`；`ps-run.sh` 把每一处 PowerShell **载荷**执行改经 `_payload` 前缀，走独立预算 `VM_PS_TIMEOUT`（默认 180s、2 试）。根因：`vmcheck.ps1` 自身耗时实测 47/53/56s（`Get-ScheduledTask` 全枚举 + `Get-NetTCPConnection` + `/health` HTTP + PS 冷启）> 旧 30s 每次窗 ⇒ 每次都被外层 timeout 杀、且 `-File` 型载荷「跑完才输出」故超时=**零输出**，被误读成通道坏（153s rc=124 日志仅 2 行）。断言 F-26 + 变异 M6 固化为不变量。**若看到「探针 rc=124 且日志无载荷输出」先量载荷耗时，勿先怀疑通道**。v1.8.0=自检门禁单文件化 `scripts/selfcheck.sh`（16 项静态+行为断言，`--mutate` 6 组变异自证可证伪；随技能分发，改完/发布前必跑）；v1.7.0=统一入口 + 参数前置冻结 + 动作级日志/环节表 + 全分支决策表 + F-17/F-18 修复 + skill 注册漂移自证；v1.7.0 补丁轮=E2E3 实证 F-19/F-20/F-21 三修（清理串零插值 / C3.0 有界幂等复跑 / 判据收紧）+ 四用例行为守卫 ALL_GREEN；F-22 第二轮实证（密钥实测择优，杜绝把密钥漂移误报成环境灭窗）；F-23/F-24/F-25 第三轮实证（动作级观测链：`step.sh log` 记 epoch→名索引，`end` 按本动作时间窗解析真实驱动日志，修复 log_path/error_excerpt 恒为 `-`；错误摘录空结果归一化为 `-`（管道退出码坑）；沙箱 `getcwd/chdir` 噪声白名单，避免 PASS 行被伪错误污染）。**E2E3 真机全绿**：`ACTION=full UNDEPLOY=PASS DEPLOY=PASS VERIFY=PASS VERDICT=YES` 994s/23 动作 0 失败。
 
 **卸载 = 恰好三段，顺序不可换**：① host 端 ② vm 端 ③ ssh 通道。②③ 可合并。
 - 通道**在**：② 由 WorkBuddy 经 ssh2 完成；③ 把内置 `-Rollback` 设为 **VM 侧 SYSTEM post 动作**（`WbTunnelRollback` 计划任务），让 VM Windows 在本会话断开后自己执行——避免拆 sshd 时自断通道。
@@ -60,7 +60,10 @@ VM_HOST=... REGISTRY_FIX=1 bash scripts/run-flow.sh      # 同时修复同名 sk
 2. **取包** gitee 主、github 备；tag 现解 `releases/latest`。
 3. **远端 PowerShell 铁律**：复合逻辑=写 `.ps1` → scp → `powershell -File`；短片段=`-EncodedCommand`（base64 UTF-16LE）。禁双引号内联含 `$` 的 PS；一律经 `scripts/ps-run.sh`。VM 侧脚本**全 ASCII**（ps-run.sh 有门禁）。
 4. **宿主删文件禁 `rm`** → `node -e 'fs.unlinkSync(...)'`；禁 `rm -rf <目录>`。
-5. **ssh/scp 必包外层 timeout**（`vm-conn.sh` 内建 `VM_SSH_TIMEOUT=25`）。
+5. **ssh/scp 必包外层 timeout**（`vm-conn.sh` 内建 `VM_SSH_TIMEOUT=25`）。**两个预算不可混用**：
+   连接/握手/短命令用 `VM_SSH_TIMEOUT`；远端 PowerShell **载荷**执行用 `VM_PS_TIMEOUT`（默认 180s，由 `ps-run.sh`
+   的 `_payload` 前缀注入 `VM_SSH_EXEC_TIMEOUT`+`VM_SSH_TRIES=2`）。本机实测载荷自身 47~56s，写死 25s 会把
+   「跑完才输出」的 `-File` 载荷杀成零输出 rc=124（E2E4 定谳 F-26）。自己写新探针若预估 >120s，显式调 `VM_PS_TIMEOUT`。
 6. **统一后端**：`channel.sh`/`deploy.sh`/`undeploy.sh`/`verify.sh`/`roundtrip.sh` 一律 `export VM_SSH_BACKEND=ssh2`（v1.5.0 起由脚本自身保证，勿再手工 export）。
 7. **密钥单一事实源**：`WINVM_VM_KEY` 三级链 env > `~/.workbuddy/winvm/vm-conn.json` identityFile > `~/.ssh/id_ed25519`；`channel.sh ensure` 把该值作为内置 `host-generate-key.sh` 第 1 参，禁止双钥并存都试。
 8. **密码只走环境变量**（askpass / `WINVM_VM_PASSWORD`），不落盘不进命令行。
@@ -184,15 +187,15 @@ bash scripts/step.sh report           # 计时汇总
 | **`action-catalog.tsv`** | 全分支决策底座：每个基本维护动作的命令/主体/环境/前置/成功下一步/失败下一步/可合并性 |
 | **`action-report.sh`** | 由 `actions.tsv` 生成「过程执行环节信息列表」Markdown（含前后状态差异、耗时、rc、错误摘录、四元组、合并分析） |
 | `step.sh`（v1.7.0 增强） | 原有计时不变；新增动作级 `actions.tsv` + `states/*-pre/post.txt` + catalog 元数据补齐 |
-| **`selfcheck.sh`**（v1.8.0） | 技能自检门禁：15 项静态+行为断言（不需要 VM），自定位 `SKILLDIR`、纯 bash 驱动 python3；`--mutate` 跑 5 组变异证明断言可证伪；末行 `SELFCHECK=ALL_GREEN checks=N fails=0` |
+| **`selfcheck.sh`**（v1.8.0） | 技能自检门禁：16 项静态+行为断言（不需要 VM），自定位 `SKILLDIR`、纯 bash 驱动 python3；`--mutate` 跑 6 组变异证明断言可证伪；末行 `SELFCHECK=ALL_GREEN checks=N fails=0` |
 | **内置通道组（v1.6.0）** `host-generate-key.sh` / `winvm-setup-sshd-and-key.ps1` / `verify-tunnel.sh` / `destroy-tunnel.sh` / `host-rollback.sh` / `vm-diag.ps1` | 免密通道创建 / VM 侧 build·`-Rollback`·`-Continue` / 四段验收 / 精确拆除 / 宿主回滚 / 只读体检（原 `hos-winvm-ssh-tunnel` v2.3.0；脚本内 `SKILLDIR` 自定位到本技能根） |
 
-## 自检门禁（v1.8.0 · 随技能分发 · 改完/发布前必跑）
+## 自检门禁（v1.8.0 起 · 随技能分发 · 改完/发布前必跑）
 
 真机成功一次 ≠ 回归安全。改任何脚本/文档后先跑自检，它是不需要 VM 的**唯一本地判据**：
 
 ```bash
-bash scripts/selfcheck.sh                            # 末行 SELFCHECK=ALL_GREEN checks=15 fails=0
+bash scripts/selfcheck.sh                            # 末行 SELFCHECK=ALL_GREEN checks=16 fails=0
 SELFCHECK_WORK=<可写目录> bash scripts/selfcheck.sh    # 指定工作区；跑完保留并打印 WORK_DIR=
 bash scripts/selfcheck.sh --mutate                   # 变异自证：末行 MUTATION_RESULT=ALL_CAUGHT
 SELFCHECK_CLEAN=1 bash scripts/selfcheck.sh          # 确实要顺手清掉工作区时才加
@@ -202,16 +205,16 @@ SELFCHECK_CLEAN=1 bash scripts/selfcheck.sh          # 确实要顺手清掉工�
 - **全程零删除**：工作区跑完**保留**（打印 `WORK_DIR=`），因为鸿蒙沙箱对批量删除有护栏
   （`SAFE_DELETE_BULK_CONFIRM_REQUIRED`，50 个/回合），删临时目录会变成用户确认弹窗——
   自检不该为清理打扰使用者。要在意磁盘就传 `SELFCHECK_CLEAN=1`，或放在 `$TMPDIR` 让系统回收。
-- **15 项**：全脚本 `bash -n` / 控制字符（文本类，`dist/*.zip` 二进制豁免）/ frontmatter name+SemVer /
+- **16 项**：全脚本 `bash -n` / 控制字符（文本类，`dist/*.zip` 二进制豁免）/ frontmatter name+SemVer /
   V11 七锚点（SKILL.md 字符串面）/ V11 入包文件面 / 打包白名单枚举（含 `run-flow.sh`·`context.sh`·
   `action-report.sh`·`action-catalog.tsv`·`selfcheck.sh`）/ F-19 零插值 / F-20 有界幂等复跑 /
-  F-21 判据 / F-22 密钥择优 / F-19 `-EncodedCommand` 实测解码（需 node，缺则 SKIP）/
+  F-21 判据 / F-22 密钥择优 / **F-26 传输/载荷预算分离** / F-19 `-EncodedCommand` 实测解码（需 node，缺则 SKIP）/
   C3.0 四用例行为守卫 / F-23·F-24·F-25 四用例守卫 / markdown 相对链接 / `git diff --check`
 - **F-21 是结构化断言**：解析 `_envcheck_ok()` **函数体**（剔注释行）验证 `ENV_PRECHECK=PASS` ∧
   `BLOCKERS=none` ∧ `&&` 串联 ∧ 存在 `! _envcheck_ok` 调用点。只搜全文会被注释里的同名字面蒙混——
   变异测试 M2 实证：把函数体内的 `BLOCKERS=none` 改成 `BLOCKERS=ok`，全文匹配式断言仍然绿，结构化断言才抓住。
-- **断言必须可证伪**：`--mutate` 把 5 个历史缺陷（F-19 插值回归 / F-21 判据放宽 / F-24 空摘录不归一 /
-  F-23 无日志索引 / 版本号非 SemVer）分别注入技能副本，每组都必须被对应断言判 FAIL。任一 MISSED 即该断言
+- **断言必须可证伪**：`--mutate` 把 6 个历史缺陷（F-19 插值回归 / F-21 判据放宽 / F-24 空摘录不归一 /
+  F-23 无日志索引 / 版本号非 SemVer / F-26 载荷预算回退）分别注入技能副本，每组都必须被对应断言判 FAIL。任一 MISSED 即该断言
   属「字符串存在式假绿」，须改成结构化解析，不能放它过。
 - 证据文件：`SKILL_SELFCHECK_OUT`（默认 `~/wbtmp/winvm-plugin-deploy-selfcheck.txt`）。
 

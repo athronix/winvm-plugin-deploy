@@ -75,7 +75,7 @@
 
 ## E. 版本门槛速查（问题 ↔ 修复起始版本）
 
-R8 跨壳=V1.4.9 · KEEP 误报=V1.4.9 · 探测冒烟/僵尸重启=V1.4.16（D1/I-6.15b 文案） · VM-START 清扫=V1.4.15、击杀生效=V1.4.16 · 服务端闸 300s=V1.4.17 · 探针窗 330s=V1.4.17 · 避坑清单 X-1~X-6=v3.0.6~v3.0.7 · gitee 主源=v3.1.0 · .env 凭据回注+BUILD 降级=V1.4.20 · ssh2 后端全量=V1.4.21 · 技能入包=V1.4.23 · 独立技能包上架=V1.4.24 · **URL 入口 ssh2 候选链修复=V1.4.25** · 技能矩阵化（canonical 独立仓+roundtrip 模板+通道外委 hos+技能单权威=旧 .prompt 退发布链）=**V1.4.26**（技能包 v1.4.1 起随该 tag 双端上架） · **技能 v1.5.0**=三流程职责定界 + `channel.sh` 通道单一动作 + VM 侧合并包 + 探针复用全绿门（`deploy_ok=1`）+ 判稳 gate + verify `ENV_WINDOW`（本技能自身版本；需母项目 V1.4.27+ pack 才随包分发） · **技能 v1.7.0**=一次执行统一入口 `run-flow.sh` + 环境事实前置冻结 `context.sh` + 动作级日志 `actions.tsv`/`states/*` + 全分支决策表 `action-catalog.tsv` + 过程执行环节信息表 `action-report.sh`（前台只打最终表，`VERBOSE=1` 出中间信息）+ F-17 假红/F-18 重复卸载/skill 注册漂移三修复 · **技能 v1.8.0**=自检门禁 `scripts/selfcheck.sh`（15 项 + `--mutate` 5 组变异自证） · **技能 v1.6.0**=通道生命周期内置（并入 `hos-winvm-ssh-tunnel` v2.3.0：6 脚本 + 6 参考文档，`HOS` 默认指向本技能根，**一次安装即可、不再需要装第二个 skill**）。
+R8 跨壳=V1.4.9 · KEEP 误报=V1.4.9 · 探测冒烟/僵尸重启=V1.4.16（D1/I-6.15b 文案） · VM-START 清扫=V1.4.15、击杀生效=V1.4.16 · 服务端闸 300s=V1.4.17 · 探针窗 330s=V1.4.17 · 避坑清单 X-1~X-6=v3.0.6~v3.0.7 · gitee 主源=v3.1.0 · .env 凭据回注+BUILD 降级=V1.4.20 · ssh2 后端全量=V1.4.21 · 技能入包=V1.4.23 · 独立技能包上架=V1.4.24 · **URL 入口 ssh2 候选链修复=V1.4.25** · 技能矩阵化（canonical 独立仓+roundtrip 模板+通道外委 hos+技能单权威=旧 .prompt 退发布链）=**V1.4.26**（技能包 v1.4.1 起随该 tag 双端上架） · **技能 v1.5.0**=三流程职责定界 + `channel.sh` 通道单一动作 + VM 侧合并包 + 探针复用全绿门（`deploy_ok=1`）+ 判稳 gate + verify `ENV_WINDOW`（本技能自身版本；需母项目 V1.4.27+ pack 才随包分发） · **技能 v1.7.0**=一次执行统一入口 `run-flow.sh` + 环境事实前置冻结 `context.sh` + 动作级日志 `actions.tsv`/`states/*` + 全分支决策表 `action-catalog.tsv` + 过程执行环节信息表 `action-report.sh`（前台只打最终表，`VERBOSE=1` 出中间信息）+ F-17 假红/F-18 重复卸载/skill 注册漂移三修复 · **技能 v1.8.0**=自检门禁 `scripts/selfcheck.sh`（16 项 + `--mutate` 6 组变异自证） · **技能 v1.9.0**=传输预算/载荷预算解耦（`VM_PS_TIMEOUT` 180s + `VM_SSH_EXEC_TIMEOUT`/`VM_SSH_TRIES`；F-26 + M6 守卫；E2E4 定谳「探针 rc=124 零输出≠通道坏」） · **技能 v1.6.0**=通道生命周期内置（并入 `hos-winvm-ssh-tunnel` v2.3.0：6 脚本 + 6 参考文档，`HOS` 默认指向本技能根，**一次安装即可、不再需要装第二个 skill**）。
 
 ## F. 自检门禁（v1.8.0 · 本地可验证面）
 
@@ -90,10 +90,38 @@ R8 跨壳=V1.4.9 · KEEP 误报=V1.4.9 · 探测冒烟/僵尸重启=V1.4.16（D1
 | FAIL `packaging whitelist captures new files` | 新脚本不在 `scripts/`/`references/`/`assets/` 下 | 挪进三目录之一，`copySkillEntry` 白名单才收 |
 | FAIL `F-21 strict verdict` | 判据被改成宽匹配（全文搜字符串） | 恢复 `_envcheck_ok()` 函数体内 `ENV_PRECHECK=PASS` ∧ `BLOCKERS=none` ∧ `&&` 串联 |
 | FAIL `F-23/24/25 action-trace guard` | `step.sh` 的日志索引 / 空摘录归一 / 噪声白名单被改坏 | 按 `known-good-flow.md` 观测链口径恢复 |
+| FAIL `F-26 payload budget split` | `ps-run.sh` 的 PowerShell 载荷执行退回了裸 `_ps_cmd`（预算分离失效，E2E4 假红会复发） | 恢复 `_payload _ps_cmd "powershell …"` 前缀（`-File` 与 `-c` 两处），**远端临时件清理保持裸调用** |
 | FAIL `markdown relative links` | 文档改名/移动后链接断 | 按 `(文件, 目标)` 修 |
 | 自检绿但实际坏了 | 断言是「字符串存在式」，抓不住逻辑改动 | 跑 `--mutate`：对应变异若 MISSED 即假绿，改成结构化解析 |
 | `--mutate` 报 `HARNESS_CRASH … SAFE_DELETE_BULK_CONFIRM_REQUIRED` | 沙箱批量删除护栏（50 个/回合）把**子进程**拦死，子进程异常退出又没有 FAIL 行 | 自检已改「零删除 + 每例独立目录」；若仍出现，说明有人把清理逻辑加回去了——恢复默认不清理（`SELFCHECK_CLEAN` 才是删） |
 | 自检跑完留下一个工作区目录 | **设计如此**：默认不清理（见上条） | 路径打在 `WORK_DIR=`；要清就 `SELFCHECK_CLEAN=1`，或把 `SELFCHECK_WORK` 指到 `$TMPDIR` |
 
-**判据**：常规出 `SELFCHECK=ALL_GREEN checks=15 fails=0`；`--mutate` 出 `MUTATION_RESULT=ALL_CAUGHT`。
+**判据**：常规出 `SELFCHECK=ALL_GREEN checks=16 fails=0`；`--mutate` 出 `MUTATION_RESULT=ALL_CAUGHT`。
 两项都绿才可发布。`SKIP`（无 node / 非 git 检出）不算 FAIL，但汇报时要点明跳过了哪项。
+
+## G. 探针 rc=124 且日志零载荷输出（v1.9.0 · 传输预算≠载荷预算）
+
+**现象**（E2E4 真机，11-13）：`ACTION=deploy` 的 `C3/3.3 vmcheck 七判据` FAIL，153s rc=124，
+`vmcheck.log` **只有两行**——`VM_CHANNEL=key(…ssh2 ping 单发即通…)` + `vmssh: ssh2 传输层失败 rc=124（3 试尽）`，
+载荷 JSON **一个字都没有**。同轮 `C3/3.0 env-check` 304s rc=124，但日志里有 4 段完整 `NODE_OK/CLI_OK` 却**没有** `ENV_PRECHECK`/`BLOCKERS`。
+
+**根因**（实测坐实，非通道故障）：
+1. `vm-conn.sh` 旧实现只用 `VM_SSH_TIMEOUT=25` 一个变量同时管「连接/握手」与「远端 PowerShell 执行」，
+   每次尝试窗 = `25+5 = 30s`。
+2. 而 `vmcheck.ps1` **自身耗时 47/53/56s**（连测三发；`Get-ScheduledTask` 全枚举 +
+   `Get-NetTCPConnection` 走 `MSFT_NetTCPConnection` + `/health` HTTP 10s + PS 冷启）——稳定超窗 ⇒ **确定性假红**。
+3. `-File` 型载荷「**跑完才吐输出**」，被 timeout 杀 ⇒ 零输出 ⇒ 看起来像通道彻底不通
+   （实测同通道 `ssh2-conn ping` 2.6s 即通）。
+4. `env-check` 是「边跑边输出」，所以能看到前半段；判据行在尾部被截断 ⇒ 另一种表现形态。
+   这也是 `vm-env-check.ps1` verdict-first（判据前置）改动的由来——**预算与前置是双保险**。
+
+**判据**：出现「rc=124 + 载荷零输出」时，**先量载荷耗时再怀疑通道**：
+`VM_PS_TIMEOUT=180 bash scripts/ps-run.sh <pkg>/qa/deploy-probes/vmcheck.ps1`；
+若单跑 40~60s 拿到 `{"task_state":…}` 即通道无罪。
+
+**处置**（v1.9.0 已内建，正常无需手工）：
+- `ps-run.sh` 的 PowerShell **载荷**执行经 `_payload` 前缀 ⇒ `VM_SSH_EXEC_TIMEOUT=$VM_PS_TIMEOUT`（默认 180s）+ `VM_SSH_TRIES=2`；
+- 连接/握手/`scp`/远端临时件清理仍用 `VM_SSH_TIMEOUT`(25s)，语义不被污染；
+- 预算不够的极端场景显式改：`VM_PS_TIMEOUT=300 bash scripts/run-flow.sh`；
+- 守卫：自检 `F-26 payload budget split` + 变异 `M6`（回退成裸 `_ps_cmd` 必判 FAIL）。
+- **禁**为了「让它过」而全局抬高 `VM_SSH_TIMEOUT`——那会把「传输层真挂起」的快速失败也拖成慢失败。
