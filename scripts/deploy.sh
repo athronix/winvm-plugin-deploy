@@ -1,304 +1,116 @@
 #!/usr/bin/env bash
-# winvm-plugin-deploy · 主部署 driver（对应 SKILL.md 安装主流程 C0→C6）
-# 用法：VM_HOST=<ip> [VM_USER=User] bash deploy.sh [--apply] [--pkg <PKG_ROOT>] [--tag V1.4.x]
-# 默认 DRY-RUN=只体检+出计划不写任何东西；--apply 才真执行。全程 step.sh 计时留痕，
-# 判据不过即停（打印后退出），绝不跳步硬推。
+# deploy.sh · 从零部署 WinVM Bridge（一个命令，5 步，无可选分支）
+#
+#   1 建 host↔VM 免密 SSH 通道      ─┐ 并行
+#   2 取包 + 装 host 端插件          ─┘
+#   3 起 winvm-tunnel service 并验证 ─┐ 并行（需 1+2）
+#   4 装 VM 端 + 起 mcp/a2a service  ─┘
+#   5 verify（三探针 + 终态矩阵）
+#
+# 用法：
+#   VM_HOST=172.16.100.2 bash scripts/deploy.sh                 # 全链
+#   VM_HOST=... bash scripts/deploy.sh --only 3                 # 只跑某一步（定点重跑）
+#   VM_HOST=... bash scripts/deploy.sh --from 3                 # 从第 3 步起
+#   VM_HOST=... bash scripts/deploy.sh --serial                 # 关并行（排障用）
+#   VM_HOST=... RELEASE_TAG=V1.4.30 bash scripts/deploy.sh      # 锁版本
+#
+# 首次运行会在第 1 步打印一条「用户只需要做这一件事」的命令并退出（rc=2）。
+# 用户在 VM 粘贴执行后，**重跑同一条命令**即可；已完成的步骤幂等跳过。
 set -u
-_here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-: "${VMDEPLOY_ENV_SH:=${HOME}/wbtmp/vmdeploy-env.sh}"; [ -f "$VMDEPLOY_ENV_SH" ] && . "$VMDEPLOY_ENV_SH"
-# v1.5.0 F-02：vm-conn.sh 默认后端是 key（原路径零冲击保留），但 deploy/undeploy/
-# verify/wait-channel 四个动词必须统一走 ssh2（鸿蒙沙箱 OpenSSH 认证段相位挂免疫）。
-# 必须在 source vm-conn.sh 之前 export，否则读到的是 key。
-export VM_SSH_BACKEND="${VM_SSH_BACKEND:-ssh2}"
-# shellcheck disable=SC1090
-. "$_here/vm-conn.sh"
-# shellcheck disable=SC1090
-. "$_here/pkg-root.sh"   # run19 R-1：三 driver 选根共享事实源（_pick_pkg_root/resolve_pkg_root/pkg_root_usage_error）
-STEP() { bash "$_here/step.sh" "$@"; }
-APPLY=0; PKG="${PKG_ROOT:-$HOME/winvm-deploy/overall-root}"; TAG="${RELEASE_TAG:-}"
-# 包根显式来源（env PKG_ROOT 或 --pkg）=跳过自动取最新；未显式=C2 走 download-verify 取最新
-PKG_EXPLICIT="${PKG_ROOT:+1}"; PKG_EXPLICIT="${PKG_EXPLICIT:-0}"
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/_common.sh"
+
+ONLY=""; FROM=1; SERIAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --apply) APPLY=1 ;;
-    --pkg) PKG="$2"; PKG_EXPLICIT=1; shift ;;
-    --tag) TAG="$2"; shift ;;
-    *) echo "未知参数 $1" >&2; exit 2 ;;
+    --only) ONLY="$2"; shift ;;
+    --from) FROM="$2"; shift ;;
+    --serial) SERIAL=1 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
   esac; shift
 done
-: "${VM_HOST:?VM_HOST 未设 → 执行协议 P-1：问用户}"
-: "${VM_USER:=User}"; : "${VM_SSH_PORT:=22}"
-NODE="${NODE:?缺少健康 node → 先跑 scripts/env-detect.sh}"
-# e2e2R4+：LOGD 对齐 step.sh 的 RUN_DIR（旧=default 目录与 VMDEPLOY_RUN_DIR 分裂，
-# 日志双落点各写一份、R2 单点扫描落空=11-12 e2e2 实锤；VMDEPLOY_LOG_DIR 仍可显式覆写）
-LOGD="${VMDEPLOY_LOG_DIR:-${VMDEPLOY_RUN_DIR:-$HOME/wbtmp/vmdeploy-run-$(date +%Y%m%d)}}"; mkdir -p "$LOGD"
+[ -n "$ONLY" ] && FROM="$ONLY"
 
-_step_log() { STEP log "$1" < "$2" 2>/dev/null || true; }
-# run17 D-3 假绿止血：不即时阻断的段失败（如实记 FAIL 后仍按原流程走完）汇入 FAILED_STEPS，
-# 末尾聚合出链非零——steps.tsv 判定列必须可信；硬阻断段（C1/C2 取包/C3.2/C3.3/C4.1）维持即时 exit 1 不变。
-FAILED_STEPS=""
-_fail_note() { FAILED_STEPS="$FAILED_STEPS $1"; }
+resolve_env; need_node; need_py; need_bash
+require_host
+state_set VM_HOST "$VM_HOST"; state_set VM_USER "$VM_USER"; state_set VM_SSH_PORT "$VM_SSH_PORT"
 
-# ── E2R4b：拆→装往返续命（位置=一切通道动作之前：P0 preflight 也依赖 vm-conn.json 的
-# R1 三级链——S7 终轮实锤本块初版误放 Step 1 之后=preflight 先失明 RED 早退）──
-if [ ! -f "$HOME/.workbuddy/winvm/vm-conn.json" ] && [ -f "$HOME/.workbuddy/winvm/vm-conn.json.roundtrip" ]; then
-  cp -f "$HOME/.workbuddy/winvm/vm-conn.json.roundtrip" "$HOME/.workbuddy/winvm/vm-conn.json"
-  echo "[R4] vm-conn.json 已从 .roundtrip 快照恢复"
-fi
+echo "════════════════════════════════════════════════════════════"
+echo " WinVM Bridge 部署  host=$VM_HOST user=$VM_USER port=$VM_SSH_PORT"
+echo " 运行目录: $VMDEPLOY_RUN_DIR"
+echo " 并行: $([ "$SERIAL" = "1" ] && echo off || echo on)   起点: 第 $FROM 步$([ -n "$ONLY" ] && echo "（只跑第 $ONLY 步）")"
+echo "════════════════════════════════════════════════════════════"
 
-# ── Step 0 体检 ──
-STEP begin P0 0 "preflight 五项体检"
-# v1.9.1：链内标记 → preflight 跳过 VM 内八项（C3.0 硬门禁 3 步后必然覆盖同域探测，
-# e2e5 实测这一次往返值 55s）。独立跑 preflight.sh 不受影响（默认仍全查）。
-VMDEPLOY_IN_CHAIN=1 bash "$_here/preflight.sh" > "$LOGD/preflight.log" 2>&1; PRC=$?
-tail -12 "$LOGD/preflight.log"; _step_log preflight "$LOGD/preflight.log"
-grep -q "READINESS=RED" "$LOGD/preflight.log" && { STEP end P0 0 $PRC FAIL "READINESS=RED" "按 preflight 输出的修复指引处置后重跑；勿硬跑"; exit 1; }
-STEP end P0 0 0 PASS "GREEN/YELLOW" "none"
-
-[ $APPLY -eq 0 ] && { echo "DRY-RUN：体检通过，加 --apply 执行 通道保障→取包→prepare→setup→vmcheck→host→探针→交付 全链。"; STEP report; exit 0; }
-
-# ── v1.5.0 F-03：开跑即作废旧 stamp ──
-# 中途硬阻断（C3.2/C4.1 等 exit 1）或末尾半绿都绝不能留下可被 verify 复用的假绿标记。
-PROBE_STAMP="${VMDEPLOY_PROBE_STAMP:-$HOME/wbtmp/vmdeploy-probes-stamp.txt}"
-"$NODE" -e 'try{require("fs").unlinkSync(process.argv[1])}catch{}' "$PROBE_STAMP" 2>/dev/null || true
-
-# ── Step 1 通道保障（v1.5.0：deploy 是唯一有权「保障通道」的动词）──
-# 在则不建；不在才按 hos 的 host-generate-key.sh 输出一次用户粘贴脚本并停。
-# undeploy 永不进此分支（通道坏是它的正常输入），verify 也永不建/修通道。
-STEP begin C1 1.5 "通道保障（在则不建，不在才引导 hos 一键脚本）"
-bash "$_here/channel.sh" ensure > "$LOGD/channel-ensure.log" 2>&1; CRC=$?
-cat "$LOGD/channel-ensure.log"; _step_log channel-ensure "$LOGD/channel-ensure.log"
-if [ $CRC -eq 2 ]; then
-  STEP end C1 1.5 2 WAIT_USER "NEED_USER_ACTION=1（通道未建立；已输出 hos 一键脚本）" "用户在 VM 管理员 PowerShell 粘贴一次 → bash scripts/channel.sh confirm → 重跑 deploy.sh --apply；勿重启 VM"
-  echo "DEPLOY_NEED_USER_ACTION=1（未部署任何一端；后续两端部署将经该通道自动完成）"
-  STEP report; exit 2
-fi
-if [ $CRC -ne 0 ]; then
-  STEP end C1 1.5 $CRC FAIL "channel ensure rc=$CRC" "检查内置通道脚本是否在场（winvm-plugin-deploy v1.6.0+ 已并入 hos-winvm-ssh-tunnel；见 SKILL.md「SSH 免密通道生命周期」）"
-  exit 1
-fi
-STEP end C1 1.5 0 PASS "channel=${VM_CHANNEL:-key} 复用现役通道，未重建" "none"
-
-# ── Step 2 取包/校验 ──
-STEP begin C2 2 "包根判定/取包三件套"
-if [ -f "$PKG/MANIFEST.txt" ] && [ -d "$PKG/delivery" ] && [ "$PKG_EXPLICIT" = "1" ]; then
-  echo "[PKG] root=$PKG（来源=显式 env PKG_ROOT/--pkg，跳过取包）"
-else
-  # run18 P-1 定谳：overall-root 曾双层并存（陈旧层永不被扫出=882 undeclared），且旧条件
-  # 「外层有 MANIFEST 即跳过下载」使最新 release 永不落地。默认路径=download-verify 取最新
-  # （隔离重解+version==TAG 选根），离线回退现存包根（如实告警版本或陈旧）。
-  # run19 R-2：旧=`… 2>&1 | tail -1` 只留末行，[cache]/[quarantine]/verify-manifest 信息行
-  # 全丢（run19 grep 实锤排障失明）。现全量落 $LOGD/download-verify.log，仅从中取 PKG_ROOT 末行。
-  bash "$_here/download-verify.sh" ${TAG:+--tag "$TAG"} > "$LOGD/download-verify.log" 2>&1 || true
-  _step_log download-verify "$LOGD/download-verify.log"
-  grep -E '^\[(cache|quarantine|pkg-root|download)\]|^SHA256_|^RESULT|^⚠' "$LOGD/download-verify.log" | head -8
-  LAST_DV="$(grep -E '^PKG_ROOT=' "$LOGD/download-verify.log" | tail -1)"
-  if [ -n "$LAST_DV" ] && [ -f "${LAST_DV#PKG_ROOT=}/MANIFEST.txt" ]; then
-    PKG="${LAST_DV#PKG_ROOT=}"; echo "[PKG] root=$PKG（来源=download-verify 最新判定）"
-  elif resolve_pkg_root; then
-    # 回退三级链的「状态文件>现探」（pkg-root.sh）；download-verify 失败但本地已有合法层
-    PKG="$PKG_RESOLVED"; echo "[PKG] root=$PKG（来源=回退 $PKG_SOURCE；download-verify 失败见 $LOGD/download-verify.log 末行=$(tail -1 "$LOGD/download-verify.log")）"
-  elif [ -f "$PKG/MANIFEST.txt" ] && [ -d "$PKG/delivery" ]; then
-    echo "[PKG] root=$PKG（来源=保底旧默认，download-verify 失败且无可探层，版本或陈旧——C3 用包内代码注意）"
-  else
-    echo "[PKG] 取包失败：download-verify 无 PKG_ROOT 输出且无任何合法包根" >&2
-    pkg_root_usage_error
-    STEP end C2 2 1 FAIL "取包失败" "$(tail -1 "$LOGD/download-verify.log" 2>/dev/null || echo 无输出)；三 driver 包根未定"; exit 1
-  fi
-fi
-# run19 R-1：C2 定根后落状态文件（显式/自动两分支统一在此写）——undeploy/verify 默认值三级链第 2 级来源
-{ echo "$PKG"; } > "$PKG_ROOT_STATE" 2>/dev/null && echo "[PKG] 状态文件已写 $PKG_ROOT_STATE" || echo "⚠ pkg-root.txt 写入失败（undeploy/verify 将走现探回退）" >&2
-( cd "$PKG" && "${PY:-python3}" qa/deploy-probes/verify-manifest.py . > "$LOGD/manifest.log" 2>&1 ); MRC=$?
-tail -1 "$LOGD/manifest.log"; _step_log manifest "$LOGD/manifest.log"
-# run17 D-3：manifest rc 入判定（旧=无条件 PASS，882 undeclared 假绿）；不即时阻断（发布面
-# 已知漂移史未定谳），如实 FAIL + 聚合出链非零，人工对照 manifest.log 处置。
-if [ $MRC -ne 0 ]; then
-  STEP end C2 2 $MRC FAIL "manifest rc=$MRC pkg=$PKG" "RESULT: FAIL 见 $LOGD/manifest.log（undeclared=陈旧层/发布清单漂移，对照 publish 链）"
-  _fail_note "C2/2-manifest"
-else
-  STEP end C2 2 0 PASS "MANIFEST 见日志 pkg=$PKG" "none"
-fi
-
-# ── Step 3 VM 侧（prepare-vm 补齐 + setup 七相位；X-6/X-7 修复后 .env/密码/BUILD 均免手工） ──
-STEP begin C3 3.0 "ENV_PRECHECK 硬门禁"
-# run17 D-3：旧=`|| true` 吞非零后无条件 PASS（run17 活体假绿）。
-# F-21 (E2E3)：旧判据 `grep -q ENV_PRECHECK` 连 `ENV_PRECHECK=FAIL` 都命中=假绿；
-#   现要求 ENV_PRECHECK=PASS **且** BLOCKERS=none。
-# F-20 (E2E3)：通道瞬态窗把 ps-run 的 30s timeout 打断时，日志有 NODE_OK/CLI_OK
-#   但缺 ENV_PRECHECK 行。旧实现直接 FAIL 并汇入 FAILED_STEPS ⇒ deploy rc=1
-#   ⇒ R3 FAIL ⇒ R4 verify 被 SKIP（假红拖垮整链）。现给一条**确定性幂等复跑**：
-#   仅当 rc∈{124,111,255} 且 NODE_OK/CLI_OK 在场（=VM 探测主体已跑通、只是
-#   尾部传输被截断）才复跑一次 env-check（只读、幂等），复跑达标即 PASS(RETRY=1)；
-#   配置性失败（BLOCKERS≠none / NODE_OK=false）绝不吞，按 P-2 处置。
-_envcheck_ok() {
-  grep -q "ENV_PRECHECK=PASS" "$LOGD/env-check.log" 2>/dev/null \
-    && grep -q "BLOCKERS=none" "$LOGD/env-check.log" 2>/dev/null
+run_step() { # run_step <n> → 返回该步 rc
+  local n="$1" s
+  case "$n" in
+    1) s="deploy-1-ssh.sh" ;;
+    2) s="deploy-2-host.sh" ;;
+    3) s="deploy-3-tunnel.sh" ;;
+    4) s="deploy-4-vm.sh" ;;
+    5) s="deploy-5-verify.sh" ;;
+    *) echo "无此步骤: $n" >&2; return 2 ;;
+  esac
+  bash "$SCRIPTDIR/$s"
 }
-_run_envcheck() {
-  ( cd "$PKG" && "${BASH_OK:-bash}" "$_here/ps-run.sh" "$PKG/qa/deploy-probes/vm-env-check.ps1" > "$LOGD/env-check.log" 2>&1 )
+
+stage() { # stage <name> <n1> [n2]
+  local name="$1" a="$2" b="${3:-}"
+  echo
+  log "━━━ 阶段 $name ━━━"
+  if [ -z "$b" ] || [ "$SERIAL" = "1" ]; then
+    run_step "$a"; return $?
+  fi
+  run_step "$a" & local p1=$!
+  run_step "$b" & local p2=$!
+  wait $p1; local r1=$?
+  wait $p2; local r2=$?
+  [ $r1 -ne 0 ] && return $r1
+  return $r2
 }
-ERC=0; _run_envcheck || ERC=$?
-RETRY=0
-if [ "$ERC" -ne 0 ] || ! _envcheck_ok; then
-  TRANSIENT=0
-  case "$ERC" in 124|111|255) TRANSIENT=1;; esac
-  grep -q 'vmssh: ssh2 传输层失败' "$LOGD/env-check.log" 2>/dev/null && TRANSIENT=1
-  if [ "$TRANSIENT" = "1" ] \
-     && grep -q "NODE_OK=true" "$LOGD/env-check.log" 2>/dev/null \
-     && grep -q "CLI_OK=true" "$LOGD/env-check.log" 2>/dev/null; then
-    cp -f "$LOGD/env-check.log" "$LOGD/env-check.attempt1.log" 2>/dev/null || true
-    echo "[C3.0] TRANSIENT_TRUNCATION rc=$ERC NODE_OK/CLI_OK 在场 → 确定性幂等复跑 1 次（勿重跑整链）"
-    RETRY=1; ERC2=0; _run_envcheck || ERC2=$?; ERC=$ERC2
-    _OKNOW=0; _envcheck_ok && _OKNOW=1
-    echo "[C3.0] RETRY=$RETRY rc=$ERC envcheck_ok=$_OKNOW"
+
+RC=0
+if [ -n "$ONLY" ]; then
+  run_step "$ONLY"; RC=$?
+else
+  if [ "$FROM" -le 2 ]; then
+    if [ "$FROM" -le 1 ]; then stage "A（第 1‖2 步）" 1 2; else stage "A（第 2 步）" 2; fi
+    RC=$?
+    if [ $RC -eq 2 ]; then
+      echo
+      echo "════════════════════════════════════════════════════════════"
+      echo " ⏸  需要你在 VM 里做一件事（上面第 1 步已打印那条命令）"
+      echo "    · VM 恢复/重建后 authorized_keys 会丢，通道必须重建"
+      echo "    · 做完后【重跑同一条命令】即可，已完成的步骤不会重复做"
+      echo "════════════════════════════════════════════════════════════"
+      steps_report
+      exit 2
+    fi
+    [ $RC -ne 0 ] && { err "阶段 A 失败（rc=$RC）"; steps_report; exit $RC; }
+  fi
+  if [ "$FROM" -le 4 ]; then
+    if [ "$FROM" -le 3 ]; then stage "B（第 3‖4 步）" 3 4; else stage "B（第 4 步）" 4; fi
+    RC=$?
+    [ $RC -ne 0 ] && { err "阶段 B 失败（rc=$RC）"; steps_report; exit $RC; }
+  fi
+  if [ "$FROM" -le 5 ]; then
+    stage "C（第 5 步 verify）" 5
+    RC=$?
   fi
 fi
-grep -E "ENV_PRECHECK|BLOCKERS|NODE_OK|CLI_OK" "$LOGD/env-check.log" | head -5; _step_log env-check "$LOGD/env-check.log"
-if [ "$ERC" -ne 0 ] || ! _envcheck_ok; then
-  STEP end C3 3.0 "$([ $ERC -ne 0 ] && echo $ERC || echo 1)" FAIL "env-check rc=$ERC/ENV_PRECHECK 未达标 retry=$RETRY" "照 troubleshooting P-2 处置（BLOCKERS≠none 或通道失败=ACTION=deploy bash scripts/run-flow.sh 定点重跑；绝不重启 VM）"
-  _fail_note "C3/3.0-env-check"
+
+# ── 收尾：只有全链零失败才把探针 stamp 升为可复用 ──
+STAMP="${VMDEPLOY_PROBE_STAMP:-$HOME/wbtmp/winvm-probes-stamp.txt}"
+if [ $RC -eq 0 ] && [ -f "$STAMP" ]; then
+  "$NODE" -e 'const fs=require("fs"),p=process.argv[1];let s=fs.readFileSync(p,"utf8");s=s.replace(/^deploy_ok=.*$/m,"deploy_ok=1");if(!/^deploy_ok=/m.test(s))s+="deploy_ok=1\n";fs.writeFileSync(p,s)' "$STAMP" 2>/dev/null || true
+fi
+steps_report
+echo
+if [ $RC -eq 0 ]; then
+  echo "DEPLOY=PASS  (host: 插件+连接器+skills · tunnel: health=200 · VM: mcp+a2a · verify: 通过)"
+  echo "ALL_DONE=1  RUN_DIR=$VMDEPLOY_RUN_DIR"
 else
-  STEP end C3 3.0 0 PASS "ENV_PRECHECK=PASS BLOCKERS=none retry=$RETRY" "none"
+  echo "DEPLOY=FAIL rc=$RC  失败段日志见 $LOGD"
 fi
-
-STEP begin C3 3.2 "prepare-vm --ensure-node + setup --apply --skip-build"
-( cd "$PKG" && "$NODE" delivery/bootstrap.mjs prepare-vm --apply --ensure-node \
-    --vm-host "$VM_HOST" --vm-user "$VM_USER" --vm-ssh-port "$VM_SSH_PORT" > "$LOGD/prepare.log" 2>&1 ); PRC2=$?
-tail -4 "$LOGD/prepare.log"; _step_log prepare-vm "$LOGD/prepare.log"
-# run17 D-3：prepare rc 旧仅展示在 PASS 判据里=吞没；现入聚合（不阻断：setup 成功可覆盖补齐面，人工对照 prepare.log）
-if [ $PRC2 -ne 0 ]; then _fail_note "C3/3.2-prepare(rc=$PRC2)"; fi
-# .env 就位（缺失→从样本生成骨架；字段核对按 SKILL.md 安装主流程人工过目）
-[ -f "$PKG/.env" ] || cp "$PKG/delivery/env.example" "$PKG/.env" 2>/dev/null || echo "⚠ 无 .env 也无 env.example→按 prompt 3.1 手建"
-( cd "$PKG" && "$NODE" delivery/setup.mjs --apply --skip-build > "$LOGD/setup.log" 2>&1 ); SRC=$?
-grep -E "部署全部完成|个步骤失败|降级 SKIP|凭据回注|VM_START_SWEEP" "$LOGD/setup.log" | head -6
-_step_log setup "$LOGD/setup.log"
-if [ $SRC -ne 0 ]; then
-  STEP end C3 3.2 $SRC FAIL "setup rc=$SRC" "失败相位名在 setup.log；对照 troubleshooting（BUILD 假败≤V1.4.18 已修/420s 未监听=僵尸行/僵尸=shutdown /r 重启行）"
-  exit 1
-fi
-STEP end C3 3.2 $PRC2 "$([ $PRC2 -eq 0 ] && echo PASS || echo FAIL)" "prepare rc=$PRC2 + setup rc=0" "$([ $PRC2 -eq 0 ] && echo none || echo 'prepare-vm 非零，对照 prepare.log')"
-
-STEP begin C3 3.3 "vmcheck 七判据"
-( cd "$PKG" && "${BASH_OK:-bash}" "$_here/ps-run.sh" "$PKG/qa/deploy-probes/vmcheck.ps1" > "$LOGD/vmcheck.log" 2>&1 ); VC=$?
-grep -E "task_state|listen_addr|listen_count|health_http|ok" "$LOGD/vmcheck.log" | head -8; _step_log vmcheck "$LOGD/vmcheck.log"
-# N1 兜底判据：task_state=Ready 但 listen_count=1 且 health=200 ⇒ 可继续
-if [ $VC -ne 0 ]; then STEP end C3 3.3 $VC FAIL "vmcheck rc=$VC" "Ready+GUI SESSION_UNAVAILABLE→schtasks /End+/Run 重触发；僵而不绑=420s 僵尸处置"; exit 1; fi
-STEP end C3 3.3 0 PASS "七判据见日志" "none"
-
-# ── Step 4 宿主插件+隧道 ──
-# run18 P-5：旧=begin 4.1 成功路径无 end、health 用 4.5 end 但从未 begin 4.5（steps.tsv
-# dur 空白/孤儿行）。现两段各自 begin/end 成对：4.1=install-host，4.5=fresh+health。
-STEP begin C4 4.1 "install-host --yes（插件+隧道装）"
-( cd "$PKG" && "$NODE" delivery/install-host.mjs --yes --vm-host "$VM_HOST" --vm-user "$VM_USER" --vm-ssh-port "$VM_SSH_PORT" > "$LOGD/host.log" 2>&1 ); HC=$?
-tail -3 "$LOGD/host.log"; _step_log install-host "$LOGD/host.log"
-[ $HC -eq 0 ] || { STEP end C4 4.1 $HC FAIL "install-host rc=$HC" "connector-states ⚠=平台账户噪声（X-4 放行）；真败查 errno=12=脆弱 node 行"; exit 1; }
-STEP end C4 4.1 0 PASS "install-host rc=0" "none"
-STEP begin C4 4.5 "fresh + 隧道 health"
-( cd "$PKG" && "$NODE" delivery/install-host.mjs --check-fresh 2>&1 | tail -1 )
-# run17 D-3：隧道 health curl rc+码入判定（旧=输出后无条件 PASS）；health 非 200 记 FAIL 聚合出链
-HEALTH_CODE="$(curl -sS --noproxy 127.0.0.1 -o /dev/null -w '%{http_code}' --max-time 15 "http://127.0.0.1:${WINVM_TUNNEL_LOCAL_PORT:-18443}/health" 2>/dev/null)"; HCRC=$?
-echo "health=$HEALTH_CODE (curl rc=$HCRC)"
-if [ $HCRC -ne 0 ] || [ "$HEALTH_CODE" != "200" ]; then
-  STEP end C4 4.5 1 FAIL "health=$HEALTH_CODE rc=$HCRC" "隧道 daemon 未就绪：查 delivery/tunnel-daemon.mjs 状态与 ~/.workbuddy/winvm 日志"
-  _fail_note "C4/4.5-health"
-else
-  STEP end C4 4.5 0 PASS "fresh/health=$HEALTH_CODE 见日志" "none"
-fi
-
-# ── Step 5 三探针 ──
-# v1.9.1 探针分级：深度项（a2a E4 真实 LLM 委派 ~30s / example E7 盘扫族 ~100s、E8 事件日志
-# ~15s、E9 文件搜索 ~20s）默认 SKIP，由探针自身打印 [SKIP] 并计入 RESULT 的 "N SKIP deep"，
-# 不会静默少测。PROBE_DEEP=1 恢复全 38 项（发布前/深度体检用）。实测 38 项 269s → 34 项 ~100s。
-export PROBE_DEEP="${PROBE_DEEP:-0}"
-STEP begin C5 5 "三探针 34 项（PROBE_DEEP=1 时 38 项；X-5 带宽：冷 ~145s / 深冷 ≤250s）"
-PROBLEMS=""
-PRC_ALL=0
-# v1.9.3 判据可证伪（e2e6 实证）：旧判据是静态字符串「38 项见日志」，与真实计数无关 ⇒
-# 探针静默少测也能报 PASS（典型字符串存在式假绿）。现改为解析三探针日志的 SUMMARY/RESULT
-# 真实计数并累加；提取不到计数即判 FAIL（无法核验=假绿风险），另按 PROBE_DEEP 校验总项/深度项。
-PROBE_TOTAL=0; PROBE_PASS=0; PROBE_SKIP=0
-for pr in mcp-probe a2a-probe example-probe; do
-  ( cd "$PKG" && "${PY:-python3}" "qa/deploy-probes/$pr.py" > "$LOGD/$pr.log" 2>&1 ); RC=$?
-  # 只认「带 x/y 计数」的那一行：mcp/a2a 的计数在 SUMMARY，example 的在 RESULT；
-  # 末行恒为裸 "RESULT: PASS"（无计数），故不能直接 tail -1（v1.9.3 回放实测踩到）。
-  LINE="$(grep -E 'SUMMARY|RESULT' "$LOGD/$pr.log" 2>/dev/null | grep -E '[0-9]+/[0-9]+' | tail -1)"
-  echo "[$pr rc=$RC] ${LINE:-no-meter}"
-  _step_log "$pr" "$LOGD/$pr.log"
-  PT="$(printf '%s' "$LINE" | grep -oE '[0-9]+/[0-9]+' | head -1)"
-  if [ -n "$PT" ]; then
-    PROBE_PASS=$((PROBE_PASS + ${PT%%/*}))
-    PROBE_TOTAL=$((PROBE_TOTAL + ${PT##*/}))
-  else
-    PROBLEMS="$PROBLEMS $pr:no-count"
-  fi
-  SK="$(printf '%s' "$LINE" | grep -oE '[0-9]+ SKIP deep' | grep -oE '[0-9]+' | head -1)"
-  PROBE_SKIP=$((PROBE_SKIP + ${SK:-0}))
-  [ $RC -ne 0 ] && { PROBLEMS="$PROBLEMS $pr:FAIL"; [ $PRC_ALL -eq 0 ] && PRC_ALL=$RC; }
-done
-# 期望口径：deep=0 → 34 项 / 4 SKIP deep；deep=1 → 38 项 / 0 SKIP deep。
-# 探针项数若变动（增删 case）必须同步此处，否则本相位判 FAIL —— 这是刻意的同步面告警。
-EXP_TOTAL="${PROBE_EXPECT_TOTAL:-34}"; EXP_SKIP="${PROBE_EXPECT_SKIP:-4}"
-if [ "$PROBE_DEEP" = "1" ]; then EXP_TOTAL="${PROBE_EXPECT_TOTAL:-38}"; EXP_SKIP="${PROBE_EXPECT_SKIP:-0}"; fi
-[ "$PROBE_TOTAL" != "$EXP_TOTAL" ] && PROBLEMS="$PROBLEMS probes:total-$PROBE_TOTAL!=$EXP_TOTAL"
-[ "$PROBE_SKIP" != "$EXP_SKIP" ] && PROBLEMS="$PROBLEMS probes:skip-$PROBE_SKIP!=$EXP_SKIP"
-JUDGE="PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP deep=$PROBE_DEEP"
-# run17 D-3：探针 rc 入 steps.tsv rc 列（旧=恒 0 只 judgment 显 FAIL）+ 聚合出链非零
-# run18 P-5：end id 与 begin 对齐（旧 end 5.3 无 begin → dur 空）
-STEP end C5 5 $PRC_ALL "$([ -z "$PROBLEMS" ] && echo PASS || echo FAIL)" "$JUDGE" "${PROBLEMS:-none}"
-[ -z "$PROBLEMS" ] || _fail_note "C5/5-probes($PROBLEMS)"
-[ -z "$PROBLEMS" ] || { echo "⚠ 探针失败:$PROBLEMS —— 按 troubleshooting 对应行处置（EXECUTION_TIMEOUT vs timed out 两形态勿混）"; }
-# v1.3.0 时间预算战役（run22 账本=装完立即 verify 会把同 3 探针冷跑第二遍，浪费 ~240s）：
-# C5 全过 ⇒ 落「探针新鲜 stamp」，verify.sh 在新鲜窗（PROBE_FRESH_BUDGET_S 默认 600s）且同包根时
-# 复用结果只跑终态矩阵。防假绿四防线=①stamp.deploy_ok=1（全链零 FAIL）②时效窗③同 PKG ④VERIFY_FORCE_PROBE=1 强制冷跑。
-# v1.5.0 F-03：探针全过只写 deploy_ok=0；只有末尾全链零 FAIL 才升为 1。
-# probe-fresh.sh 第四防线读的就是这一行（旧格式 stamp 一律 REUSE=0）。
-if [ -z "$PROBLEMS" ]; then
-  mkdir -p "$(dirname "$PROBE_STAMP")" 2>/dev/null || true
-  printf 'epoch=%s\npkg=%s\nrun=%s\ndeploy_ok=0\n' "$(date +%s)" "$PKG" "${VMDEPLOY_RUN_DIR:-}" > "$PROBE_STAMP" 2>/dev/null || true
-  echo "[probe-stamp] 候选标记已落 $PROBE_STAMP（deploy_ok=0；全链零 FAIL 后升 1 才可被 verify 复用）"
-else
-  echo "[probe-stamp] 探针未全绿：不写标记（开跑时旧标记已作废）"
-fi
-
-# ── Step 6 交付 ──
-STEP begin C6 6.1 "skill 交付判据"
-SKCNT="$(ls "$HOME/.workbuddy/connectors/skills/connector-winvm/" 2>/dev/null | wc -l)"
-echo "connector-winvm skills=$SKCNT"
-# run17 D-3：计数判据入判定（旧=无条件 PASS）；≠8 记 FAIL 聚合出链（口径见 SKILL.md 安装主流程 C6）
-if [ "$SKCNT" -lt 8 ]; then
-  STEP end C6 6.1 1 FAIL "skills=$SKCNT（期望≥8）" "skill 交付缺口：重跑 delivery/deploy-shared-skills.mjs 或对照 SKILL.md 安装主流程 C6"
-  _fail_note "C6/6.1-skills"
-else
-  STEP end C6 6.1 0 PASS "计数=$SKCNT" "none"
-fi
-
-# E2R2（11-12 E2E Q4）：交付待办清单——prepare/vmcheck 日志的 [MANUAL] 人工项必须显形到
-# 终端摘要（旧=埋在大 log 里，装"成"后 VM 侧 codebuddy 登录这类结构性人工项被漏）。
-TODO=""
-# e2e2R4+：日志双落点都扫（LOGD=VMDEPLOY_LOG_DIR 缺省位 vs step.sh RUN_DIR 位，
-# LOG_SAVED 实际走后者——首轮 R2 只扫 LOGD=落空未显形，11-12 e2e2 实锤）
-RUN2="${VMDEPLOY_RUN_DIR:-$HOME/wbtmp/vmdeploy-run-$(date +%Y%m%d)}"
-for _lg in "$LOGD/prepare-vm.log" "$LOGD/vmcheck.log" "$RUN2/logs/prepare-vm.log" "$RUN2/logs/vmcheck.log"; do
-  [ -f "$_lg" ] || continue
-  _m="$(grep -oE "DB-4[^↔]*|\[MANUAL\][^↔]*" "$_lg" 2>/dev/null | head -2 | tr '\n' ';')"
-  [ -n "$_m" ] && TODO="$TODO\n  · [$_lg] $_m"
-done
-if [ -n "$TODO" ]; then
-  echo "==== 交付待办（结构性人工项，非失败）===="
-  printf '%b\n' "$TODO"
-  echo "（VM 内一次交互登录等=deploy 设计内残留人工步骤，完成后可 verify 复跑确认 provider 态）"
-fi
-
-STEP report
-# run17 D-3 聚合出链：非硬阻断段失败（FAILED_STEPS 在场）→ 如实非零退出（旧=恒 0 假绿）
-if [ -n "$FAILED_STEPS" ]; then
-  echo "DEPLOY_APPLY_WITH_FAILURES:$FAILED_STEPS PKG_ROOT=$PKG"
-  echo "⚠ steps.tsv 判定列含 FAIL（硬阻断段已过；失败段明细见上与 logs/），出链 rc=1"
-  exit 1
-fi
-# v1.5.0 F-03：只有全链零 FAIL 才把候选标记升为 deploy_ok=1（verify 复用唯一合法来源）
-if [ -f "$PROBE_STAMP" ]; then
-  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];let s=fs.readFileSync(p,"utf8");s=s.replace(/^deploy_ok=.*$/m,"deploy_ok=1");if(!/^deploy_ok=/m.test(s))s+="deploy_ok=1\n";fs.writeFileSync(p,s)' "$PROBE_STAMP" 2>/dev/null || true
-  echo "[probe-stamp] deploy_ok=1（verify 仅在此全绿部署后可复用探针）"
-fi
-echo "DEPLOY_APPLY_DONE PKG_ROOT=$PKG"
+exit $RC

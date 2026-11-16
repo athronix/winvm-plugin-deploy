@@ -1,470 +1,375 @@
 #!/usr/bin/env bash
-# winvm-plugin-deploy · 自检门禁 (v1.8.0 起；v1.9.0 加 F-26 载荷预算分离)
+# selfcheck.sh · 技能离线自检门禁（不需要 VM，改完/发布前必跑）
 #
-# 一个命令跑完本技能的全部可本地验证断言（不需要 VM、不碰通道）：
-#   静态面 : bash -n / 控制字符 / frontmatter / V11 断言锚点 / 入包枚举 / 相对链接 / ASCII 载荷
-#   行为面 : F-19 零插值 + EncodedCommand 解码 / F-20 有界幂等复跑 / F-21 严格判据 / F-22 密钥择优
-#            F-23·F-24·F-25 动作级观测链（log_path 解析 / 空摘录归一 / 噪声白名单）
-#   容器面 : git diff --check（非 git 环境自动 SKIP）
+# 断言面（全部结构化，不做"字样在场"式假绿）：
+#   1  syntax        现行 .sh 全部 bash -n
+#   2  control       文本文件无控制字符（dist/*.zip 豁免）
+#   3  frontmatter   name 与 SemVer
+#   4  inventory     SKILL.md 脚本清单 ↔ scripts/ 实际文件一致（漏改名/漏入包）
+#   5  no-grep-c     禁 `grep -c ... || echo 0`（零匹配吐两个 0 ⇒ 假红 F-17）
+#   6  tsv-contract  _common.sh 的 st_end 真写 steps.tsv 且判定取值受控
+#   7  ssh-4-steps   deploy-1-ssh.sh 具备 1a/1b/1c/1d 且用新建连接实测判据
+#   8  probe-count   deploy-5-verify.sh 解析真实 x/y + 项数断言 + 取不到即 FAIL
+#   9  keep-default  undeploy-3-ssh.sh 默认 --remove-ssh-tunnel=no
+#  10  payload       ps-run.sh 的 _payload 注入 VM_PS_TIMEOUT（F-26 不变量）
+#  11  parallel      deploy.sh 阶段 A=1‖2 / B=3‖4 / C=5
+#  12  no-rebuild    卸载脚本不出现建通道字样
+#  13  links         SKILL.md 相对链接目标存在
+#  14  oneclick      VM 单脚本具备自归位 + 公钥文件回填 + 固定 -Rollback 路径
 #
-# 用法：bash scripts/selfcheck.sh             # 常规自检（15 项）
-#       bash scripts/selfcheck.sh --mutate    # 变异自证：5 组历史缺陷必须全被抓住
-#   退出码 0=全绿；1=有 FAIL；2=前置缺失（无 python3）
-#   证据文件默认写到 ${SKILL_SELFCHECK_OUT:-$HOME/wbtmp/winvm-plugin-deploy-selfcheck.txt}
-#   工作目录默认 ${TMPDIR:-$HOME/wbtmp}/skill-selfcheck-<pid>（/tmp 在本沙箱只读）
-#   跑完保留工作区并把路径打在 WORK_DIR= 上；确需清理才传 SELFCHECK_CLEAN=1
-#   （沙箱对批量删除有护栏，删目录会弹用户确认，故默认不删）
+# 用法：
+#   bash scripts/selfcheck.sh                  # 末行 SELFCHECK=ALL_GREEN checks=N fails=0
+#   bash scripts/selfcheck.sh --mutate         # 变异自证（6 组缺陷必须被对应断言抓到）
+#   SELFCHECK_WORK=<dir> bash scripts/selfcheck.sh
 #
-# 设计约束：本脚本自身也在被检查范围内（bash -n、控制字符、相对链接），
-# 任何字面量都不得写成会被自身断言命中的形态。
+# 退出码：0 全绿 / 1 有 FAIL / 2 前置缺失
 set -u
-SKILLDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-
-# ---- 渲染器解析（鸿蒙沙箱 / 常规 Linux 双兼容）----
-_pick() { for c in "$@"; do [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }; done; return 1; }
-PY="${PY:-$(_pick "$(command -v python3 2>/dev/null || true)" /data/service/hnp/bin/python3 /usr/bin/python3)}"
-[ -n "$PY" ] || { echo "SELFCHECK=NO_PYTHON（缺 python3，无法自检）" >&2; exit 2; }
-NODE="${NODE:-$(_pick "$(command -v node 2>/dev/null || true)" /data/storage/el1/bundle/libs/arm64/node/bin/node /usr/bin/node)}"
-BASH_OK="${BASH_OK:-$(_pick /data/storage/el1/bundle/libs/arm64/bash/bin/bash "$(command -v bash 2>/dev/null || true)" /bin/bash)}"
-[ -n "$BASH_OK" ] || BASH_OK=/bin/bash
-
-WORK="${SELFCHECK_WORK:-${TMPDIR:-$HOME/wbtmp}/skill-selfcheck-$$}"
-mkdir -p "$WORK" || { echo "SELFCHECK=NO_WORKDIR $WORK" >&2; exit 2; }
-
-MODE="${1:-}"
-if [ "$MODE" = "--mutate" ]; then
-  "$PY" - "$SKILLDIR" "$BASH_OK" "$NODE" "$WORK" <<'MUTEOF'
-"""把历史上每个真实缺陷注入技能副本，断言对应断言必须变 FAIL。
-绿的实现跑在坏的树上=假绿；本模式证明自检断言确实可被证伪。
-
-设计约束（实测踩过）：只克隆**一次**，每例改完用原位还原，不做「克隆→删→再克隆」。
-原因=沙箱对批量删除有护栏（SAFE_DELETE_BULK_CONFIRM_REQUIRED，50 个/回合），
-每轮整树克隆再删会累计越线，子进程被拦后异常退出、又没打印 FAIL，
-表现为「静默 MISSED」——把环境限制误读成断言失效。"""
-import os, shutil, subprocess, sys, time
-
-SK, BASH, NODE, WORK = sys.argv[1:5]
-# 唯一目录、全程零删除：沙箱对批量删除有护栏（>50 个/回合即拦），
-# 删副本会连带把自检自己拦死。所以本模式只建不删，路径打在 MUT_DIR 上由使用者自行清理。
-BASE = os.path.join(WORK, "mut-%d-%d" % (os.getpid(), int(time.time())))
-os.makedirs(BASE, exist_ok=True)
-
-CLONE = os.path.join(BASE, "skill")
-shutil.copytree(SK, CLONE, ignore=shutil.ignore_patterns(".git", "dist", "__pycache__"))
-
-TARGETS = ["scripts/ps-run.sh", "scripts/deploy.sh", "scripts/step.sh", "scripts/vm-conn.sh", "SKILL.md"]
-PRISTINE = {t: open(os.path.join(CLONE, t), encoding="utf-8").read() for t in TARGETS}
-
-
-def reset():
-    for t in TARGETS:
-        p = os.path.join(CLONE, t)
-        cur = open(p, encoding="utf-8").read() if os.path.exists(p) else None
-        if cur != PRISTINE[t]:
-            open(p, "w", encoding="utf-8").write(PRISTINE[t])
-
-
-def edit(rel, old, new):
-    p = os.path.join(CLONE, rel)
-    s = open(p, encoding="utf-8").read()
-    assert s.count(old) == 1, "anchor %s count=%d" % (rel, s.count(old))
-    open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
-
-
-def run(tag):
-    r = subprocess.run([BASH, os.path.join(CLONE, "scripts", "selfcheck.sh")],
-                       capture_output=True, text=True,
-                       env=dict(os.environ,
-                                SELFCHECK_WORK=os.path.join(BASE, "_w_" + tag),
-                                SKILL_SELFCHECK_OUT=os.path.join(BASE, "_e_" + tag + ".txt")))
-    fails = [l.split("  ")[1] for l in r.stdout.splitlines() if l.startswith("FAIL")]
-    # 子进程非零退出却一行 FAIL 都没有 = 自检自身崩了（既不是绿，也不是断言命中）。
-    # 必须显式暴露，否则会被误报成 MISSED、掩盖真实原因（本模式就是这么被坑过）。
-    if r.returncode != 0 and not fails:
-        tail = (r.stderr or "").strip().splitlines()
-        fails = ["HARNESS_CRASH rc=%d %s" % (r.returncode, tail[-1][:140] if tail else "no stderr")]
-    return r.returncode, fails
-
-
-def m1():  # F-19：JS 串里重新插值 bash 变量
-    edit("scripts/ps-run.sh",
-         '_enc="$("$NODE" -e \'process.stdout.write(Buffer.from("Remove-Item -LiteralPath \\"" + '
-         'process.argv[1] + "\\" -Force -ErrorAction SilentlyContinue","utf16le").toString("base64"))\' "$base")"',
-         '_enc="$("$NODE" -e \'process.stdout.write(Buffer.from("Remove-Item -LiteralPath \\"${base}\\" '
-         '-Force -ErrorAction SilentlyContinue","utf16le").toString("base64"))\')"')
-
-
-def m2():  # F-21：判据函数体里放宽 BLOCKERS 闸
-    edit("scripts/deploy.sh",
-         '    && grep -q "BLOCKERS=none" "$LOGD/env-check.log" 2>/dev/null',
-         "    && true")
-
-
-def m3():  # F-24：空摘录不再归一为 -
-    edit("scripts/step.sh",
-         "  if [ -n \"$out\" ]; then printf '%s\\n' \"$out\"; else echo \"-\"; fi",
-         "  printf '%s\\n' \"$out\"")
-
-
-def m4():  # F-23：不再写动作日志索引
-    edit("scripts/step.sh",
-         "    printf '%s\\t%s\\n' \"$(date -u +%s)\" \"$step\" >> \"$RUN_DIR/logs/.index\"",
-         "    : # no index")
-
-
-def m5():  # frontmatter 版本号非 SemVer
-    p = os.path.join(CLONE, "SKILL.md")
-    s = open(p, encoding="utf-8").read()
-    i = s.find("version:")
-    j = s.find("\n", i)
-    open(p, "w", encoding="utf-8").write(s[:i] + "version: 1.x" + s[j:])
-
-
-def m6():  # F-26：载荷执行退回裸调用（预算分离失效 → E2E4 假红复发）
-    edit("scripts/ps-run.sh",
-         '_payload _ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}"',
-         '_ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}"')
-
-
-MUT = [("M1 F-19 插值回归", m1, "F-19 ps-run zero-interpolation (code lines)"),
-       ("M2 F-21 判据放宽", m2, "F-21 strict verdict"),
-       ("M3 F-24 空摘录不归一", m3, "F-23/24/25 action-trace guard"),
-       ("M4 F-23 无日志索引", m4, "F-23/24/25 action-trace guard"),
-       ("M5 版本号非 SemVer", m5, "frontmatter name/version"),
-       ("M6 F-26 载荷预算回退", m6, "F-26 payload budget split")]
-
-print("=== baseline（未变异，必须 ALL_GREEN）===")
-reset()
-rc, fails = run("baseline")
-print("  rc=%s fails=%s" % (rc, fails))
-ok_all = (rc == 0 and not fails)
-
-for name, fn, expect in MUT:
-    print("=== %s ===" % name)
-    reset()
-    fn()
-    rc, fails = run(name.split()[0])
-    hit = expect in fails
-    ok_all &= (rc != 0 and hit)
-    print("  rc=%s fails=%s  expect=%r  %s" % (rc, fails, expect, "CAUGHT" if hit else "MISSED"))
-    reset()
-
-print("MUT_DIR=%s（取证副本保留在原地；确认结果后可自行删除整个目录）" % BASE)
-print("MUTATION_RESULT=" + ("ALL_CAUGHT" if ok_all else "FAILED"))
-sys.exit(0 if ok_all else 1)
-MUTEOF
-  rc=$?
-  # 不清理 WORK：整树删除会撞沙箱批量删除护栏（且 rm shim 在鸿蒙沙箱可能是坏的）。
-  # 取证副本路径由上面的 MUT_DIR 行给出。
-  exit $rc
-fi
-
-
-
-"$PY" - "$SKILLDIR" "$BASH_OK" "$NODE" "$WORK" "${1:-}" <<'PYEOF'
-import os, sys, glob, re, subprocess, shutil, datetime
-
-SK, BASH, NODE, WORK, MODE = sys.argv[1:6]
-PY = sys.executable
-lines, fails = [], []
-
-
-def chk(name, ok, detail=""):
-    lines.append(("PASS" if ok else "FAIL") + "  " + name + (("  " + str(detail)) if detail else ""))
-    if not ok:
-        fails.append(name)
-
-
-def skip(name, why):
-    lines.append("SKIP  " + name + "  (" + why + ")")
-
-
-def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
-
-
-def rd(p):
-    return open(p, encoding="utf-8", errors="replace").read()
-
-
-sh = sorted(glob.glob(os.path.join(SK, "scripts", "*.sh")))
-
-# ---------- 1 static: bash -n ----------
-bad = []
-for p in sh:
-    r = run([BASH, "-n", p])
-    if r.returncode:
-        bad.append((os.path.basename(p), (r.stderr or r.stdout).strip()[:80]))
-chk("bash -n all scripts", not bad, "total=%d fail=%s" % (len(sh), bad))
-
-# ---------- 2 static: control chars (text files only; dist/*.zip is binary) ----------
-TEXT_EXT = (".sh", ".mjs", ".js", ".md", ".tsv", ".ps1", ".json", ".txt", ".yaml", ".yml", ".example")
-allf = [p for p in glob.glob(os.path.join(SK, "**", "*"), recursive=True)
-        if os.path.isfile(p) and p.endswith(TEXT_EXT)]
-bad = []
-for p in allf:
-    b = open(p, "rb").read()
-    if any(x < 32 and x not in (9, 10, 13) for x in b):
-        bad.append(os.path.relpath(p, SK))
-chk("control chars zero", not bad, "files=%d bad=%s" % (len(allf), bad[:5]))
-
-# ---------- 3 static: frontmatter ----------
-fm = rd(os.path.join(SK, "SKILL.md"))[:2000]
-name = re.search(r"^name:\s*(\S+)", fm, re.M)
-ver = re.search(r"^version:\s*(\S+)", fm, re.M)
-chk("frontmatter name/version",
-    bool(name and ver and name.group(1) == "winvm-plugin-deploy" and re.match(r"^\d+\.\d+\.\d+$", ver.group(1))),
-    "name=%s version=%s" % (name.group(1) if name else "?", ver.group(1) if ver else "?"))
-
-# ---------- 4/5 V11 assertion anchors (release-time surface) ----------
-skill_md = rd(os.path.join(SK, "SKILL.md"))
-NEED_STR = ["URL 单指令入口", "winvm-plugin-deploy-skill.zip", "roundtrip.sh", "ROUNDTRIP_RESULT",
-            "SSH 免密通道生命周期", "hos-winvm-ssh-tunnel", "INSTALL_PROMPT.md"]
-missing = [s for s in NEED_STR if s not in skill_md]
-chk("V11 SKILL.md string anchors", not missing, "missing=%s" % missing)
-
-rel = lambda p: os.path.relpath(p, SK).replace(os.sep, "/")
-# 只登记**实际存在**的顶层件：无条件预置会让子断言恒真（RELEASE-VERSION.txt 由母项目 pack
-# 写入 staging zip，技能仓里没有；预置它=空断言）。该项现由母项目 V11 断言负责。
-entries = []
-for f in ("SKILL.md",):
-    if os.path.isfile(os.path.join(SK, f)):
-        entries.append("winvm-plugin-deploy/" + f)
-for sub in ("scripts", "references", "assets"):
-    d = os.path.join(SK, sub)
-    if os.path.isdir(d):
-        for dp, _, fs in os.walk(d):
-            for f in fs:
-                entries.append("winvm-plugin-deploy/" + rel(os.path.join(dp, f)))
-NEED_FILE = ["SKILL.md", "scripts/ssh2-conn.mjs", "scripts/undeploy.sh", "references/troubleshooting.md",
-             "scripts/roundtrip.sh", "scripts/probe-fresh.sh"]
-missing = [x for x in NEED_FILE if "winvm-plugin-deploy/" + x not in entries]
-chk("V11 package file anchors", not missing, "missing=%s" % missing)
-
-# ---------- 6 packaging whitelist enumeration ----------
-NEW = ["scripts/run-flow.sh", "scripts/context.sh", "scripts/action-report.sh", "scripts/action-catalog.tsv",
-       "scripts/selfcheck.sh"]
-missing = [x for x in NEW if "winvm-plugin-deploy/" + x not in entries]
-badroot = [e for e in entries if not e.startswith("winvm-plugin-deploy/")]
-chk("packaging whitelist captures new files", not missing and not badroot,
-    "entries=%d missing=%s badroot=%d" % (len(entries), missing, len(badroot)))
-
-# ---------- 7/8/9/10 code-level guards on driver scripts ----------
-ps = rd(os.path.join(SK, "scripts", "ps-run.sh"))
-code_ps = "\n".join(l for l in ps.splitlines() if not l.lstrip().startswith("#"))
-# F-19 的要害是「清理串经 process.argv 传参 + EncodedCommand 生效」。注意 ${base} 本身在
-# vmscp / -File 里是合法远端路径变量，不能 blanket 禁——只禁「JS 串里插值 ${base}」这一缺陷形态。
-FORBID = ['LiteralPath "${base}"', 'LiteralPath \\"${base}']
-chk("F-19 ps-run zero-interpolation (code lines)",
-    "process.argv[1]" in code_ps and "-EncodedCommand ${_enc}" in code_ps
-    and "Remove-Item -LiteralPath" in code_ps and not any(f in code_ps for f in FORBID),
-    "argv=%s enc=%s" % ("process.argv[1]" in code_ps, "-EncodedCommand ${_enc}" in code_ps))
-
-dp = rd(os.path.join(SK, "scripts", "deploy.sh"))
-chk("F-20 bounded idempotent retry", "TRANSIENT_TRUNCATION" in dp and "RETRY" in dp,
-    "TRANSIENT_TRUNCATION=%s RETRY=%s" % ("TRANSIENT_TRUNCATION" in dp, "RETRY" in dp))
-# F-21: 断言必须落在**判据函数体**上。只查全文出现会被注释/echo 里的同名字面蒙混过去
-# （变异测试 M2 实证：把函数体内的 BLOCKERS=none 改成 BLOCKERS=ok，全文断言仍绿）。
-_m = re.search(r"_envcheck_ok\s*\(\)\s*\{(.*?)\n\}", dp, re.S)
-_body = "\n".join(l for l in (_m.group(1) if _m else "").splitlines() if not l.lstrip().startswith("#"))
-chk("F-21 strict verdict",
-    bool(_m) and 'grep -q "ENV_PRECHECK=PASS"' in _body and 'grep -q "BLOCKERS=none"' in _body
-    and "&&" in _body and dp.count("! _envcheck_ok") >= 1,
-    "fn=%s pass=%s blockers=%s and=%s guard=%d"
-    % (bool(_m), 'grep -q "ENV_PRECHECK=PASS"' in _body, 'grep -q "BLOCKERS=none"' in _body,
-       "&&" in _body, dp.count("! _envcheck_ok")))
-cx = rd(os.path.join(SK, "scripts", "context.sh"))
-chk("F-22 key probe", "VM_KEY_PROBE" in cx and "READY" in cx)
-
-# ---------- F-26 传输预算 / 载荷预算分离（E2E4 定谳 11-13） ----------
-# 现象：vmcheck 153s rc=124，日志只有「VM_CHANNEL/传输层失败」两行、零载荷输出 → 被误判通道坏。
-# 实测：同通道 ssh2 ping 2.6s，而 vmcheck.ps1 自身耗时 47~56s（连测 47/53/56 三发），
-#   每次都撞穿 VM_SSH_TIMEOUT+5=30s 的**传输**窗；`-File` 型载荷「跑完才输出」⇒ 超时=零输出。
-# 断言形态（可证伪）：①ps-run 定义 VM_PS_TIMEOUT 且默认 >=120；②每一处 powershell 载荷执行
-# 都必须经 _payload 前缀（裸 _ps_cmd "powershell 计数须为 0）；③vm-conn 的 ssh2 exec 与 _ssh_t
-# 都认 VM_SSH_EXEC_TIMEOUT、重试次数认 VM_SSH_TRIES（否则预算抬了也被 25s 兜底杀）。
-vc = rd(os.path.join(SK, "scripts", "vm-conn.sh"))
-code_vc = "\n".join(l for l in vc.splitlines() if not l.lstrip().startswith("#"))
-_mps = re.search(r'VM_PS_TIMEOUT="\$\{VM_PS_TIMEOUT:-(\d+)\}"', code_ps)
-# 恰好两个载荷执行点必须带 _payload：-File 推文件、-c 的 EncodedCommand 载荷；
-# 远端临时件清理（-EncodedCommand ${_enc}）是轻调用，必须保持裸调用（25s 传输窗），
-# 否则清理挂起会白等 180s。
-_file_w = '_payload _ps_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File ${base}"' in code_ps
-_enc_w = ('_payload _ps_cmd "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass '
-          '-EncodedCommand ${ENC}"') in code_ps
-_clean_bare = '_ps_cmd "powershell -NoProfile -NonInteractive -EncodedCommand ${_enc}"' in code_ps
-_wired = len(re.findall(r'_payload _ps_cmd "powershell', code_ps))
-_vc_exec = code_vc.count("VM_SSH_EXEC_TIMEOUT:-")
-chk("F-26 payload budget split",
-    bool(_mps) and int(_mps.group(1)) >= 120
-    and _wired == 2 and _file_w and _enc_w and _clean_bare
-    and 'VM_SSH_EXEC_TIMEOUT="$VM_PS_TIMEOUT"' in code_ps
-    and "VM_SSH_TRIES=2" in code_ps
-    and _vc_exec >= 2 and "VM_SSH_TRIES:-" in code_vc,
-    "ps_timeout=%s wired=%d file=%s enc=%s clean=%s vc_exec=%d"
-    % (_mps.group(1) if _mps else "?", _wired, _file_w, _enc_w, _clean_bare, _vc_exec))
-
-# ---------- 11 F-19 EncodedCommand roundtrip (needs node) ----------
-JS = ('process.stdout.write(Buffer.from("Remove-Item -LiteralPath \\"" + process.argv[1] + '
-      '"\\" -Force -ErrorAction SilentlyContinue","utf16le").toString("base64"))')
-if NODE and os.path.isfile(NODE):
-    enc = run([NODE, "-e", JS, "vm-env-check.ps1"]).stdout.strip()
-    dec = run([NODE, "-e", 'console.log(Buffer.from(process.argv[1],"base64").toString("utf16le"))',
-               enc]).stdout.strip()
-    chk("F-19 EncodedCommand decode",
-        dec == 'Remove-Item -LiteralPath "vm-env-check.ps1" -Force -ErrorAction SilentlyContinue', dec)
-else:
-    skip("F-19 EncodedCommand decode", "no node")
-
-# ---------- 12 C3.0 behavioural guard (4 falsifiable cases) ----------
-G = os.path.join(WORK, "c30")
-os.makedirs(G, exist_ok=True)
-# 一例一目录、零删除：沙箱对批量删除有护栏（>50 个/回合即拦，见 C 表），
-# 删文件既慢又会把自检自己拦死；unique 目录天然隔离，不需要清理。
-
-src = rd(os.path.join(SK, "scripts", "deploy.sh"))
-MARK = "STEP begin C3 3.0"
-if src.count(MARK) != 1:
-    chk("C3.0 four-case behavioural guard", False, "C3.0 anchor not unique")
-else:
-    tail = src[src.find(MARK):].splitlines()
-    pass_i = next((i for i, l in enumerate(tail) if "STEP end C3 3.0 0 PASS" in l), None)
-    end_i = next((i for i, l in enumerate(tail) if l == "fi" and pass_i is not None and i > pass_i), None)
-    if pass_i is None or end_i is None:
-        chk("C3.0 four-case behavioural guard", False, "C3.0 block not delimited")
-    else:
-        block = "\n".join(tail[:end_i + 1])
-        SKEL = ('#!/usr/bin/env bash\nset -u\n_here="__G"\nPKG="__G"\nLOGD="__G"\nBASH_OK="__B"\n'
-                'STEP() {\n  if [ "${1:-}" = "end" ]; then\n'
-                '    echo "STEP_END rc=$4 result=$5 judged=$6" > "__G/step-result.txt"\n'
-                '    echo "$6" > "__G/step-judged.txt"\n  fi\n}\n'
-                '_step_log() { :; }\n_fail_note() { echo "$1" >> "__G/fail-notes.txt"; }\n'
-                'export LOGD\n. "__G/block.sh"\necho "RETRY=$RETRY ERC=$ERC" > "__G/vars.txt"\n')
-        FAKE = ('#!/usr/bin/env bash\nn=0; [ -f "__G/count" ] && n=$(cat "__G/count"); n=$((n+1)); '
-                'echo "$n" > "__G/count"\ncase "$CASE_ID:$n" in\n'
-                '  A:1) printf \'NODE_OK=true\\nCLI_OK=true\\nvmssh: ssh2 传输层失败\\n\' > "$LOGD/env-check.log"; exit 124;;\n'
-                '  A:2) printf \'NODE_OK=true\\nCLI_OK=true\\nENV_PRECHECK=PASS\\nBLOCKERS=none\\n\' > "$LOGD/env-check.log"; exit 0;;\n'
-                '  B:*) printf \'NODE_OK=true\\nCLI_OK=true\\nENV_PRECHECK=FAIL\\nBLOCKERS=none\\n\' > "$LOGD/env-check.log"; exit 0;;\n'
-                '  C:*) printf \'NODE_OK=true\\nCLI_OK=true\\nENV_PRECHECK=PASS\\nBLOCKERS=codebuddy-login\\n\' > "$LOGD/env-check.log"; exit 0;;\n'
-                '  D:*) printf \'NODE_OK=false\\nCLI_OK=true\\n\' > "$LOGD/env-check.log"; exit 124;;\n'
-                '  *) echo "unexpected CASE_ID/call $CASE_ID:$n" >&2; exit 99;;\nesac\n')
-        CASES = [("A", "1", "PASS"), ("B", "0", "FAIL"), ("C", "0", "FAIL"), ("D", "0", "FAIL")]
-        allok = True
-        for cid, retry, result in CASES:
-            Gc = os.path.join(G, cid)
-            os.makedirs(Gc, exist_ok=True)
-            open(os.path.join(Gc, "block.sh"), "w", encoding="utf-8").write(block + "\n")
-            open(os.path.join(Gc, "skeleton.sh"), "w", encoding="utf-8").write(
-                SKEL.replace("__G", Gc).replace("__B", BASH))
-            open(os.path.join(Gc, "ps-run.sh"), "w", encoding="utf-8").write(FAKE.replace("__G", Gc))
-            os.chmod(os.path.join(Gc, "ps-run.sh"), 0o755)
-            e = dict(os.environ, CASE_ID=cid, G=Gc, LOGD=Gc, SELFCHECK_GUARD="1")
-            p = run([BASH, os.path.join(Gc, "skeleton.sh")], env=e)
-            verdict = open(os.path.join(Gc, "step-result.txt"), encoding="utf-8").read() if os.path.exists(
-                os.path.join(Gc, "step-result.txt")) else ""
-            v = open(os.path.join(Gc, "vars.txt"), encoding="utf-8").read() if os.path.exists(
-                os.path.join(Gc, "vars.txt")) else ""
-            got_retry = v.split("RETRY=")[1].split()[0] if "RETRY=" in v else "?"
-            got_result = verdict.split("result=")[1].split()[0] if "result=" in verdict else "?"
-            ok = (got_retry == retry and got_result == result)
-            allok &= ok
-            if not ok:
-                lines.append("      · CASE %s FAIL retry=%s(exp %s) result=%s(exp %s) rc=%s"
-                             % (cid, got_retry, retry, got_result, result, p.returncode))
-        chk("C3.0 four-case behavioural guard", allok, "cases=4")
-
-# ---------- 13 F-23/F-24/F-25 action-trace guard (4 cases) ----------
-H = os.path.join(WORK, "trace")
-shutil.rmtree(H, ignore_errors=True)
-os.makedirs(H, exist_ok=True)
-STEP = os.path.join(SK, "scripts", "step.sh")
-env = dict(os.environ, VMDEPLOY_RUN_DIR=H, PY=PY, NODE=NODE or "")
-
-
-def step(*a, stdin=None):
-    return run([BASH, STEP, *a], env=env, input=stdin)
-
-
-def lastrow():
-    rows = rd(os.path.join(H, "actions.tsv")).splitlines()
-    return dict(zip(rows[0].split("\t"), rows[-1].split("\t")))
-
-
-ok = True
-step("begin", "C3", "3.0", "ENV_PRECHECK")
-step("log", "env-check", stdin="NODE_OK=true\nCLI_OK=true\nvmssh: ssh2 传输层失败 rc=124（3 试尽）\n")
-step("end", "C3", "3.0", "124", "FAIL", "env-check rc=124", "照 P-2 处置")
-d = lastrow()
-c1 = d["log_path"].endswith("logs/env-check.log") and "ssh2" in d["error_excerpt"] and os.path.isfile(d["log_path"])
-ok &= c1
-step("begin", "C4", "4.1", "install-host")
-step("log", "install-host", stdin="install-host rc=0\nFRESH OK\n")
-step("end", "C4", "4.1", "0", "PASS", "install-host rc=0", "none")
-d2 = lastrow()
-c2 = d2["log_path"].endswith("logs/install-host.log") and d2["error_excerpt"] == "-"
-ok &= c2
-step("begin", "R1", "1", "download-verify")
-step("log", "1", stdin="download rc=0\n")
-step("end", "R1", "1", "0", "PASS", "PKG_ROOT=x", "none")
-c3 = lastrow()["log_path"].endswith("logs/1.log")
-ok &= c3
-step("begin", "R1", "1.9", "noise-only")
-step("log", "noise-only",
-     stdin="shell-init: error retrieving current directory: getcwd: cannot access parent directories: Not supported\n"
-           "chdir: error retrieving current directory: getcwd: cannot access parent directories: Invalid argument\n"
-           "FRESH OK\n")
-step("end", "R1", "1.9", "0", "PASS", "noise only", "none")
-c4 = lastrow()["error_excerpt"] == "-"
-ok &= c4
-if not ok:
-    lines.append("      · F-23/24/25 cases: logpath=%s excerpt2=%r excerpt4=%r"
-                 % (c1, d2["error_excerpt"], lastrow()["error_excerpt"]))
-chk("F-23/24/25 action-trace guard", ok, "cases=4")
-
-# ---------- 14 markdown relative links ----------
-links, broken = [], []
-for p in glob.glob(os.path.join(SK, "**", "*.md"), recursive=True):
-    for t in re.findall(r"\]\(([^)#]+)", rd(p)):
-        if t.startswith(("http://", "https://", "mailto:")):
+_here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PY=/data/service/hnp/bin/python3
+[ -x "$PY" ] || PY="$(command -v python3 2>/dev/null || true)"
+[ -n "$PY" ] && [ -x "$PY" ] || { echo "SELFCHECK=PRECONDITION_MISSING reason=no-python3"; exit 2; }
+MUTATE=0
+[ "${1:-}" = "--mutate" ] && MUTATE=1
+: "${SELFCHECK_WORK:=${HOME}/wbtmp/selfcheck-$(date +%Y%m%d-%H%M%S)}"
+: "${SKILL_SELFCHECK_OUT:=${HOME}/wbtmp/winvm-plugin-deploy-selfcheck.txt}"
+mkdir -p "$SELFCHECK_WORK" 2>/dev/null || true
+
+"$PY" - "$_here/.." "$MUTATE" "$SELFCHECK_WORK" "$SKILL_SELFCHECK_OUT" <<'PYEOF'
+import os, re, sys, io, shutil, subprocess
+
+ROOT = os.path.abspath(sys.argv[1])
+MUTATE = sys.argv[2] == '1'
+WORK = sys.argv[3]
+OUT = sys.argv[4]
+
+# 现行脚本（legacy 不进断言面：留档即冻结）
+ACTIVE = ['_common.sh', 'deploy.sh', 'deploy-1-ssh.sh', 'deploy-2-host.sh',
+          'deploy-3-tunnel.sh', 'deploy-4-vm.sh', 'deploy-5-verify.sh',
+          'undeploy.sh', 'undeploy-1-host.sh', 'undeploy-2-vm.sh',
+          'undeploy-3-ssh.sh', 'verify.sh', 'env-detect.sh', 'download-verify.sh',
+          'pkg-root.sh', 'ps-run.sh', 'vm-conn.sh', 'selfcheck.sh']
+
+
+def read(p):
+    with io.open(p, encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
+def strip_comments(txt):
+    """剔注释行，避免"注释里的字样"蒙混结构化断言（F-21 变异实证）。"""
+    return '\n'.join(l for l in txt.splitlines() if not l.lstrip().startswith('#'))
+
+
+def walk_files(base):
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in ('.git', 'legacy', 'dist', 'node_modules')]
+        for fn in filenames:
+            yield os.path.join(dirpath, fn)
+
+
+# ─────────────────────────── 断言 ───────────────────────────
+def c_syntax(root):
+    bad = []
+    for fn in ACTIVE:
+        p = os.path.join(root, 'scripts', fn)
+        if not os.path.exists(p):
+            bad.append('%s: missing' % fn); continue
+        r = subprocess.run(['bash', '-n', p], capture_output=True, text=True)
+        if r.returncode != 0:
+            bad.append('%s: %s' % (fn, (r.stderr or '').strip().splitlines()[:1]))
+    return bad
+
+
+def c_control(root):
+    bad = []
+    for p in walk_files(root):
+        rel = os.path.relpath(p, root)
+        if rel.endswith(('.zip', '.png', '.jpg', '.ico')):
             continue
-        links.append((p, t))
-        if not os.path.exists(os.path.normpath(os.path.join(os.path.dirname(p), t))):
-            broken.append((rel(p), t))
-chk("markdown relative links", not broken, "links=%d broken=%s" % (len(links), broken[:5]))
+        try:
+            data = open(p, 'rb').read()
+        except Exception:
+            continue
+        if b'\x00' in data:
+            bad.append(rel + ': NUL byte'); continue
+        try:
+            txt = data.decode('utf-8')
+        except UnicodeDecodeError:
+            bad.append(rel + ': not utf-8'); continue
+        for ch in txt:
+            o = ord(ch)
+            if o < 0x09 or o in (0x0b, 0x0c) or 0x0e <= o <= 0x1f:
+                bad.append('%s: ctrl U+%04X' % (rel, o)); break
+    return bad
 
-# ---------- 15 git diff --check (container surface) ----------
-if os.path.isdir(os.path.join(SK, ".git")):
-    GIT = shutil.which("git") or next((c for c in (
-        os.path.expanduser("~/.harmonybrew/opt/git/bin/git"), "/usr/bin/git") if os.path.isfile(c)), None)
-    if GIT:
-        r = run([GIT, "-C", SK, "diff", "--check"])
-        chk("git diff --check", r.returncode == 0, (r.stdout + r.stderr).strip()[:160])
+
+def c_frontmatter(root):
+    bad = []
+    txt = read(os.path.join(root, 'SKILL.md'))
+    m = re.search(r'^---\s*$(.*?)^---\s*$', txt, re.S | re.M)
+    if not m:
+        return ['SKILL.md: no frontmatter block']
+    fm = m.group(1)
+    if not re.search(r'^name:\s*winvm-plugin-deploy\s*$', fm, re.M):
+        bad.append('frontmatter name != winvm-plugin-deploy')
+    vm = re.search(r'^version:\s*(\S+)\s*$', fm, re.M)
+    if not vm:
+        bad.append('frontmatter version missing')
+    elif not re.match(r'^\d+\.\d+\.\d+$', vm.group(1)):
+        bad.append('version not SemVer: %s' % vm.group(1))
+    return bad
+
+
+def c_inventory(root):
+    """SKILL.md 提到的每个脚本名都必须真实存在（防改名漏改文档/漏入包）。"""
+    bad = []
+    txt = read(os.path.join(root, 'SKILL.md'))
+    names = set(re.findall(r'`([A-Za-z0-9_\-]+\.(?:sh|ps1|mjs))`', txt))
+    for n in sorted(names):
+        cands = [os.path.join(root, 'scripts', n), os.path.join(root, 'scripts', 'legacy', n)]
+        if not any(os.path.exists(c) for c in cands):
+            bad.append('SKILL.md 引用了不存在的脚本: %s' % n)
+    return bad
+
+
+def c_no_grep_c(root):
+    bad = []
+    for p in walk_files(os.path.join(root, 'scripts')):
+        if not p.endswith(('.sh', '.ps1')):
+            continue
+        for i, l in enumerate(read(p).splitlines(), 1):
+            if l.lstrip().startswith('#'):
+                continue
+            if re.search(r'grep\s+-c\b.*\|\|\s*echo\s+0', l):
+                bad.append('%s:%d %s' % (os.path.relpath(p, root), i, l.strip()[:70]))
+    return bad
+
+
+def c_tsv_contract(root):
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    if 'steps.tsv' not in body:
+        bad.append('_common.sh 未定义 steps.tsv')
+    if not re.search(r"printf\s+'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n'", body):
+        bad.append('st_end 未按 6 列写 steps.tsv')
+    for v in ('PASS', 'FAIL', 'SKIP', 'WAIT_USER'):
+        if v not in body:
+            bad.append('st_end 判定缺少取值 %s' % v)
+    return bad
+
+
+def c_ssh_4steps(root):
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh')))
+    for tag in ('1a', '1b', '1c', '1d'):
+        if tag not in body:
+            bad.append('deploy-1-ssh.sh 缺 %s 段' % tag)
+    # 分段结构性断言：1a（判）与 1d（验）都必须用新建连接实测，不能是常量或注释
+    seg1a = re.search(r'st_begin 1a\b(.*?)\n\s*st_end', body, re.S)
+    if not seg1a or 'channel_ready' not in seg1a.group(1):
+        bad.append('1a 段未用 channel_ready 做判据')
+    seg1d = re.search(r'st_begin "1d[^\n]*\n(.*?)\n\s*st_end', body, re.S)
+    if not seg1d or 'channel_ready' not in seg1d.group(1):
+        bad.append('1d 段未用 channel_ready 做验证')
+    if 'while' not in body or 'prepare_key' not in body:
+        bad.append('缺"验证失败回 1b"的循环/备钥调用')
+    return bad
+
+
+def c_probe_count(root):
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', 'deploy-5-verify.sh')))
+    if not re.search(r"grep\s+-oE\s+'\[0-9\]\+/\[0-9\]\+'", body):
+        bad.append('未解析真实 x/y 计数')
+    if 'EXP_TOTAL' not in body or 'EXP_SKIP' not in body:
+        bad.append('缺 EXP_TOTAL/EXP_SKIP 项数断言')
+    if 'SKIP deep' not in body:
+        bad.append('未解析 SKIP deep（分级失效=静默少测）')
+    # 结构化：每个「取计数」分支的 else 必须真的把问题记进 PROBLEMS（不是靠字样在场）
+    blocks = re.findall(r'if \[ -n "\$PT" \]; then(.*?)else(.*?)fi', body, re.S)
+    if not blocks:
+        bad.append('找不到"有计数/无计数"分支结构（判据可能被改写）')
     else:
-        skip("git diff --check", "no git binary")
-else:
-    skip("git diff --check", "not a git checkout")
+        if len(blocks) < 2:
+            bad.append('计数分支 <2（冷跑与复用两条路都必须判）')
+        for i, (thenb, elseb) in enumerate(blocks, 1):
+            if 'PROBLEMS' not in elseb:
+                bad.append('第 %d 个计数分支的 else 未记 PROBLEMS（无计数照样 PASS=假绿）' % i)
+            if 'PROBLEMS' in thenb:
+                bad.append('第 %d 个分支误在 then 里记失败' % i)
+    return bad
 
-out = "\n".join(lines) + ("\n\nSELFCHECK=%s checks=%d fails=%d\n"
-                          % ("ALL_GREEN" if not fails else "FAILED", len(lines), len(fails)))
-print(out)
-dest = os.environ.get("SKILL_SELFCHECK_OUT") or os.path.join(os.path.expanduser("~"), "wbtmp",
-                                                             "winvm-plugin-deploy-selfcheck.txt")
-try:
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    open(dest, "w", encoding="utf-8").write(
-        "# winvm-plugin-deploy selfcheck · %s\n# skill=%s mode=%s\n\n%s\n"
-        % (datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), SK, MODE, out))
-    print("EVIDENCE=" + dest)
-except Exception as e:
-    print("EVIDENCE_WRITE_FAIL " + str(e)[:80])
 
-# 默认**不清理**工作区：鸿蒙沙箱对批量删除有护栏（>50 个/回合），
-# 删临时目录会变成用户确认弹窗——自检不该为清理打扰使用者。
-# 需要清理时显式传 SELFCHECK_CLEAN=1；工作区路径总是打在 WORK_DIR= 上。
-if os.environ.get("SELFCHECK_CLEAN"):
-    shutil.rmtree(WORK, ignore_errors=True)
-print("WORK_DIR=" + WORK)
-sys.exit(0 if not fails else 1)
+def c_keep_default(root):
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-3-ssh.sh')))
+    if not re.search(r'^REMOVE="no"', body, re.M):
+        bad.append('undeploy-3-ssh.sh 默认 --remove-ssh-tunnel 不是 no')
+    if '--remove-ssh-tunnel' not in body:
+        bad.append('未识别 --remove-ssh-tunnel 参数')
+    return bad
+
+
+def c_payload(root):
+    body = strip_comments(read(os.path.join(root, 'scripts', 'ps-run.sh')))
+    m = re.search(r'^_payload\(\)\s*\{(.*?)\}', body, re.S | re.M)
+    if not m:
+        return ['ps-run.sh 无 _payload 函数']
+    inner = m.group(1)
+    bad = []
+    if 'VM_PS_TIMEOUT' not in inner:
+        bad.append('_payload 未注入 VM_PS_TIMEOUT（载荷预算回退 → 假红 F-26）')
+    if 'VM_SSH_EXEC_TIMEOUT' not in inner:
+        bad.append('_payload 未覆盖 VM_SSH_EXEC_TIMEOUT')
+    return bad
+
+
+def c_parallel(root):
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', 'deploy.sh')))
+    pats = [('A', r'stage\s+"A[^"]*"\s+1\s+2'),
+            ('B', r'stage\s+"B[^"]*"\s+3\s+4'),
+            ('C', r'stage\s+"C[^"]*"\s+5\s*$')]
+    for tag, pat in pats:
+        if not re.search(pat, body, re.M):
+            bad.append('阶段 %s 未按预期组合' % tag)
+    return bad
+
+
+def c_no_rebuild(root):
+    bad = []
+    for fn in ('undeploy-1-host.sh', 'undeploy-2-vm.sh', 'undeploy-3-ssh.sh'):
+        body = strip_comments(read(os.path.join(root, 'scripts', fn)))
+        for kw in ('channel.sh ensure', 'host-generate-key.sh', 'deploy-1-ssh.sh'):
+            if kw in body:
+                bad.append('%s 出现重建通道迹象: %s' % (fn, kw))
+    return bad
+
+
+def c_links(root):
+    bad = []
+    txt = read(os.path.join(root, 'SKILL.md'))
+    for m in re.finditer(r'\[[^\]]*\]\(([^)#]+?)\)', txt):
+        t = m.group(1).strip()
+        if re.match(r'^(https?:|mailto:)', t):
+            continue
+        if not os.path.exists(os.path.normpath(os.path.join(root, t))):
+            bad.append('SKILL.md 死链: %s' % t)
+    return bad
+
+
+def c_oneclick(root):
+    p = os.path.join(root, 'scripts', 'winvm-sshd-oneclick.ps1')
+    if not os.path.exists(p):
+        return ['缺 winvm-sshd-oneclick.ps1']
+    body = read(p)
+    bad = []
+    if 'InstallDir' not in body or 'SelfPathFinal' not in body:
+        bad.append('缺自归位（InstallDir/SelfPathFinal）')
+    if '$PublicKeyFile' not in body:
+        bad.append('缺 -PublicKeyFile 回填')
+    if not re.search(r'\[switch\]\$Rollback', body):
+        bad.append('缺 -Rollback 开关')
+    if 'winvm-sshd-oneclick.ps1' not in body:
+        bad.append('缺固定留存路径字样')
+    return bad
+
+
+CHECKS = [
+    ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
+    ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
+    ('ssh-4-steps', c_ssh_4steps), ('probe-count', c_probe_count),
+    ('keep-default', c_keep_default), ('payload', c_payload), ('parallel', c_parallel),
+    ('no-rebuild', c_no_rebuild), ('links', c_links), ('oneclick', c_oneclick),
+]
+
+
+def run_all(root):
+    total, fails, lines = 0, [], []
+    for name, fn in CHECKS:
+        total += 1
+        try:
+            bad = fn(root)
+        except Exception as e:
+            bad = ['assertion crashed: %r' % (e,)]
+        if bad:
+            fails.extend('%s: %s' % (name, b) for b in bad)
+            lines.append('  [FAIL] %-14s %s' % (name, bad[0][:110]))
+        else:
+            lines.append('  [ ok ] %-14s' % name)
+    return total, fails, lines
+
+
+# ─────────────────────── 变异自证（注缺陷必须被抓） ───────────────────────
+# 注入串分片构造：字面缺陷串若出现在本文件同一行，会被 no-grep-c 扫到自己（自伤）
+_M1_TAIL = 'grep -c foo /dev/null'
+_M1_OR = ' || echo 0'
+
+MUTATIONS = [
+    ('M1 grep-c 假红回归', 'scripts/_common.sh',
+     "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n'",
+     "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' ; X=$(" + _M1_TAIL + _M1_OR + ")"),
+    ('M2 探针无计数不判FAIL', 'scripts/deploy-5-verify.sh',
+     'PROBLEMS="$PROBLEMS $pr:no-count"', 'true'),
+    ('M3 卸载默认拆通道', 'scripts/undeploy-3-ssh.sh', 'REMOVE="no"', 'REMOVE="yes"'),
+    ('M4 载荷预算回退', 'scripts/ps-run.sh',
+     '_payload() { VM_SSH_EXEC_TIMEOUT="$VM_PS_TIMEOUT" VM_SSH_TRIES=2 "$@"; }',
+     '_payload() { "$@"; }'),
+    ('M5 1a 判据改成常量', 'scripts/deploy-1-ssh.sh',
+     'st_begin 1a "判断 host↔VM 免密通道"\nif channel_ready 5000; then',
+     'st_begin 1a "判断 host↔VM 免密通道"\nif true; then'),
+    ('M6 版本非 SemVer', 'SKILL.md', 'version: 2.0.0', 'version: 2.0'),
+]
+
+
+def make_copy(src_root, dst_root):
+    s = os.path.join(src_root, 'SKILL.md')
+    if os.path.exists(s):
+        shutil.copy2(s, os.path.join(dst_root, 'SKILL.md'))
+    ignore = shutil.ignore_patterns('legacy', '__pycache__')
+    for d in ('scripts', 'references'):
+        sp = os.path.join(src_root, d)
+        if os.path.isdir(sp):
+            shutil.copytree(sp, os.path.join(dst_root, d), ignore=ignore, dirs_exist_ok=True)
+
+
+def main():
+    n, fails, lines = run_all(ROOT)
+    print('\n'.join(lines))
+    if MUTATE:
+        print('\n== 变异自证 ==')
+        caught = 0
+        for label, rel, old, new in MUTATIONS:
+            dst = os.path.join(WORK, 'mut-' + re.sub(r'\W+', '-', label))
+            if not os.path.isdir(dst):
+                os.makedirs(dst, exist_ok=True)
+                make_copy(ROOT, dst)
+            target = os.path.join(dst, rel)
+            if not os.path.exists(target):
+                print('  [MISS]   %-24s 目标不存在 %s' % (label, rel)); continue
+            txt = read(target)
+            if txt.count(old) != 1:
+                print('  [MISS]   %-24s 注入点不唯一 count=%d' % (label, txt.count(old))); continue
+            io.open(target, 'w', encoding='utf-8').write(txt.replace(old, new, 1))
+            _n, mfails, _l = run_all(dst)
+            io.open(target, 'w', encoding='utf-8').write(txt)   # 还原，不删目录
+            if mfails:
+                caught += 1
+                print('  [CAUGHT] %-24s <- %s' % (label, mfails[0][:88]))
+            else:
+                print('  [MISSED] %-24s 注入后仍全绿 ⇒ 该断言是假绿' % label)
+        verdict = 'ALL_CAUGHT' if caught == len(MUTATIONS) else 'NOT_ALL_CAUGHT'
+        print('MUTATION_RESULT=%s %d/%d' % (verdict, caught, len(MUTATIONS)))
+        if caught != len(MUTATIONS):
+            fails = list(fails) + ['mutations %d/%d' % (caught, len(MUTATIONS))]
+    io.open(OUT, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+    print('\nSELFCHECK=%s checks=%d fails=%d' % ('ALL_GREEN' if not fails else 'FAILED', n, len(fails)))
+    if fails:
+        print('WORK_DIR=' + WORK)
+        for f in fails[:20]:
+            print('  - ' + f)
+    sys.exit(0 if not fails else 1)
+
+
+main()
 PYEOF
-rc=$?
-exit $rc

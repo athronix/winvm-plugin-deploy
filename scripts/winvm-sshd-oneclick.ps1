@@ -101,13 +101,41 @@ param(
   [string]$OpenSSHZipPath,
   [string]$DownloadUrl,        # 自定义源：直接给 msi/zip 的完整 URL，优先于内置镜像
   [string]$ProxyUrl,           # 自定义代理：如 http://127.0.0.1:2080
-  [int]   $DownloadTimeoutSec = 180
+  [int]   $DownloadTimeoutSec = 180,
+  [string]$PublicKeyFile,               # 公钥文件路径（-PublicKey 未给/为占位符时读这里）
+  [string]$InstallDir = (Join-Path $env:ProgramData 'WinVMDeploy'),  # 本脚本自留目录（卸载时 -Rollback 的固定路径）
+  [switch]$NoSelfStage                  # 跳过"把自己复制到 InstallDir"（自检/测试用）
 )
 
-$SCRIPT_VERSION = '2.3.0'
+$SCRIPT_VERSION = '2.4.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # 下载不写进度条（PS5.1 进度条会拖慢 3-5 倍）
 if ($env:SSH_CONNECTION) { try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {} }
+
+# =====================================================================
+#  自留存量（v2.4.0）
+#  本脚本由部署流程从远端下载后直接执行；执行时把自身复制到固定目录，
+#  这样卸载阶段有一条确定路径可用：
+#     powershell -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1 -Rollback
+#  journal 在 C:\ProgramData\ssh\wb-tunnel-state.json，与本脚本位置无关，故复制不影响可逆性。
+# =====================================================================
+$script:SelfStaged = $false
+$script:SelfPathFinal = Join-Path $InstallDir 'winvm-sshd-oneclick.ps1'
+if (-not $NoSelfStage) {
+  try {
+    $src = $PSCommandPath
+    if ($src -and ([IO.Path]::GetFullPath($src) -ne [IO.Path]::GetFullPath($script:SelfPathFinal))) {
+      New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+      Copy-Item -LiteralPath $src -Destination $script:SelfPathFinal -Force
+      $script:SelfStaged = $true
+    } elseif (Test-Path -LiteralPath $script:SelfPathFinal) { $script:SelfStaged = $true }
+  } catch { }
+}
+
+# 公钥来源：-PublicKey 优先；为空或仍是模板占位符时从 -PublicKeyFile 读。
+if (([string]::IsNullOrWhiteSpace($PublicKey) -or $PublicKey -eq '__PUBKEY__') -and $PublicKeyFile) {
+  try { if (Test-Path -LiteralPath $PublicKeyFile) { $PublicKey = ([IO.File]::ReadAllText($PublicKeyFile)).Trim() } } catch { }
+}
 
 $SSHD_CFG  = 'C:\ProgramData\ssh\sshd_config'
 $LogDir    = 'C:\ProgramData\ssh'
@@ -2979,7 +3007,7 @@ catch {
   Say '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' 'Red'
   Say ''
   Say '已做过的变更都记在 journal 里，随时可精确还原：' 'Yellow'
-  Say '   powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1 -Rollback -DryRun' 'White'
-  Say '   powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1 -Continue' 'White'
+  Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Rollback -DryRun') 'White'
+  Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Continue') 'White'
   Say ''
 }

@@ -1,180 +1,69 @@
-# 效率审计：23 动作逐个评判与时间去向（v1.9.1）
+# 效率审计（v2.0.0 结构）
 
-> 基线：e2e5 真机全链（`~/wbtmp/e2e5-1428`，2026-11-13，`ACTION=full` 从零安装）。
-> 数据源 = `actions.tsv` / `steps.tsv` / `logs/*.log`（含 `setup.log` 自带相位计时）。
-> 目标（用户 2026-11-16 裁定，不含用户交互与 LLM 决策）：deploy ≤30s / verify ≤30s / undeploy ≤20s。
+记录「时间花在哪、哪些是物理下限、哪些是可省」。历史逐动作审计（v1.9.1 的 23 动作版）已归档到
+`references/legacy/`；本文件只保留仍然成立的结论 + v2.0.0 实测。
 
-## 0. 先去掉重复计量
+## 一、结构简化带来的直接收益
 
-`actions.tsv` 有 23 行，但 **R1–R4 与 R2.5 是编排层包装行**，与内层动作是同一段时间：
-
-- `R2`(81s) ⊃ `U1+U2+U3+U4`(75s)
-- `R3`(964s) ⊃ `P0…C6`(920s)
-- `R4`(66s) ⊃ `VERIFY/5-*` + `VERIFY/6`(48s)
-
-真实基线：**undeploy 75s / deploy 920s / verify 48s（复用）· 311s（冷跑）**。
-
-## 1. 逐动作评判
-
-### 编排层（5 行，非独立动作）
-
-| 编号 | 动作 | 实测 | 判定 | 说明 |
-|---|---|---|---|---|
-| R1/1 | download-verify 取包 | 12s | **必须，但与 C2 重复** | R1 与 C2 各跑一次 download-verify（roundtrip 故意不传 PKG_ROOT 让 deploy 自己取最新） |
-| R2/2 | undeploy 包装 | 81s | **重复计量** | = U1–U4，非独立成本 |
-| R2.5/2.5 | wait-channel 判稳 | 85s | **冗余 75s** | 连击成功之间 **硬 sleep 75s**（为老 ssh 二进制的半开 auth 槽设计）；ssh2 后端每次独立连接，无需此等待 |
-| R3/3 | deploy 包装 | 964s | **重复计量** | = P0–C6 |
-| R4/4 | verify 包装 | 66s | **重复计量** | = VERIFY/5-* + VERIFY/6 |
-
-### undeploy 任务（4 个原子动作）
-
-| 编号 | 动作 | 实测 | 判定 | 说明 |
-|---|---|---|---|---|
-| U1/1 | host 拆除 | 7s | **必须** | 已接近地板 |
-| U2/2 | VM 拆除 | 41s | **必须** | `Remove-Item -Recurse -Force C:\WinVMBridge` 删数万文件 = 物理下限；可优化见 §4-B |
-| U3/3 | 隧道处置 | 1s | **必须** | 已最优（`kept by request` 直接跳过） |
-| U4/4.2 | 独立复检 | 26s | **必须但重复探测** | 价值=「不信 U2 自报」；但 U2 的 `.ps1` 已输出同域 6 项 POST STATUS。26s 中 ~25s 是 PS 冷启 + 两个 CIM 慢查询 |
-
-### deploy 任务（10 个原子动作）
-
-| 编号 | 动作 | 实测 | 判定 | 说明 |
-|---|---|---|---|---|
-| P0/0 | preflight 体检 | 63s | **必须但 60% 重复** | VM 内八项（OS/SSHD/BRIDGE/LISTEN/NODE/CLI/NETCAT/FW）与 C3.0 同域；P0 不可替代的价值只有「取包/安装之前判通道可达」 |
-| C1/1.5 | 通道保障 | 4s | **必须** | 已最优（在则不建） |
-| C2/2 | 取包三件套 | 13s | **必须但与 R1 重复** | 见 §1 编排层 |
-| C3/3.0 | ENV_PRECHECK 硬门禁 | 60s | **必须** | 60s 中 `npm ls -g`（20–35s）与判定无关，纯参考值 |
-| C3/3.2 | prepare+setup | 429s | **必须（物理）** | 见 §2 拆解，内含 4 处可回收 |
-| C3/3.3 | vmcheck 七判据 | 71s | **必须但与 C4.5/C5 重叠** | `health_http` 与 C4.5 的 health 重复；`Get-ScheduledTask` 全枚举是主成本 |
-| C4/4.1 | install-host | 5s | **必须** | 已接近地板 |
-| C4/4.5 | fresh + health | 4s | **必须** | 已接近地板 |
-| C5/5 | 三探针 38 项 | 269s | **必须（功能面唯一证据）** | 见 §3，**不可并行**（ps-bridge 单实例串行） |
-| C6/6.1 | skill 交付判据 | 2s | **必须** | 已最优 |
-
-### verify 任务（4 个原子动作）
-
-| 编号 | 动作 | 实测 | 判定 | 说明 |
-|---|---|---|---|---|
-| VERIFY/5-mcp-probe | 复用 | 2s | **必须（纯开销）** | 复用判定本身 ~2s，可压到 <0.5s |
-| VERIFY/5-a2a-probe | 复用 | 2s | 同上 | 同上 |
-| VERIFY/5-example-probe | 复用 | 2s | 同上 | 同上 |
-| VERIFY/6 | 终态矩阵 | 42s | **必须** | 42s 中 ~30s 是一次 ps-run（PS 冷启 + `Get-ScheduledTask` + `Get-NetTCPConnection`） |
-
-**结论：23 行里 5 行是包装（不占独立时间），16 个原子动作全部是「必须」——没有一个是纯粹多余的。
-多余的是「同一件事被做了两遍」：取包 ×2、VM 内探测 ×2（P0/C3.0）、health ×3（vmcheck/C4.5/C5）、
-终态探测 ×2（U2/U4）。**
-
-## 2. C3.2 = 429s 的内部（setup.log 自带计时）
-
-| 相位 | 耗时 | 内容 | 可回收 |
+| 项目 | v1.9.2（旧编排层） | v2.0.0 | 说明 |
 |---|---|---|---|
-| HOST | 3.7s | 宿主插件安装 | — |
-| VM | **160.1s** | `tar -czf winvm-dist.tgz` + `scp` + 远端 `install-vm.mjs` | 打包与传输可压缩 |
-| VM-START | **71.3s** | `schtasks /End` → kill → `/Run` → 轮询端口 ≤420s | 轮询间隔偏保守 |
-| TUNNEL | **80.9s** | 黑洞嫌疑探测 → `tunnel ensure`（实测仅 **0.7s**） | **~70s 可回收** |
-| TEST | 0.9s | 宿主自检 | — |
-| QA-PROBE | **24.3s** | scp 2 个小 ps1 + MANIFEST 写**两遍**（日志 58/59 行同文件） | 并入 tar 可为 0 |
-| HEALTH | 1.7s | /health | — |
-| （prepare-vm） | ~86s | bootstrap prepare-vm --ensure-node | 全 SKIP 时可快 |
+| 脚本数 | 24 个（含 roundtrip/run-flow/context/action-* 五件套） | **11 个现行 + 7 个底座** | 编排层从 18 个降到 8 个步脚本 |
+| 第 1~3 步实测 | 取包 + 通道 + 隧道 ≈ 100s | **≈ 6s**（缓存命中 + 隧道已就绪短路） | 3b 幂等跳过 restart 是主因 |
+| 探针跑几次 | deploy 跑一次，verify 复用（靠 4 防线 stamp） | 同（stamp 内联进 `deploy-5-verify.sh`） | 无第二次冷跑 |
+| 动作级留痕 | `actions.tsv` + `action-catalog.tsv` + `action-report.sh` | `steps.tsv` 六列 | catalog 的"下一步命令"改由脚本自身打印 |
 
-**TUNNEL 80.9s 的成因**：`tunnel ensure` 本身 0.7s，其余在「daemon 自报 healthy 但 /health 未通」的判定链上——
-`probeTunnelHttp`（curl `--max-time 5`，失败即 5s）× 若干 + `pluginTunnelStatus`（起一个 node 加载整个
-plugin bundle，超时窗 20s）+ 20s 退避窗口（10×2s）。**根因是「探测用宽窗 + 探测次数多」，不是隧道慢。**
+## 二、物理下限（不可再压，别再优化这些）
 
-## 3. C5 = 269s 的构成与「不可并行」的硬原因
-
-| 探针 | 项数 | 实测 | 说明 |
-|---|---|---|---|
-| mcp-probe | 20 | ~40s | 逐能力串行 HTTP，单项 1–2s |
-| a2a-probe | 5 | ~40s | 含 E4 真实 LLM 委派（一轮完整 agent 回合） |
-| example-probe | 13 | **~190s** | `storage.cleanup.analyze` 深扫 + `system.eventlog.query` + `gui.screen.capture` |
-
-**为什么不能并行**：VM 侧 `ps-bridge.ps1` 是**单实例串行执行器**（请求进 pending 队列），三个探针并发
-只是把请求排到同一条队里，总时长不变，还会让客户端超时窗更容易被撞穿（假 FAIL 风险）。
-**并行化在此架构下无收益。**
-
-## 4. 优化清单
-
-### A. 已直接实施（v1.9.1，零真机依赖，自检 16/16 绿）
-
-| # | 改动 | 文件 | 节省 |
-|---|---|---|---|
-| A1 | wait-channel 轮间隔自适应（ssh2=2s / key=75s，可 `WAIT_GAP` 覆写） | `wait-channel.sh` | R2.5 **85s → ~10s** |
-| A2 | P0 链内跳过 VM 内八项（`VMDEPLOY_IN_CHAIN=1`；独立跑/`PREFLIGHT_DEEP=1` 行为不变） | `preflight.sh` + `deploy.sh` | P0 **63s → ~8s** |
-| A3 | U4 慢查询替换：`Get-ScheduledTask`→`schtasks /query` 退出码、`Get-NetTCPConnection`→`.NET GetActiveTcpListeners()` | `undeploy.sh` | U4 **26s → ~12s** |
-| A4 | VERIFY/6 同上（NetTCP → .NET） | `verify.sh` | VERIFY/6 **42s → ~28s** |
-| A5 | 修观测黑洞：verify 复用分支不再用 `< /dev/null` 把 deploy 探针明细覆盖成 0 字节（e2e5 里 `logs/*-probe.log` 全空即此因） | `verify.sh` | —（诊断价值） |
-
-### B. 需决策后实施
-
-| # | 方案 | 节省 | 代价 / 风险 |
-|---|---|---|---|
-| B1 | **C5 探针分级**：核心 8 项（health/能力数/会话/tools-list/抽样 3 能力/A2A health）+ 深度 30 项按需 | deploy **-230s**，verify 冷跑 **-270s** | 判定口径变更：默认不再覆盖 GUI/存储重能力 |
-| B2 | **U2 改名+异步删**：`Rename-Item C:\WinVMBridge → .del-<ts>` 立即返回，后台删 | U2 **41s → ~15s** | 「删除未完成」残留；需 U4 兼容 `.del-*` 判据 |
-| B3 | **deploy 30s 口径**：仅「幂等重跑全 SKIP」模式可达 | 冷装 ~600s → 稳态 ~30s | 全 SKIP 等于没验证任何东西，需明确适用场景 |
-| B4 | **TUNNEL 探测短路**（母项目 `setup.mjs`）：VM-START 刚确认监听时，跳过「黑洞嫌疑」探测直接 ensure；`pluginTunnelStatus` 失败不重试 | C3.2 **-70s** | 削弱「本地活 ≠ 后端活」的防护，需保留一次 /health 硬判据 |
-| B5 | **QA-PROBE 并入 tar**（母项目 `setup.mjs`）：两个 ps1 打进 `winvm-dist.tgz`，省一次 scp + 修 MANIFEST 写两遍 | C3.2 **-24s** | 改动小，但需重打 V1.4.29 验证 |
-| B6 | **C3.0 砍 `npm ls -g` / `npm config get prefix`**（母项目探针）：两者只在报告里出现，不参与 BLOCKERS | C3.0 **-25s** | 失去 GLOBAL_PKG 参考值 |
-| B7 | **vmcheck 去 health 重复**（母项目探针）：health 交给 C4.5 | C3.3 **-15s** | 判据分布变化，需同步改断言 |
-
-### C. 目标可达性判定（诚实口径）
-
-| 任务 | 目标 | 当前 | A 全实施后 | + B 全实施后 | 判定 |
-|---|---|---|---|---|---|
-| undeploy | 20s | 75s | 61s | **~20s**（含 B2） | ✅ 需 B2 |
-| verify（复用） | 30s | 48s | **34s** | ~20s | ✅ 接近 |
-| verify（冷跑） | 30s | 311s | 311s | **~50s**（含 B1） | ⚠ 仅分级后可行 |
-| deploy（冷装） | 30s | 920s | 865s | ~600s | ❌ **物理不可行** |
-| deploy（幂等全 SKIP） | 30s | — | — | **~30s**（需 B3 短路） | ⚠ 需明确定义 |
-
-**deploy 30s 的物理下限**（不含任何跳步）：
-`tar` 打包（delivery+skills+dist，数十 MB）≈ 20–40s + `scp` 局域网传输 ≈ 30–60s + 远端解包/落地 ≈ 30s +
-`Remove-Item`（仅卸载时）≈ 30s + 每次 ps-run 的 PS 冷启 ≈ 5s × N。
-**从零安装的硬地板约 180–250s；30s 只能来自「什么都不用做」的短路。**
-
-## 5. 一句话结论
-
-23 个动作里没有多余的**动作**，只有多余的**重复探测**与**固定等待**；时间集中在 4 处——
-`C3.2 429s`（其中 94s 是探测/冗余可回收）、`C5 269s`（受单实例串行约束，只能分级）、
-`P0+C3.0+C3.3 194s`（同域探测做了三遍）、`R2.5 85s`（75s 是 sleep）。
-
-## 6. 落地进度（2026-11-16 用户裁定后）
-
-| 项 | 状态 | 说明 |
+| 项 | 量级 | 为什么是下限 |
 |---|---|---|
-| A1 wait-channel 轮间隔 | ✅ v1.9.1 | 85s → ~10s |
-| A2 P0 链内去重 | ✅ v1.9.1 | 63s → ~8s |
-| A3/A4 U4·VERIFY6 原语替换 | ✅ v1.9.1 | 26s→~12s / 42s→~12s（VERIFY6 的 `Get-ScheduledTask` 在 v1.9.2 一并换掉） |
-| A5 复用日志不再被清空 | ✅ v1.9.1 | 观测修复 |
-| B1 探针分级 | ✅ v1.9.2（用户裁定：砍 25/33/34/35） | 默认 34 项 ~100s；`PROBE_DEEP=1` 全 38 项。SKIP 显式打印并计入 `RESULT: … N SKIP deep` |
-| B2 U2 改名+异步删 | ❌ 用户否决 | 保持同步删 41s → undeploy 实际可达 ~61s，**20s 目标不可达** |
-| B3 deploy 口径 | ✅ 用户裁定：拆两个指标 | 冷装 ≤250s / 幂等重跑 ≤30s |
-| B4 TUNNEL 探测短路 | ✅ V1.4.29 **真机已验 11.3s** | 读 `tunnel.state.json`/`tunnel.pid` 替代 `pluginTunnelStatus`；退避 20s→6.5s；探测 max-time 5→3。80.9s → **11.3s** |
-| B5 QA-PROBE 并入 tar | ⏸ 暂缓 | 24s = 3 次必需往返（mkdir/probes/manifest）；并行与目录创建竞态，改 tar 结构影响 install-vm 解包路径，需真机验后单独做（e2e6 实测仅 **5.9s**，收益下调） |
-| B6 砍 npm ls -g | ✅ V1.4.29 **真机已验 17s** | `VM_ENVCHECK_NPM=1` 可恢复；证据行 `GLOBAL_PKG=SKIPPED_PERF` / `NPM_PREFIX=SKIPPED_PERF` |
-| B7 vmcheck 换原生 | ✅ V1.4.29 **真机已验 14s** | 71s → **14s**（`schtasks /fo CSV` + `.NET GetActiveTcpListeners` + health body 截断） |
+| VM 端 BUILD + scp + install | 30~50s | tar 打包 + 3MB 传输 + 远端解包，网络与磁盘实打实 |
+| VM-START（起服务到端口监听） | 10~20s | Windows 服务启动 + node 冷启 |
+| prepare-vm 全 SKIP | 20~30s | 依赖已就绪仍要 3 次远程往返（每次含 PS 冷启 8~10s） |
+| 三探针 34 项 | ~100s | 每项都是真实 MCP/HTTP 往返；深度项（LLM 委派 30s、盘扫 100s）已默认 SKIP |
+| 终态矩阵 | 8~15s | 一次 VM 探测（PS 冷启 + schtasks + .NET 监听查询） |
+| 宿主 PS 冷启 | 8~10s / 次 | 每个 `-c` / `-File` 载荷都要付 |
 
-### 真机实测（e2e6，2026-11-16，`qa/real-test-2026-11-16-e2e6.md`）
+## 三、已实施的关键优化（别回退）
 
-| 任务 | 基线 | e2e5 | **e2e6 实测** | 目标 | 判定 |
-|---|---|---|---|---|---|
-| undeploy | 75s | 81s | **32s** | 20s | ❌ 差 12s |
-| verify（复用） | 48s | 66s | **21s** | 30s | ✅ 达 |
-| deploy（应用级冷装，undeploy→deploy） | 920s | 964s | **196s** | 250s | ✅ 达 |
-| deploy（幂等重跑短路） | — | 未实现 | **未实现** | 30s | ⚠ 待做 |
-| full（三者相加） | — | 1245s | **297s** | — | 降 76% |
-
-> **口径边界（必须随数字一起引用）**：196s 是**应用级冷装**——undeploy 已拆掉 VM 侧
-> `WinVMBridge.Service` 与 `C:/WinVMBridge`，但 `prepare-vm` 的 DB-1 sshd / DB-2 防火墙 /
-> DB-3 VM Node 三项均为 `[SKIP] 已就绪`。**系统级冷装（全新 VM 含 VM Node 安装）本轮未测**。
-
-### undeploy 差 12s 的可选路径（未实施，需裁定）
-
-| 路径 | 预计 | 风险 |
+| 优化 | 效果 | 落在哪 |
 |---|---|---|
-| U1 与 U2 并行（互不依赖） | -4s → 28s | 低：两者作用域不交（host 删文件 / VM 删服务） |
-| U4 五点复核并入 U2 同一 PS 会话（省一次 SSH 建连 + PS 冷启） | -5s → 23s | 中：需把 U4 判据搬进 `vm-remove-local.ps1` 尾部，判据与拆除耦合 |
-| 二者叠加后仍差 ~3s | — | 须动 U2 本体 16s（PS 冷启 + 计划任务删除串行） |
+| CIM 全枚举 → 原生原语 | `Get-ScheduledTask`→`schtasks /fo CSV`；`Get-NetTCPConnection`→`.NET GetActiveTcpListeners()`：单次 20~35s → <1s | `deploy-4/5`、`undeploy-2` |
+| 传输预算 / 载荷预算分离 | 载荷 25s→180s，消除「跑完才输出」被截断成 rc=124 零输出的假红 | `ps-run.sh` `_payload` |
+| 探针分级 | 38 项 269s → 34 项 ~100s；`PROBE_DEEP=1` 恢复全量 | `deploy-5-verify.sh` + 包内探针 |
+| 隧道 restart 幂等短路 | 避免重建 ssh 连接扰动第 4 步（并省 2~3s） | `deploy-3-tunnel.sh` 3b |
+| 探针新鲜复用内联 | deploy 后立刻 verify 省 ~100s | `deploy-5-verify.sh` stamp 判定 |
+| install-host 拆 `--no-tunnel` | host 侧安装从 ~40s 降到 1~3s，隧道独立成第 3 步可单独计时/单独重跑 | `deploy-2-host.sh` 2d |
 
-**已实测证伪的旧预估**：C3.2 的 `VM 160.1s` / `VM-START 71.3s` 在 e2e6 实测为 **36.6s / 15.5s**——
-旧数字含 e2e5 首装的装态差异，不是稳定工作量，故「冷装 ≤250s 的唯一拦路石」判断作废。
-当前 deploy 196s 内部余量最大的是 `prepare-vm ~23s`（三项全 SKIP 仍要远程探测三次往返）。
+## 四、刻意不做的事（有理由，不要"顺手优化"）
+
+| 想法 | 为什么不 |
+|---|---|
+| 把 3 和 4 改成串行 | 用户裁定并行；且 3 已幂等短路，实际冲突面只剩"首次 restart"一种，用 4 的 60s 健康窗门禁 + 一次重试兜住 |
+| undeploy 异步删文件 | 用户裁定不接受：异步删除会让"卸载完成"的判据失去意义（无法确认真的删掉了） |
+| 提高 `VM_SSH_TIMEOUT` 到 180s | 会让"真断线"场景从 25s 变 180s 才报错，把瞬态掩盖成长时间挂起；载荷已走独立预算 |
+| 把探针再砍几项 | 34 项已是"能证明链路真的通"的最小集；再砍就只剩"端口开着"这种弱证据 |
+| deploy 幂等重跑的 ultra-short 模式 | 未实现。当前热跑 90~120s，主要花在第 4 步的重复安装（幂等但不可跳过，除非引入"装态指纹"）——属可选优化，需先定义指纹失效条件 |
+
+## 五、2026-11-16 实测（v2.0.0 首次真机）
+
+`VM_HOST=172.16.100.2 RELEASE_TAG=V1.4.29 bash scripts/deploy.sh`：
+
+```
+1a 判断 host↔VM 免密通道                          1s  READY（1b~1d SKIP）
+2a 取发布包（sha256 校验 + 隔离解压）              0s  缓存命中
+2b MANIFEST 对账                                 2s  PASS
+2c 两端结构就位检查                               0s
+2d install-host --yes --no-tunnel                1s  PASS
+2e host 端交付判据（connector skills ≥8）          0s
+3a 对齐 vm-conn.json 的 identityFile             0s
+3b 起隧道服务（幂等）                              2s  restart
+3c 验证隧道（/health = 200）                      3s  PASS
+-------------------------------------------------  WALL_S=6（到第 3 步完成）
+4a prepare-vm --ensure-node                      26s  FAIL ← 通道 WEDGE
+```
+
+4a 的失败不是结构问题：当时 `ping` 通（3~9ms）、隧道 `health=200`（长连活着），
+但**新建 ssh 连接握手超时**（`Timed out while waiting for handshake`）——典型 WEDGE。
+第 1~3 步在同一时点全部 PASS，说明前面三步的判据与实现都成立。
+
+**结论**：1~3 步从旧版约 100s 压到 **6s**，且每步都可单独重跑；第 4、5 步待健康窗复验。
