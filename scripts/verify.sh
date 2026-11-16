@@ -38,7 +38,9 @@ case "$_PF_OUT" in *"REUSE=1"*) REUSE=1;; esac
 REASON="$(printf '%s\n' "$_PF_OUT" | sed -n 's/^REASON=//p' | head -1)"
 [ $REUSE -eq 1 ] && echo "[probe-fresh] $REASON"
 
-echo "== 探针（X-5 带宽：全链 97~250s 属正常带；判据=零超时零复跑） =="
+echo "== 探针（X-5 带宽：全量 97~250s；v1.9.1 起深度项默认 SKIP → 34 项约 100s，PROBE_DEEP=1 跑全 38 项） =="
+# v1.9.1 探针分级：与 deploy C5 同一口径（探针自身打印 [SKIP] 并计入 RESULT 的 "N SKIP deep"）。
+export PROBE_DEEP="${PROBE_DEEP:-0}"
 FAILS=""
 for pr in mcp-probe a2a-probe example-probe; do
   STEP begin VERIFY "5-$pr" "$pr 20/5/13"

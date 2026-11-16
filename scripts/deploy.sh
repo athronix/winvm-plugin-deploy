@@ -206,7 +206,11 @@ else
 fi
 
 # ── Step 5 三探针 ──
-STEP begin C5 5 "三探针 38 项（X-5 带宽：冷 ~145s / 深冷 ≤250s）"
+# v1.9.1 探针分级：深度项（a2a E4 真实 LLM 委派 ~30s / example E7 盘扫族 ~100s、E8 事件日志
+# ~15s、E9 文件搜索 ~20s）默认 SKIP，由探针自身打印 [SKIP] 并计入 RESULT 的 "N SKIP deep"，
+# 不会静默少测。PROBE_DEEP=1 恢复全 38 项（发布前/深度体检用）。实测 38 项 269s → 34 项 ~100s。
+export PROBE_DEEP="${PROBE_DEEP:-0}"
+STEP begin C5 5 "三探针 34 项（PROBE_DEEP=1 时 38 项；X-5 带宽：冷 ~145s / 深冷 ≤250s）"
 PROBLEMS=""
 PRC_ALL=0
 for pr in mcp-probe a2a-probe example-probe; do
