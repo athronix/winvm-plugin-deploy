@@ -148,21 +148,33 @@ plugin bundle，超时窗 20s）+ 20s 退避窗口（10×2s）。**根因是「�
 | B1 探针分级 | ✅ v1.9.2（用户裁定：砍 25/33/34/35） | 默认 34 项 ~100s；`PROBE_DEEP=1` 全 38 项。SKIP 显式打印并计入 `RESULT: … N SKIP deep` |
 | B2 U2 改名+异步删 | ❌ 用户否决 | 保持同步删 41s → undeploy 实际可达 ~61s，**20s 目标不可达** |
 | B3 deploy 口径 | ✅ 用户裁定：拆两个指标 | 冷装 ≤250s / 幂等重跑 ≤30s |
-| B4 TUNNEL 探测短路 | ✅ V1.4.29（待真机验） | 读 `tunnel.state.json`/`tunnel.pid` 替代 `pluginTunnelStatus`；退避 20s→6.5s；探测 max-time 5→3。80.9s → ~8s |
-| B5 QA-PROBE 并入 tar | ⏸ 暂缓 | 24s = 3 次必需往返（mkdir/probes/manifest）；并行与目录创建竞态，改 tar 结构影响 install-vm 解包路径，需真机验后单独做 |
-| B6 砍 npm ls -g | ✅ V1.4.29（待真机验） | `VM_ENVCHECK_NPM=1` 可恢复 |
-| B7 vmcheck 换原生 | ✅ V1.4.29（待真机验） | 71s → ~45s（含 health body 截断） |
+| B4 TUNNEL 探测短路 | ✅ V1.4.29 **真机已验 11.3s** | 读 `tunnel.state.json`/`tunnel.pid` 替代 `pluginTunnelStatus`；退避 20s→6.5s；探测 max-time 5→3。80.9s → **11.3s** |
+| B5 QA-PROBE 并入 tar | ⏸ 暂缓 | 24s = 3 次必需往返（mkdir/probes/manifest）；并行与目录创建竞态，改 tar 结构影响 install-vm 解包路径，需真机验后单独做（e2e6 实测仅 **5.9s**，收益下调） |
+| B6 砍 npm ls -g | ✅ V1.4.29 **真机已验 17s** | `VM_ENVCHECK_NPM=1` 可恢复；证据行 `GLOBAL_PKG=SKIPPED_PERF` / `NPM_PREFIX=SKIPPED_PERF` |
+| B7 vmcheck 换原生 | ✅ V1.4.29 **真机已验 14s** | 71s → **14s**（`schtasks /fo CSV` + `.NET GetActiveTcpListeners` + health body 截断） |
 
-### 优化后预估（未真机复验）
+### 真机实测（e2e6，2026-11-16，`qa/real-test-2026-11-16-e2e6.md`）
 
-| 任务 | 基线 | 现在 | 目标 | 差距 |
-|---|---|---|---|---|
-| undeploy | 75s | ~61s | 20s | ❌ 用户否决 U2 异步删，差 41s |
-| verify（复用） | 48s | ~20s | 30s | ✅ |
-| verify（冷跑） | 311s | ~115s | 30s | ⚠ 差 85s（探针仍留 34 项） |
-| deploy（冷装） | 920s | ~740s | 250s | ⚠ 差 490s（C3.2 的 VM 相位 160s + VM-START 71s 未动） |
-| deploy（幂等） | — | 未实现 | 30s | 需新增短路模式 |
+| 任务 | 基线 | e2e5 | **e2e6 实测** | 目标 | 判定 |
+|---|---|---|---|---|---|
+| undeploy | 75s | 81s | **32s** | 20s | ❌ 差 12s |
+| verify（复用） | 48s | 66s | **21s** | 30s | ✅ 达 |
+| deploy（应用级冷装，undeploy→deploy） | 920s | 964s | **196s** | 250s | ✅ 达 |
+| deploy（幂等重跑短路） | — | 未实现 | **未实现** | 30s | ⚠ 待做 |
+| full（三者相加） | — | 1245s | **297s** | — | 降 76% |
 
-**下一步的物理大头**：C3.2 内部 `VM 160.1s`（tar 打包 + scp 传输 + 远端 install-vm）与 `VM-START 71.3s`
-（schtasks 重启 + 端口轮询）。这两项是「冷装 ≤250s」的唯一拦路石，需单独一轮改造（tar 增量/压缩、
-轮询间隔自适应、install-vm 相位并行）。
+> **口径边界（必须随数字一起引用）**：196s 是**应用级冷装**——undeploy 已拆掉 VM 侧
+> `WinVMBridge.Service` 与 `C:/WinVMBridge`，但 `prepare-vm` 的 DB-1 sshd / DB-2 防火墙 /
+> DB-3 VM Node 三项均为 `[SKIP] 已就绪`。**系统级冷装（全新 VM 含 VM Node 安装）本轮未测**。
+
+### undeploy 差 12s 的可选路径（未实施，需裁定）
+
+| 路径 | 预计 | 风险 |
+|---|---|---|
+| U1 与 U2 并行（互不依赖） | -4s → 28s | 低：两者作用域不交（host 删文件 / VM 删服务） |
+| U4 五点复核并入 U2 同一 PS 会话（省一次 SSH 建连 + PS 冷启） | -5s → 23s | 中：需把 U4 判据搬进 `vm-remove-local.ps1` 尾部，判据与拆除耦合 |
+| 二者叠加后仍差 ~3s | — | 须动 U2 本体 16s（PS 冷启 + 计划任务删除串行） |
+
+**已实测证伪的旧预估**：C3.2 的 `VM 160.1s` / `VM-START 71.3s` 在 e2e6 实测为 **36.6s / 15.5s**——
+旧数字含 e2e5 首装的装态差异，不是稳定工作量，故「冷装 ≤250s 的唯一拦路石」判断作废。
+当前 deploy 196s 内部余量最大的是 `prepare-vm ~23s`（三项全 SKIP 仍要远程探测三次往返）。

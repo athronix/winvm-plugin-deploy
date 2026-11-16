@@ -143,7 +143,9 @@ if [ "$ACTION" = full ] || [ "$ACTION" = verify ] || [ "$ACTION" = deploy ]; the
     RES_V=$([ $RC -eq 0 ] && echo PASS || echo "FAIL(rc=$RC)")
     [ $RC -ne 0 ] && FAILED="$FAILED verify"
     # F-20: same grep -c || echo 0 false-value pattern (display only, but keep clean).
-    REUSED_N="$(awk '/REUSED/{n++} END{print n+0}' "$RUN_DIR/verify.log" 2>/dev/null)"; : "${REUSED_N:=0}"
+    # v1.9.3 观测修复（e2e6 实证 "复用=4/3"）：旧 awk /REUSED/ 把汇总行
+    # "[probe-reuse] 3/3 REUSED（…）" 也计入 ⇒ 3 个探针数出 4。只数单探针行。
+    REUSED_N="$(grep -cE '^\[[a-z0-9]+-probe REUSED\]' "$RUN_DIR/verify.log" 2>/dev/null || true)"; : "${REUSED_N:=0}"
     say "R4 $RES_V（探针复用=$REUSED_N/3）"
   fi
 fi
