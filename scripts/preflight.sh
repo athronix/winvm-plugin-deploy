@@ -33,7 +33,15 @@ else
 fi
 
 # 4) 若通道在，探 VM 侧关键前置
-if [ -n "${VM_CHANNEL:-}" ]; then
+#
+# v1.9.1 效率（e2e5 账本：P0 实测 63s，其中 ~55s 是这一次 VM 往返；而 3 步之后的
+# C3.0 ENV_PRECHECK 是硬门禁，必然再跑一次同域探测 —— 链内重复探测零增量信息）：
+# 链内（VMDEPLOY_IN_CHAIN=1，由 deploy.sh 设置）跳过 VM 内八项，只保留宿主侧判定
+# （VM_HOST/运行时/通道可达性 —— 这才是 P0 不可替代的价值：在取包/安装之前判断
+# 通道是否可用，避免白跑）。独立使用 preflight.sh 时行为完全不变（默认仍全查）。
+if [ -n "${VM_CHANNEL:-}" ] && [ "${VMDEPLOY_IN_CHAIN:-0}" = "1" ] && [ "${PREFLIGHT_DEEP:-0}" != "1" ]; then
+  echo "-- VM 内前置：链内去重跳过（C3.0 ENV_PRECHECK 硬门禁覆盖同域八项；强制全查=PREFLIGHT_DEEP=1）--"
+elif [ -n "${VM_CHANNEL:-}" ]; then
   echo "-- VM 内前置（heredoc 写 .ps1 → ps-run 铁律通道）--"
   _pfps="$HOME/wbtmp/vmdeploy-preflight.ps1"; mkdir -p "$HOME/wbtmp"
   cat > "$_pfps" <<'PS1'

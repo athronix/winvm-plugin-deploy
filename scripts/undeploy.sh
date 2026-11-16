@@ -196,7 +196,11 @@ echo "health=${HCODE} (expect 000 = host side cleaned)"
 if [ "$VM_MODE" = "user-bundle" ]; then
   echo "VM terminal state = PENDING_USER (bundle handed over; not a failure)"
 else
-  bash "$_here/ps-run.sh" -c '$a=Test-Path C:\WinVMBridge; $b=[bool](Get-ScheduledTask -TaskName WinVMBridge.Service -EA SilentlyContinue); $c=@(Get-NetTCPConnection -LocalPort 18443 -State Listen -EA SilentlyContinue).Count; $d=(Get-Service sshd).Status; $e=Test-Path C:\WinVMWorkspace; Write-Output ("expect False False 0 * True => " + $a + " " + $b + " " + $c + " " + $d + " " + $e)' || { U4_RC=1; note "U4/vm"; }
+  # v1.9.1 效率（e2e5 实测 U4=26s，其中 ~25s 是 PS 冷启 + 两个 CIM 慢查询）：
+  # Get-ScheduledTask（CIM 全枚举，cmd 21s / PS 35s 实测）换 schtasks 原生查询——只取
+  #   退出码判存在性，不解析本地化文本（中文系统 "状态:" vs 英文 "Status:" 不可靠）；
+  # Get-NetTCPConnection（CIM）换 .NET GetActiveTcpListeners()（毫秒级，语义等价）。
+  bash "$_here/ps-run.sh" -c '$a=Test-Path C:\WinVMBridge; $null=(schtasks /query /tn WinVMBridge.Service 2>$null); $b=($LASTEXITCODE -eq 0); $c=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 18443 }).Count; $d=(Get-Service sshd).Status; $e=Test-Path C:\WinVMWorkspace; Write-Output ("expect False False 0 * True => " + $a + " " + $b + " " + $c + " " + $d + " " + $e)' || { U4_RC=1; note "U4/vm"; }
 fi
 STEP end U4 4.2 $U4_RC "$([ $U4_RC -eq 0 ] && echo PASS || echo FAIL)" "host clean / VM $VM_MODE" "none"
 

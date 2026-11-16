@@ -44,7 +44,11 @@ for pr in mcp-probe a2a-probe example-probe; do
   STEP begin VERIFY "5-$pr" "$pr 20/5/13"
   if [ $REUSE -eq 1 ]; then
     echo "[$pr REUSED] 新鲜窗 ${FRESH}s 内复用 deploy C5 结果（stamp=$PROBE_STAMP；强制冷跑=VERIFY_FORCE_PROBE=1）"
-    "$_here/step.sh" log "$pr" < /dev/null >/dev/null 2>&1 || true
+    # v1.9.1 观测修复（e2e5 实锤）：旧版 `step.sh log "$pr" < /dev/null` 会把 deploy C5
+    # 已落盘的探针明细覆盖成 0 字节（logs/{mcp,a2a,example}-probe.log 全空 = 269s 观测黑洞）。
+    # 现改为写入复用标记，保留原始明细供事后追查。
+    printf '[REUSED] 复用 deploy C5 结果：stamp=%s 新鲜窗=%ss pkg=%s\n原始明细见同一 run 的 deploy 段 %s.log\n' \
+      "$PROBE_STAMP" "$FRESH" "$PKG" "$pr" | "$_here/step.sh" log "$pr" >/dev/null 2>&1 || true
     STEP end VERIFY "5-$pr" 0 PASS "REUSED(deploy C5 fresh)" "none"
     continue
   fi
@@ -74,7 +78,10 @@ if [ -n "${VM_HOST:-}" ]; then
   . "$_here/vm-conn.sh" 2>/dev/null
   export VM_CHANNEL=key
   # run18 P-3：PIPESTATUS 取 ps-run 真 rc（管道末级 tr 恒 0 会吞）+ 内容判据（VM: task= 行必须在场）。
-  "${BASH_OK:-bash}" "$_here/ps-run.sh" -c '$t=(Get-ScheduledTask -TaskName WinVMBridge.Service -EA SilentlyContinue).State; $l=@(Get-NetTCPConnection -LocalPort 18443 -State Listen -EA SilentlyContinue).Count; $s=(Get-Service sshd).Status; Write-Output ("VM: task=" + $t + " listen=" + $l + " sshd=" + $s)' | tr -d '\r' > "$LOGD/vm-terminal.txt"; VTRC=${PIPESTATUS[0]}
+  # v1.9.1 效率：Get-NetTCPConnection（CIM，秒级）换 .NET GetActiveTcpListeners()（毫秒级，
+  # 语义等价：同为「本地 18443 上处于 Listen 的套接字计数」）。task/sshd 保持原语以便保留
+  # State 语义（Running vs Ready 是有用的区分，且此处只跑一次）。
+  "${BASH_OK:-bash}" "$_here/ps-run.sh" -c '$t=(Get-ScheduledTask -TaskName WinVMBridge.Service -EA SilentlyContinue).State; $l=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 18443 }).Count; $s=(Get-Service sshd).Status; Write-Output ("VM: task=" + $t + " listen=" + $l + " sshd=" + $s)' | tr -d '\r' > "$LOGD/vm-terminal.txt"; VTRC=${PIPESTATUS[0]}
   cat "$LOGD/vm-terminal.txt"
   if [ $VTRC -ne 0 ] || ! grep -q "VM: task=" "$LOGD/vm-terminal.txt" 2>/dev/null; then
     # 通道相位窗是【环境问题】不是【功能失败】，但也不能吞掉当 PASS。

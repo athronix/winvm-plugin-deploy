@@ -48,7 +48,9 @@ fi
 
 # ── Step 0 体检 ──
 STEP begin P0 0 "preflight 五项体检"
-bash "$_here/preflight.sh" > "$LOGD/preflight.log" 2>&1; PRC=$?
+# v1.9.1：链内标记 → preflight 跳过 VM 内八项（C3.0 硬门禁 3 步后必然覆盖同域探测，
+# e2e5 实测这一次往返值 55s）。独立跑 preflight.sh 不受影响（默认仍全查）。
+VMDEPLOY_IN_CHAIN=1 bash "$_here/preflight.sh" > "$LOGD/preflight.log" 2>&1; PRC=$?
 tail -12 "$LOGD/preflight.log"; _step_log preflight "$LOGD/preflight.log"
 grep -q "READINESS=RED" "$LOGD/preflight.log" && { STEP end P0 0 $PRC FAIL "READINESS=RED" "按 preflight 输出的修复指引处置后重跑；勿硬跑"; exit 1; }
 STEP end P0 0 0 PASS "GREEN/YELLOW" "none"
