@@ -79,9 +79,10 @@ if [ -n "${VM_HOST:-}" ]; then
   export VM_CHANNEL=key
   # run18 P-3：PIPESTATUS 取 ps-run 真 rc（管道末级 tr 恒 0 会吞）+ 内容判据（VM: task= 行必须在场）。
   # v1.9.1 效率：Get-NetTCPConnection（CIM，秒级）换 .NET GetActiveTcpListeners()（毫秒级，
-  # 语义等价：同为「本地 18443 上处于 Listen 的套接字计数」）。task/sshd 保持原语以便保留
-  # State 语义（Running vs Ready 是有用的区分，且此处只跑一次）。
-  "${BASH_OK:-bash}" "$_here/ps-run.sh" -c '$t=(Get-ScheduledTask -TaskName WinVMBridge.Service -EA SilentlyContinue).State; $l=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 18443 }).Count; $s=(Get-Service sshd).Status; Write-Output ("VM: task=" + $t + " listen=" + $l + " sshd=" + $s)' | tr -d '\r' > "$LOGD/vm-terminal.txt"; VTRC=${PIPESTATUS[0]}
+  # 语义等价：同为「本地 18443 上处于 Listen 的套接字计数」）；Get-ScheduledTask（CIM 全枚举
+  # 20-35s）换 schtasks /fo CSV + ConvertFrom-Csv -Header（列位置由 schtasks 固定，语言无关）。
+  # 判据不变：仍要求 VM: task= 行在场（grep 见下），值仅作信息。
+  "${BASH_OK:-bash}" "$_here/ps-run.sh" -c '$r=@(schtasks /query /tn WinVMBridge.Service /fo CSV /nh 2>$null | ConvertFrom-Csv -Header n,next,status); $t=if ($r.Count -gt 0) { [string]$r[0].status } else { "absent" }; $l=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 18443 }).Count; $s=(Get-Service sshd).Status; Write-Output ("VM: task=" + $t + " listen=" + $l + " sshd=" + $s)' | tr -d '\r' > "$LOGD/vm-terminal.txt"; VTRC=${PIPESTATUS[0]}
   cat "$LOGD/vm-terminal.txt"
   if [ $VTRC -ne 0 ] || ! grep -q "VM: task=" "$LOGD/vm-terminal.txt" 2>/dev/null; then
     # 通道相位窗是【环境问题】不是【功能失败】，但也不能吞掉当 PASS。
