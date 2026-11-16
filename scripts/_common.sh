@@ -174,9 +174,64 @@ channel_ready() { # channel_ready [ready_timeout_ms]
     "$NODE" ssh2-conn.mjs ping ) >/dev/null 2>&1
 }
 
-health_code() { # health_code [port]
-  curl -sS --noproxy 127.0.0.1 -o /dev/null -w '%{http_code}' --max-time "${2:-8}" \
-    "http://127.0.0.1:${1:-${WINVM_TUNNEL_LOCAL_PORT:-18443}}/health" 2>/dev/null || echo 000
+health_code() { # health_code [port] [max_time] → 恒为 3 字符（不通=000）
+  local out
+  out="$(curl -sS --noproxy 127.0.0.1 -o /dev/null -w '%{http_code}' --max-time "${2:-8}" \
+    "http://127.0.0.1:${1:-${WINVM_TUNNEL_LOCAL_PORT:-18443}}/health" 2>/dev/null)"
+  # 连不上时 curl 自己就吐 "000" 且 rc!=0；若再 `|| echo 000` 会拼成 "000000"
+  # （同 grep -c 双值坑）。这里统一归一到 3 字符，调用方才能用 = "000" 判不通。
+  case "$out" in
+    [1-5][0-9][0-9]) printf '%s' "$out" ;;
+    *) printf '000' ;;
+  esac
+}
+
+port_listening() { # port_listening <port> [host] → 本地/远端端口是否有 listener
+  # 纯 bash /dev/tcp 探测：连接成功即有人 accept。不依赖 curl（curl 在"连上但无 HTTP
+  # 应答"与"连接被拒"两种情况都可能给 000，分不开）。
+  local h="${2:-127.0.0.1}"
+  ( exec 3<>"/dev/tcp/$h/$1" ) >/dev/null 2>&1
+}
+
+tunnel_pid() { # → 隧道 daemon pid（读不到/无文件输出 0）
+  # tunnel.pid 是 JSON（{"pid":57857,...}），不是纯数字文本。
+  # 早期用 `tr -dc '0-9'` 会把 11 行 JSON 里所有数字拼成一串，kill -0 必然失败（2026-11-16 实测）。
+  local f="${WINVM_HOME}/tunnel.pid" p
+  [ -f "$f" ] || { printf '0'; return 0; }
+  p="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+  printf '%s' "${p:-0}"
+}
+
+tunnel_alive() { # → 0=daemon 存活 1=不在
+  local p; p="$(tunnel_pid)"
+  [ "$p" != "0" ] && kill -0 "$p" 2>/dev/null
 }
 
 user_home_file() { printf '%s/%s' "$HOME" "$1"; }
+
+# ── 远端 oneclick 脚本地址（deploy 第 1 步与 undeploy 第 3 步共用，单一事实源）──
+# 技能源仓是 private ⇒ raw 匿名 404，只能走母项目 release 资产（第 5 资产）。
+# 注意：本函数必须自给自足——步脚本可单独重跑，调用方未必跑过 need_py，
+# 所以不许裸用 $PY（set -u 下会 unbound variable，静默把 URL 判成不可达）。
+sshd_script_url() {
+  [ -n "${SSHD_SCRIPT_URL:-}" ] && { printf '%s' "$SSHD_SCRIPT_URL"; return 0; }
+  local tag="${RELEASE_TAG:-}" py="${PY:-}" raw=""
+  if [ -z "$tag" ]; then
+    [ -n "$py" ] || py="$(command -v python3 2>/dev/null || true)"
+    raw="$(curl -fsSL --connect-timeout 10 --max-time 25 \
+      "https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest" 2>/dev/null)"
+    if [ -n "$py" ]; then
+      tag="$(printf '%s' "$raw" | "$py" -c 'import sys,json;print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
+    fi
+    # python 不可用时退回文本解析（同一 JSON 的 tag_name 字段）
+    [ -n "$tag" ] || tag="$(printf '%s' "$raw" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+  fi
+  [ -n "$tag" ] || return 1
+  printf 'https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/%s/winvm-sshd-oneclick.ps1' "$tag"
+}
+
+url_reachable() { # url_reachable <url> → 200 才算可用
+  local code
+  code="$(curl -sIL --connect-timeout 12 --max-time 30 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null)"
+  [ "$code" = "200" ]
+}

@@ -12,6 +12,9 @@
 | `远端脚本地址不可达（HEAD ≠ 200）` | 同上，或代理/网络 | 同上；先在宿主 `curl -sIL <url>` 自证 |
 | 用户执行时报 `PublicKey 未提供或格式不对` | 粘贴时公钥被换行截断/引号丢失 | 重新复制**整行**；公钥在单引号内 |
 | 用户执行后仍连不上 | sshd 装了但监听/防火墙/网络档不对 | VM 里跑只读体检：`powershell -File C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1 -Continue` |
+| 重建时报 `Cannot start service sshd`，且 [1/9] 显示 `OpenSSH.Server 能力状态：NotPresent`、[2/9] 显示 `sshd 服务已存在，跳过安装` | **僵尸服务壳**：`-Rollback` 卸掉 capability（连 `System32\OpenSSH\sshd.exe` 一起没了），但保留了 sshd 服务注册项。旧版 [2/9] 只看 `Get-Service sshd` 就跳过安装，[3/9] 拿着无二进制的服务去 Start ⇒ 必失败 | v2.0.0 起 [2/9] 判据改为「服务在 **且** `sshd.exe` 在位」，否则 `sc.exe delete sshd` 清壳后走正常安装。**旧包上 VM 时**手动清壳：`sc.exe stop sshd; sc.exe delete sshd`，再重跑脚本 |
+| 长命令粘贴后 PowerShell 报 `Unexpected token '\System32\...'` / `exe_exi` 之类被截断 | 命令经 **Git Bash / MSYS** 传递时双引号被吃掉，`"$env:WINDIR\..."` 变成裸 token | 给用户的命令**在 PowerShell 里粘**；必须经 bash 时全用单引号且路径写死（`C:\Windows\...`），或改用 `-PublicKeyFile` 避开含空格的长公钥 |
+| 多行命令粘进去后 PowerShell 报 `行:1 字符:NN`，多条语句挤在同一条报错里 | 终端把多行粘贴**折叠成单行**（换行丢失），`if { }` 块被压平后语法崩 | **给用户的命令一律写成单行 `;` 串联**（块体压成 `{ a; b }` 也可），永不依赖换行 |
 | 三轮都没建起来 | 密钥 / 网络 / 权限三者之一 | 看 `1b.*`/`1c.*` 各轮日志；VM 侧 build 段应有 `[+]` 行而无 `[x]` |
 | `ping` 100% 丢包 | VM 整机离线（关机/暂停/断网） | 用户在 VM 管理端开机/恢复。脚本救不了，别循环重试 |
 
@@ -36,6 +39,7 @@
 | tunnel 日志连续 `All configured authentication methods failed` | `vm-conn.json` 的 `identityFile` 指向未被授权的钥（**单值、无回退链**） | 3a 已自动对齐到 `WINVM_VM_KEY`；仍失败就看 3a 输出里 `→` 的目标文件是否存在 |
 | 手测 `ssh2-conn.mjs ping` 报 `All configured authentication methods failed`，但 `ssh -i` 手连成功 | 手测**漏了 `WINVM_VM_KEY`**，ssh2 回落到默认 `~/.ssh/id_ed25519`（不存在/不对）。这是**假红**，通道其实健康 | 手测必须带 `WINVM_VM_KEY=$HOME/.ssh/id_ed25519_winvm`；看错误是「握手超时」还是「认证失败」：前者=WEDGE，后者=钥配错 |
 | `health` 反复 000 | daemon 没起，或到 VM 18443 不通 | 看 `~/.workbuddy/winvm/tunnel.log`；VM 端服务在不在听由第 4 步 4c 判。**不要重启 VM** |
+| `curl: (52) Empty reply from server` + `health=000`，但 `ping` 0% 丢包、`ssh2-conn ping` 通、tunnel daemon 存活 | **VM 端 winvm 服务假死**：VM 网络抖动/挂起恢复后进程还在，但 socket 已死（ssh 转发接上就被对端 close）。实测 **restart 隧道无效**（2026-11-16） | 重跑 `deploy.sh --only 4`（4b 会重装并重启 `WinVMBridge.Service`）；赶时间可在 VM 里 `schtasks /End /TN WinVMBridge.Service & schtasks /Run /TN WinVMBridge.Service`。**不要重启 VM** |
 | restart 后第 4 步立刻握手失败 | restart 重建到 VM 的 ssh 连接，与第 4 步抢握手槽（2026-11-16 实证） | 3b 已改「health 已 200 就跳过 restart」；第 4 步另有 60s 健康窗门禁 + 一次有界重试 |
 
 ## 第 4 步：装 VM 端 + 起服务
@@ -80,6 +84,8 @@
 | `HOST_PASS<11` 或 `HOST_FAIL>0` | host 清理项失败 | 看 `uninstall-host.log` 的 `[FAIL] HOST` 行 |
 | `VM_PHASE_IN_HOST≠0` | `.env`/`vm-conn.json` 没屏蔽干净，host 相位跑成了双端 | 已有 trap 还原；若复现说明还有第四处 VM 目标来源，需补屏蔽 |
 | 第 3 步 `TUNNEL=PENDING_USER` | 通道不在，只能用户在 VM 里跑 `-Rollback` | 照打印的那一条执行；宿主侧私钥/known_hosts 已同时清理 |
+| 第 3 步 `3c FAIL health=000`（等满 30 轮 / 123s），但第 4 步 4b/4c 全 PASS | **从零部署的正常中间态**被当成故障：`/health` 是 VM 端 winvm service 的口径，而该服务由并行的第 4 步安装，此刻 18443 后面没人应答 | v2.0.0 起 3c 判据改为「本地端口在监听 + daemon 存活」，`health` 只作信息位（第 5 步才验端到端）。旧包上遇到就 `--only 3` 重跑（4b 已完成，此时 health 已是 200） |
+| 第 3 步报 `daemon=0(pid=57857127001...)` 这种一长串数字 | `tunnel.pid` 是 **JSON**（`{"pid":57857,...}`），`tr -dc '0-9'` 把全部数字拼成一串 | 用 `tunnel_pid`（sed 取 `"pid":` 后数字）/`tunnel_alive`，勿手写解析 |
 
 ## 环境/工具类
 

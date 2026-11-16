@@ -23,13 +23,12 @@ else
   warn "无包根：跳过 CLI stop，直接按 pid 兜底"
 fi
 # pid 兜底（不 kill -f：会误伤同命令行的其它进程）
-if [ -f "$WINVM_HOME/tunnel.pid" ]; then
-  _pid="$(cat "$WINVM_HOME/tunnel.pid" 2>/dev/null | tr -dc '0-9')"
-  if [ -n "${_pid:-}" ] && kill -0 "$_pid" 2>/dev/null; then
-    kill "$_pid" 2>/dev/null || true
-    sleep 1
-    kill -0 "$_pid" 2>/dev/null && warn "隧道 pid $_pid 仍在（可能自愈重启，稍后 health 复判）"
-  fi
+# tunnel.pid 是 JSON，必须走 tunnel_pid 解析（早期 tr -dc '0-9' 会拼成一串错误 pid）
+_pid="$(tunnel_pid)"
+if [ "$_pid" != "0" ] && kill -0 "$_pid" 2>/dev/null; then
+  kill "$_pid" 2>/dev/null || true
+  sleep 1
+  kill -0 "$_pid" 2>/dev/null && warn "隧道 pid $_pid 仍在（可能自愈重启，稍后 health 复判）"
 fi
 HC="$(health_code "${WINVM_TUNNEL_LOCAL_PORT:-18443}" 6)"
 sleep 1; HC2="$(health_code "${WINVM_TUNNEL_LOCAL_PORT:-18443}" 6)"

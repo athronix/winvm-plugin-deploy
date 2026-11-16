@@ -48,35 +48,63 @@ HOST_STATE="${WB_TUNNEL_STATE_DIR:-$HOME/.workbuddy/.state/winvm-tunnel}/host-st
 # 宿主侧精确回滚：只删本技能建的钥 + 恢复 known_hosts（基线来自 deploy 第 1 步）
 host_rollback() {
   st_begin 3c "宿主侧回滚（私钥 / known_hosts）"
-  local created=1 existed=1
+  local created="unknown" existed="unknown"
   if [ -f "$HOST_STATE" ]; then
-    created="$("$NODE" -e 'try{process.stdout.write(String(require(process.argv[1]).keyCreatedBySkill))}catch{process.stdout.write("true")}' "$HOST_STATE" 2>/dev/null)"
-    existed="$("$NODE" -e 'try{process.stdout.write(String(require(process.argv[1]).knownHostsEntryExistedBefore))}catch{process.stdout.write("true")}' "$HOST_STATE" 2>/dev/null)"
+    created="$("$NODE" -e 'try{process.stdout.write(String(require(process.argv[1]).keyCreatedBySkill))}catch{process.stdout.write("unknown")}' "$HOST_STATE" 2>/dev/null)"
+    existed="$("$NODE" -e 'try{process.stdout.write(String(require(process.argv[1]).knownHostsEntryExistedBefore))}catch{process.stdout.write("unknown")}' "$HOST_STATE" 2>/dev/null)"
   fi
-  if [ "$created" = "true" ] && [ -f "$WINVM_VM_KEY" ]; then
-    "$NODE" -e 'const fs=require("fs");for(const s of ["","\.pub"]){try{fs.unlinkSync(process.argv[1]+s)}catch{}}' "$WINVM_VM_KEY" 2>/dev/null \
-      && echo "  已删本技能生成的私钥/公钥: $WINVM_VM_KEY" || warn "私钥删除失败（保留）"
-  else
-    echo "  私钥非本技能创建，保留: $WINVM_VM_KEY"
-  fi
-  if [ "$existed" = "false" ] && [ -f "$HOME/.ssh/known_hosts" ]; then
-    local tmp="$HOME/.ssh/known_hosts.wbnew.$$"
-    awk -v h="$VM_HOST" 'index($0,h)==0' "$HOME/.ssh/known_hosts" > "$tmp" 2>/dev/null \
-      && mv -f "$tmp" "$HOME/.ssh/known_hosts" && echo "  已清 known_hosts 中 $VM_HOST 的条目（部署前不存在）" \
-      || warn "known_hosts 清理失败（保留原文件）"
-  elif [ "$existed" = "true" ]; then
-    echo "  known_hosts 条目部署前已存在，保留"
-  fi
-  st_end 0 PASS "host key state cleaned"
+  # unknown = 没有基线：绝不盲删（钥可能是用户自己放的），但必须显式告知而不是静默保留
+  case "$created" in
+    true)
+      if [ -f "$WINVM_VM_KEY" ]; then
+        "$NODE" -e 'const fs=require("fs");for(const s of ["","\.pub"]){try{fs.unlinkSync(process.argv[1]+s)}catch{}}' "$WINVM_VM_KEY" 2>/dev/null \
+          && echo "  已删本技能生成的私钥/公钥: $WINVM_VM_KEY" || warn "私钥删除失败（保留）"
+      fi ;;
+    unknown)
+      warn "无回滚基线（$HOST_STATE 缺失）→ 保守保留私钥 $WINVM_VM_KEY（确需删除请手工处理）" ;;
+    *)
+      echo "  私钥非本技能创建，保留: $WINVM_VM_KEY" ;;
+  esac
+  case "$existed" in
+    false)
+      if [ -f "$HOME/.ssh/known_hosts" ]; then
+        local tmp="$HOME/.ssh/known_hosts.wbnew.$$"
+        awk -v h="$VM_HOST" 'index($0,h)==0' "$HOME/.ssh/known_hosts" > "$tmp" 2>/dev/null \
+          && mv -f "$tmp" "$HOME/.ssh/known_hosts" && echo "  已清 known_hosts 中 $VM_HOST 的条目（部署前不存在）" \
+          || warn "known_hosts 清理失败（保留原文件）"
+      fi ;;
+    unknown)
+      warn "known_hosts 归属未知（无基线）→ 保留不动" ;;
+    *)
+      echo "  known_hosts 条目部署前已存在，保留" ;;
+  esac
+  st_end 0 PASS "host key state cleaned (created=$created known_before=$existed)"
 }
 
 if [ "$CH" = "1" ]; then
   st_begin 3b "VM SYSTEM post 动作（用 VM 上已存的 oneclick -Rollback）"
   PL="$(sub_log tunnel-post)"
-  # 脚本必须已在 VM 上（deploy 第 1 步存的）；不在就退回用户命令，绝不 scp 新模板。
+  # 首选 VM 上已存的那份（deploy 第 1 步留下的）；缺失时**就地下载**再跑，
+  # 因为「让用户手敲一条指向不存在文件的命令」是死路（实测踩到）。
+  # 绝不 scp 新模板、绝不为拆通道而重建通道。
+  URL_FOR_VM=""
+  if URL_FOR_VM="$(sshd_script_url)" && url_reachable "$URL_FOR_VM"; then
+    echo "  兜底下载源: $URL_FOR_VM"
+  else
+    URL_FOR_VM=""; echo "  [WARN] 远端脚本地址不可达，缺文件时将只能给用户手工命令"
+  fi
   cat > "$PL.ps1" <<'PS1'
 $rb = 'C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1'
-if (-not (Test-Path $rb)) { Write-Output 'NO_LOCAL_SCRIPT'; exit 3 }
+$u  = '__URL__'
+if (-not (Test-Path $rb)) {
+  if (-not $u) { Write-Output 'NO_LOCAL_SCRIPT_NO_URL'; exit 3 }
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path $rb) | Out-Null
+    Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $rb
+    Unblock-File $rb
+    Write-Output 'DOWNLOADED'
+  } catch { Write-Output ('DOWNLOAD_FAILED: ' + $_.Exception.Message); exit 4 }
+}
 $tr = 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + $rb + ' -Rollback'
 $a1 = @('/Create','/TN','WbTunnelRollback','/TR',$tr,'/SC','ONCE','/ST','00:00','/RL','HIGHEST','/RU','SYSTEM','/F')
 & schtasks.exe $a1 | Out-Null
@@ -84,6 +112,8 @@ $a2 = @('/Run','/TN','WbTunnelRollback')
 & schtasks.exe $a2 | Out-Null
 Write-Output 'POST_ROLLBACK_SCHEDULED'
 PS1
+  # 占位替换注入 URL（比 unquoted heredoc 转义 PS 变量安全）
+  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];fs.writeFileSync(p,fs.readFileSync(p,"utf8").replace("__URL__",process.argv[2]))' "$PL.ps1" "${URL_FOR_VM:-}"
   bash "$SCRIPTDIR/ps-run.sh" "$PL.ps1" > "$PL" 2>&1; PRC=$?
   tr -d '\r' < "$PL" | tail -4
   if [ $PRC -eq 0 ] && grep -q 'POST_ROLLBACK_SCHEDULED' "$PL" 2>/dev/null; then
@@ -103,7 +133,8 @@ PS1
     exit 0
   fi
   st_end $PRC SKIP "post 动作未成功（转用户命令）"
-  grep -q 'NO_LOCAL_SCRIPT' "$PL" 2>/dev/null && echo "  VM 上没有 $VM_SCRIPT_WIN（可能被清理过）"
+  grep -q 'DOWNLOAD_FAILED' "$PL" 2>/dev/null && echo "  VM 侧下载失败：$(tr -d '\r' < "$PL" | grep DOWNLOAD_FAILED | head -1)"
+  grep -q 'NO_LOCAL_SCRIPT_NO_URL' "$PL" 2>/dev/null && echo "  VM 上无 $VM_SCRIPT_WIN 且远端地址不可达"
 fi
 
 # 通道不在 / post 失败 → 给用户那一条命令

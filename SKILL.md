@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。v2.0.0 起结构定为 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端并起 mcp/a2a ⑤verify）+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务卸 VM 模块 ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（脚本由 VM 从远端下载就近留存，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包下载失败、插件健康复验。"
-version: 2.0.0
+version: 2.0.1
 agent_created: true
 ---
 
@@ -16,7 +16,7 @@ agent_created: true
 |---|---|---|---|
 | **1** | 建 host↔VM 免密 ssh 通道（1a 判 → 1b 备钥 → 1c 给用户一条命令 → 1d 验证，失败回 1b 换钥重来） | `deploy-1-ssh.sh` | — |
 | **2** | 取发布包（sha256 + 隔离解压）+ 装 host 端插件与依赖 | `deploy-2-host.sh` | — |
-| **3** | 起 `winvm-tunnel` service 并验证 `/health=200` | `deploy-3-tunnel.sh` | 1 + 2 |
+| **3** | 起 `winvm-tunnel` service 并验证隧道（本地端口在监听 + daemon 存活；`/health` 属第 5 步端到端） | `deploy-3-tunnel.sh` | 1 + 2 |
 | **4** | 装 VM 端（含 node 依赖）+ 起 mcp/a2a service + 七判据 | `deploy-4-vm.sh` | 1 + 2 |
 | **5** | verify：三探针（34 项，`PROBE_DEEP=1` 跑 38）+ 终态矩阵 | `deploy-5-verify.sh`（别名 `verify.sh`） | 3 + 4 |
 
@@ -35,10 +35,11 @@ VM_HOST=... RELEASE_TAG=V1.4.30 bash scripts/deploy.sh         # 锁版本
 从零部署时第 1 步会打印**一整行**命令，用户在 VM 的**管理员 PowerShell** 粘贴执行即可（约 1~3 分钟，含装 OpenSSH）：
 
 ```powershell
-$ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path $d|Out-Null;iwr -UseBasicParsing -Uri '<远端直链>' -OutFile "$d\winvm-sshd-oneclick.ps1";Unblock-File "$d\winvm-sshd-oneclick.ps1";powershell -NoProfile -ExecutionPolicy Bypass -File "$d\winvm-sshd-oneclick.ps1" -PublicKey '<公钥>' -User 'User' -Port 22 -AllowFrom '<宿主IP>'
+$ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path $d|Out-Null;iwr -UseBasicParsing -Uri '<远端直链>' -OutFile "$d\winvm-sshd-oneclick.ps1";Unblock-File "$d\winvm-sshd-oneclick.ps1";powershell -NoProfile -ExecutionPolicy Bypass -File "$d\winvm-sshd-oneclick.ps1" -PublicKey '<公钥>' -User 'User' -Port 22
 ```
 
-- 命令由 `deploy-1-ssh.sh` 现拼（公钥、端口、来源 IP 都已填好），**不需要用户改任何东西**。
+- 命令由 `deploy-1-ssh.sh` 现拼（公钥、端口都已填好），**不需要用户改任何东西**。
+- `-AllowFrom` **默认不带**：它在 VM 侧落成防火墙白名单（只放行该来源），默认传错值会直接把宿主挡死（实测症状=连接超时）。要收紧来源才加 `VM_ALLOW_FROM=<宿主源IP>`（如 `172.16.100.1`）。
 - 脚本执行时把自己复制到 `C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1`，所以卸载阶段有确定路径。
 - 用户粘完 → **重跑同一条 deploy 命令**：1a 判到 READY 就跳过 1b~1d，直接往下走。已完成的步骤全部幂等。
 - `CHANNEL_WAIT_S=600` 可让第 1 步原地等用户粘贴（默认 0 = 打印完就退出，让命令露在前台）。
@@ -99,7 +100,7 @@ VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计�
 | `deploy.sh` / `undeploy.sh` | 两个任务的总入口（编排 + 并行 + 汇总） |
 | `deploy-1-ssh.sh` | 免密通道：判 / 备钥 / 给命令 / 验证（1a~1d，失败回 1b，最多 3 轮） |
 | `deploy-2-host.sh` | 取包 + MANIFEST 对账 + host 端插件与 skills |
-| `deploy-3-tunnel.sh` | 对齐 `vm-conn.json` 的 identityFile + 起隧道 + health 判据 |
+| `deploy-3-tunnel.sh` | 对齐 `vm-conn.json` 的 identityFile + 起隧道 + 隧道判据（端口监听 + daemon 存活） |
 | `deploy-4-vm.sh` | VM 依赖 + 推包装服务 + 七判据 |
 | `deploy-5-verify.sh`（`verify.sh`） | 三探针 + 终态矩阵；唯一 verify 实现 |
 | `undeploy-1-host.sh` | 停隧道 + host-only 卸载（把 VM 目标三处屏蔽干净，防重复/挂死） |

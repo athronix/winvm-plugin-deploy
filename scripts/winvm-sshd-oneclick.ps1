@@ -2051,11 +2051,21 @@ function Install-ViaWinget {
 }
 
 function Ensure-OpenSSHServer {
+  $sshdExeProbe = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
   if (Get-Service -Name sshd -ErrorAction SilentlyContinue) {
-    Ok 'sshd 服务已存在，跳过安装'
-    return
+    if (Test-Path $sshdExeProbe) {
+      Ok 'sshd 服务已存在且二进制在位，跳过安装'
+      return
+    }
+    # 服务壳还在、sshd.exe 却没了 —— 这是 OpenSSH.Server 能力被卸载后的残留
+    # （-Rollback 撤 capability 时就会出现）。若这里跳过安装，
+    # 阶段 3 的 Start-Service 必然报 "Cannot start service sshd"。
+    Warn ('sshd 服务壳存在但 {0} 缺失（能力已被卸载的残留）→ 清壳重装' -f $sshdExeProbe)
+    try { & sc.exe stop sshd 2>$null | Out-Null } catch {}
+    try { & sc.exe delete sshd 2>$null | Out-Null } catch {}
+    Detail '已移除失去二进制的服务壳，改走正常安装流程重新注册'
   }
-  if ($SkipInstall) { throw '未检测到 sshd 且指定了 -SkipInstall' }
+  if ($SkipInstall) { throw '未检测到可用的 sshd 且指定了 -SkipInstall' }
 
   # 真的会阻塞 msiexec 的只有 CBS/WU 待重启标记；PFRO 只作信息展示（正常现象）
   $pending = Test-PendingReboot

@@ -173,6 +173,12 @@ def c_ssh_4steps(root):
         bad.append('1d 段未用 channel_ready 做验证')
     if 'while' not in body or 'prepare_key' not in body:
         bad.append('缺"验证失败回 1b"的循环/备钥调用')
+    # -AllowFrom 在 VM 侧是防火墙白名单。默认给 $VM_HOST（VM 自身 IP）=
+    # 只放行 VM 自己，宿主连不上（真机实测：连接超时）。
+    if 'VM_ALLOW_FROM:-$VM_HOST' in body:
+        bad.append('ALLOW_FROM 默认 $VM_HOST（VM 自身 IP）→ 防火墙白名单把宿主挡死')
+    if 'allow_arg' not in body:
+        bad.append('1c 未把 -AllowFrom 做成可选（无 allow_arg 条件拼接）')
     return bad
 
 
@@ -278,6 +284,120 @@ def c_oneclick(root):
         bad.append('缺 -Rollback 开关')
     if 'winvm-sshd-oneclick.ps1' not in body:
         bad.append('缺固定留存路径字样')
+    # 僵尸服务壳：-Rollback 卸掉 OpenSSH.Server 能力后，sshd 服务注册项仍残留，
+    # 此时 sshd.exe 已不在。只看 Get-Service 会误判"已安装"→ Start-Service 必失败。
+    seg = re.search(r'function Ensure-OpenSSHServer\s*\{[\s\S]*?\n\}\n', body)
+    if not seg:
+        bad.append('找不到 Ensure-OpenSSHServer 函数')
+    else:
+        s = seg.group(0)
+        # 必须是「真的去探 sshd.exe」，不能只声明路径变量（变异把探测改成 $true 时会被抓）
+        if 'Test-Path $sshdExeProbe' not in s:
+            bad.append('Ensure-OpenSSHServer 未真正探测 sshd.exe（僵尸服务壳会被误判已安装）')
+        if 'sc.exe delete sshd' not in s:
+            bad.append('Ensure-OpenSSHServer 未清壳（sc.exe delete sshd）')
+    return bad
+
+
+def c_tunnel_signal(root):
+    """第 3 步判据必须是「隧道本身」，不能是 health。
+
+    health 是 **VM 端 winvm service** 的口径：从零部署时 VM 端服务由第 4 步并行安装，
+    第 3 步那一刻 18443 后面没人应答 ⇒ health 必然 000。把它当门槛 = 从零部署假 FAIL
+    （2026-11-16 真机实测：3c 空等 123s 后判 FAIL，而 4b/4c 全 PASS）。
+    正确判据：本地端口有 listener（port_listening）+ daemon 存活（tunnel_pid）。
+    """
+    p = os.path.join(root, 'scripts', 'deploy-3-tunnel.sh')
+    if not os.path.exists(p):
+        return ['缺 deploy-3-tunnel.sh']
+    body = strip_comments(read(p))
+    bad = []
+    parts = body.split('st_begin 3c')
+    if len(parts) < 2:
+        bad.append('找不到 3c 段')
+        return bad
+    seg = parts[-1]
+    if 'port_listening' not in seg:
+        bad.append('3c 未用 port_listening 判隧道（health 是 VM 端服务口径，从零部署必为 000）')
+    if 'tunnel_pid' not in seg and 'tunnel_alive' not in seg:
+        bad.append('3c 未校验 daemon 存活（只听端口会被"监听但转发已死"骗过）')
+    if re.search(r'if\s*\[\s*"\$HC"\s*!=\s*"200"\s*\]', seg):
+        bad.append('3c 仍把 health=200 当门槛（从零部署时必然 000 → 假 FAIL）')
+    # tunnel.pid 是 JSON：任何 `tr -dc '0-9'` 解析都会把数字拼成一串错误 pid。
+    if re.search(r"tunnel\.pid.*tr -dc", body):
+        bad.append("用 tr -dc 解析 tunnel.pid（它是 JSON，会拼成错误 pid → kill -0 恒失败）")
+    return bad
+
+
+def c_health_code(root):
+    """health_code 必须恒为 3 字符。
+
+    curl -w '%{http_code}' 在连不上时**自己就吐 "000"** 且 rc!=0，
+    再 `|| echo 000` 会拼成 "000000"（同 grep -c 双值坑的变体），
+    于是调用方 `= "000"` 判不通永不成立 ⇒ undeploy 1c 假 FAIL、阶段 A 中断。
+    """
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    m = re.search(r'health_code\(\)\s*\{(.*?)\n\}', body, re.S)
+    if not m:
+        return ['_common.sh 找不到 health_code() 定义']
+    fn = m.group(1)
+    if re.search(r'\|\|\s*echo\s+0+', fn):
+        bad.append('health_code 里 `|| echo 000` 会与 curl 自带 000 拼成 000000')
+    if not re.search(r"printf '000'", fn):
+        bad.append('health_code 缺「不通→000」归一分支')
+    # 行为断言：肯定不通的端口必须恰好返回 000（比字符串匹配强）
+    try:
+        out = subprocess.run(['bash', '-c', '. "%s/scripts/_common.sh"; health_code 1 2' % root],
+                             capture_output=True, text=True, timeout=25)
+        got = (out.stdout or '').strip()
+    except Exception as exc:  # noqa: BLE001
+        got = 'ERR:%s' % exc
+    if got != '000':
+        bad.append('health_code 不通端口实测=%r（须恰为 000，不许拼长）' % got)
+    return bad
+
+
+def c_rollback_path(root):
+    """拆通道必须真能完成，不能"给一条指向不存在文件的命令"。
+
+    a) VM 上缺 oneclick 脚本时，3b 要**就地下载**再 -Rollback；
+    b) 回滚基线在 1a 判 READY 与 1b 备钥两条路上都要写，
+       否则「通道本来就活着」的机器永远无基线，undeploy 只能保守不删钥。
+    """
+    bad = []
+    u3 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-3-ssh.sh')))
+    m = re.search(r'st_begin 3b "VM SYSTEM post 动作(.*?)\n\s*st_end [^\n]*SKIP "post 动作未成功', u3, re.S)
+    fn = m.group(1) if m else ''
+    if not m:
+        bad.append('undeploy-3 找不到 3b「SYSTEM post 动作」段')
+    if 'Invoke-WebRequest' not in fn:
+        bad.append('3b 缺「VM 上无脚本就地下载」分支（用户会敲一条指向不存在文件的命令）')
+    if 'sshd_script_url' not in fn:
+        bad.append('3b 未复用 sshd_script_url 解析下载源（应与第 1 步同源）')
+    if 'POST_ROLLBACK_SCHEDULED' not in fn:
+        bad.append('3b 缺 SYSTEM 任务成功判据')
+
+    d1 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh')))
+    seg1a = re.search(r'st_begin 1a\b(.*?)\n\s*st_end', d1, re.S)
+    seg1b = re.search(r'prepare_key\(\)\s*\{(.*?)\n\}', d1, re.S)
+    for tag, seg in (('1a READY 路径', seg1a), ('1b 备钥路径', seg1b)):
+        if not seg:
+            bad.append('deploy-1 找不到 %s 段落' % tag)
+        elif 'write_baseline_if_absent' not in seg.group(1):
+            bad.append('%s 未写回滚基线（undeploy 将无从判断钥归属）' % tag)
+
+    # sshd_script_url 必须自给自足：步脚本可单独重跑，调用方未必跑过 need_py
+    cm = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    fm = re.search(r'sshd_script_url\(\)\s*\{(.*?)\n\}', cm, re.S)
+    if not fm:
+        bad.append('_common.sh 找不到 sshd_script_url()')
+    else:
+        fbody = fm.group(1)
+        if re.search(r'(?<!\$\{)"\$PY"', fbody):
+            bad.append('sshd_script_url 裸用 "$PY"（set -u 下 unbound variable，URL 静默变空）')
+        if 'command -v python3' not in fbody:
+            bad.append('sshd_script_url 缺 python3 兜底查找')
     return bad
 
 
@@ -312,6 +432,8 @@ CHECKS = [
     ('keep-default', c_keep_default), ('payload', c_payload), ('parallel', c_parallel),
     ('no-rebuild', c_no_rebuild), ('links', c_links), ('oneclick', c_oneclick),
     ('vmcheck-assert', c_vmcheck_assert),
+    ('health-code', c_health_code), ('rollback-path', c_rollback_path),
+    ('tunnel-signal', c_tunnel_signal),
 ]
 
 
@@ -353,6 +475,25 @@ MUTATIONS = [
     # 4c 判据断言化是 v2.0.0 真机首跑抓到的假绿（vmcheck 纯报告器 + 只看 rc）。
     # 去掉解析器门禁 ⇒ vmcheck-assert 必须报「未声明 need_py」。
     ('M7 4c 判据退化为看 rc', 'scripts/deploy-4-vm.sh', 'need_py', 'true'),
+    # undeploy 1c 假 FAIL 的真因：curl 自带 000 + `|| echo 000` ⇒ "000000"。
+    ('M8 health_code 双值回归', 'scripts/_common.sh',
+     "*) printf '000' ;;", "*) printf '000'; printf '000' ;;"),
+    # 拆通道时 VM 上没脚本 ⇒ 必须下载；退化成就地放弃会打印死命令。
+    ('M9 拆通道缺脚本不下载', 'scripts/undeploy-3-ssh.sh',
+     'Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $rb',
+     "Write-Output 'SKIP_DOWNLOAD'"),
+    # 步脚本可单独重跑 ⇒ 公共函数不许依赖调用方的 PY 初始化。
+    ('M10 公共函数裸用 $PY', 'scripts/_common.sh', 'py="${PY:-}"', 'py="$PY"'),
+    # -AllowFrom 默认成 VM 自身 IP ⇒ 防火墙白名单把宿主挡死（真机实测超时）。
+    ('M11 AllowFrom 默认 VM 自身IP', 'scripts/deploy-1-ssh.sh',
+     'ALLOW_FROM="${VM_ALLOW_FROM:-}"', 'ALLOW_FROM="${VM_ALLOW_FROM:-$VM_HOST}"'),
+    # -Rollback 卸能力后服务壳残留、sshd.exe 已没了；只看 Get-Service 就"跳过安装"必挂。
+    ('M12 僵尸服务壳误判已安装', 'scripts/winvm-sshd-oneclick.ps1',
+     'if (Test-Path $sshdExeProbe) {', 'if ($true) {'),
+    # 从零部署时 health 必然 000（VM 端服务由第 4 步并行装）；3c 只听端口才是对的口径。
+    ('M13 3c 退回只看 health', 'scripts/deploy-3-tunnel.sh',
+     'if port_listening "$PORT"; then OK=1; break; fi',
+     'HC0="$(health_code "$PORT" 6)"; [ "$HC0" = "200" ] && { OK=1; break; }'),
 ]
 
 

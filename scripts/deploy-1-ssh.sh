@@ -25,23 +25,35 @@ KEY="$WINVM_VM_KEY"
 ROUNDS="${CHANNEL_ROUNDS:-3}"
 WAIT_S="${CHANNEL_WAIT_S:-0}"
 
-# 远端脚本 URL（VM 匿名可达；技能源仓是 private，raw 不可用，故走 release 资产）
-sshd_script_url() {
-  [ -n "${SSHD_SCRIPT_URL:-}" ] && { printf '%s' "$SSHD_SCRIPT_URL"; return 0; }
-  local tag="${RELEASE_TAG:-}"
-  if [ -z "$tag" ]; then
-    tag="$(curl -fsSL --connect-timeout 10 --max-time 25 \
-      "https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest" 2>/dev/null \
-      | "$PY" -c 'import sys,json;print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
-  fi
-  [ -n "$tag" ] || return 1
-  printf 'https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/%s/winvm-sshd-oneclick.ps1' "$tag"
+# 远端脚本 URL 与可达性判定来自 _common.sh（deploy 第 1 步与 undeploy 第 3 步共用同一解析）
+
+# 写回滚基线（只在缺失时写；1a 判 READY 与 1b 备钥两条路都要写，
+# 否则「通道本来就活着」的机器永远没有基线，undeploy 只能保守不删钥）
+write_baseline_if_absent() { # <existed 0|1> <ours 0|1> <known_before 0|1> [force_created]
+  [ -f "$HOST_STATE" ] && return 0
+  mkdir -p "$HOST_STATE_DIR" 2>/dev/null || true
+  "$PY" - "$HOST_STATE" "$KEY" "$1" "$2" "$3" "$VM_HOST" "$VM_USER" "$VM_SSH_PORT" "${4:-}" <<'PY'
+import json, os, sys, datetime
+p, key, existed, ours, known, ip, user, port = sys.argv[1:9]
+force = (sys.argv[9] if len(sys.argv) > 9 else '').strip()
+created = True if force == 'true' else ((existed == '0') or (ours == '1'))
+st = {'ts': datetime.datetime.now().isoformat(timespec='seconds'), 'keyPath': key,
+      'keyExistedBefore': existed == '1', 'keyCreatedBySkill': created,
+      'knownHostsEntryExistedBefore': known == '1',
+      'vmIp': ip, 'vmUser': user, 'port': port, 'createdBy': 'winvm-plugin-deploy'}
+os.makedirs(os.path.dirname(p), exist_ok=True)
+json.dump(st, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+print('[baseline] 已记录 -> %s (keyCreatedBySkill=%s knownHostsExistedBefore=%s)'
+      % (p, created, known == '1'))
+PY
 }
 
-url_reachable() {
-  local code
-  code="$(curl -sIL --connect-timeout 12 --max-time 30 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null)"
-  [ "$code" = "200" ]
+key_facts() { # 输出 "<existed> <ours> <known_before>"
+  local existed=0 ours=0 known_before=0
+  [ -f "$KEY" ] && existed=1
+  [ -f "$KEY.pub" ] && grep -q 'workbuddy-winvm' "$KEY.pub" 2>/dev/null && ours=1
+  [ -f "$HOME/.ssh/known_hosts" ] && grep -q -- "$VM_HOST" "$HOME/.ssh/known_hosts" 2>/dev/null && known_before=1
+  printf '%s %s %s' "$existed" "$ours" "$known_before"
 }
 
 # ── 1b：准备 host 端密钥 + 记录可回滚基线 ──
@@ -71,22 +83,9 @@ prepare_key() {
   fi
 
   # 基线只写一次（供 undeploy-3 精确回滚：删本技能建的钥 / 恢复 known_hosts）
-  if [ ! -f "$HOST_STATE" ]; then
-    local known_before=0
-    [ -f "$HOME/.ssh/known_hosts" ] && grep -q -- "$VM_HOST" "$HOME/.ssh/known_hosts" 2>/dev/null && known_before=1
-    "$PY" - "$HOST_STATE" "$KEY" "$existed" "$ours" "$known_before" "$VM_HOST" "$VM_USER" "$VM_SSH_PORT" <<'PY'
-import json, os, sys, datetime
-p, key, existed, ours, known, ip, user, port = sys.argv[1:9]
-created = (existed == '0') or (ours == '1')
-st = {'ts': datetime.datetime.now().isoformat(timespec='seconds'), 'keyPath': key,
-      'keyExistedBefore': existed == '1', 'keyCreatedBySkill': created,
-      'knownHostsEntryExistedBefore': known == '1',
-      'vmIp': ip, 'vmUser': user, 'port': port, 'createdBy': 'winvm-plugin-deploy'}
-os.makedirs(os.path.dirname(p), exist_ok=True)
-json.dump(st, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
-print('[1b] 基线已记录 -> %s (keyCreatedBySkill=%s)' % (p, created))
-PY
-  fi
+  local known_before=0
+  [ -f "$HOME/.ssh/known_hosts" ] && grep -q -- "$VM_HOST" "$HOME/.ssh/known_hosts" 2>/dev/null && known_before=1
+  write_baseline_if_absent "$existed" "$ours" "$known_before" "$([ "$rotate" = "1" ] && echo true)"
   PUB="$(cat "$KEY.pub" 2>/dev/null)"
   [ -n "$PUB" ] || die "公钥不可读" "$KEY.pub 为空" "cat 失败" "重跑并加 ROTATE=1 换钥"
 }
@@ -94,12 +93,17 @@ PY
 # ── 1c：打印用户命令 ──
 print_user_command() {
   local url="$1" pub="$2"
+  # -AllowFrom 在 VM 侧落成**防火墙白名单**（只放行该来源 IP）。默认绝不能给
+  # $VM_HOST——那是 VM 自己的地址，会把宿主直接挡在门外（实测症状=连接超时）。
+  # 只有用户显式给 VM_ALLOW_FROM=<宿主源IP> 时才带。
+  local allow_arg=""
+  [ -n "${ALLOW_FROM:-}" ] && allow_arg=" -AllowFrom '$ALLOW_FROM'"
   cat <<EOF
 
 ════════════════════ user 只需要做这一件事 ════════════════════
 把下面【一整行】复制到 VM 的【管理员 PowerShell】里回车（约 1~3 分钟，含装 OpenSSH）
 
-\$ErrorActionPreference='Stop';\$d=Join-Path \$env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path \$d|Out-Null;iwr -UseBasicParsing -Uri '$url' -OutFile "\$d\\winvm-sshd-oneclick.ps1";Unblock-File "\$d\\winvm-sshd-oneclick.ps1";powershell -NoProfile -ExecutionPolicy Bypass -File "\$d\\winvm-sshd-oneclick.ps1" -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT -AllowFrom '$ALLOW_FROM'
+\$ErrorActionPreference='Stop';\$d=Join-Path \$env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path \$d|Out-Null;iwr -UseBasicParsing -Uri '$url' -OutFile "\$d\\winvm-sshd-oneclick.ps1";Unblock-File "\$d\\winvm-sshd-oneclick.ps1";powershell -NoProfile -ExecutionPolicy Bypass -File "\$d\\winvm-sshd-oneclick.ps1" -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT$allow_arg
 
 脚本会自己存到 VM 的 C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1
 （卸载通道时直接：powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1 -Rollback）
@@ -114,6 +118,9 @@ EOF
 st_begin 1a "判断 host↔VM 免密通道"
 if channel_ready 5000; then
   # 通道可用还需确认"是本技能这把钥"，否则后续 scp 会用错钥
+  # 同时补写回滚基线：READY 路径此前从不写基线，会让 undeploy 无从判断钥的归属
+  read -r _ex _ours _kh <<<"$(key_facts)"
+  write_baseline_if_absent "$_ex" "$_ours" "$_kh"
   st_end 0 PASS "channel=READY key=$(basename "$KEY") → 1b~1d SKIP"
   state_set CHANNEL_READY 1
   state_set WINVM_VM_KEY "$KEY"
@@ -146,7 +153,9 @@ while [ "$CH_ROUND" -lt "$ROUNDS" ]; do
         "HEAD $URL → 非 200" \
         "先发布新版（资产含该 ps1），或 SSHD_SCRIPT_URL 指向可用直链"
   fi
-  ALLOW_FROM="${VM_ALLOW_FROM:-$VM_HOST}"
+  # -AllowFrom = VM 侧防火墙白名单（只放行该来源）。默认留空=不限定来源，
+  # 仍受 ListenAddress 收窄保护；要收紧就显式 VM_ALLOW_FROM=<宿主源IP>。
+  ALLOW_FROM="${VM_ALLOW_FROM:-}"
   st_end 0 WAIT_USER "url=$URL"
   print_user_command "$URL" "$PUB"
 
