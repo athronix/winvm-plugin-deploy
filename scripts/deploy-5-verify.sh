@@ -34,9 +34,13 @@ if [ "${VERIFY_FORCE_PROBE:-0}" != "1" ] && [ -f "$STAMP" ]; then
   S_EPOCH="$(sed -n 's/^epoch=//p' "$STAMP" | head -1)"
   S_OK="$(sed -n 's/^deploy_ok=//p' "$STAMP" | head -1)"
   S_PKG="$(sed -n 's/^pkg=//p' "$STAMP" | head -1)"
+  # 复用要读「上一轮真实探针日志」，而非本轮新建的空目录（2026-11-16 实测：
+  # 只记 pkg+epoch 时，新 run_dir 下无日志 → 三个探针全 meter-missing → 0/0 假 FAIL）
+  S_LOGD="$(sed -n 's/^logd=//p' "$STAMP" | head -1)"
   NOW="$(date +%s)"
   if [ "${S_OK:-0}" != "1" ]; then RREASON="deploy-not-green"
   elif [ "${S_PKG:-}" != "$PKG" ]; then RREASON="pkg-changed"
+  elif [ -z "${S_LOGD:-}" ] || [ ! -d "$S_LOGD" ]; then RREASON="no-logdir"
   elif [ -z "${S_EPOCH:-}" ] || [ $((NOW - S_EPOCH)) -gt "$FRESH" ]; then RREASON="stale($((NOW - ${S_EPOCH:-0}))s)"
   else REUSE=1; RREASON="fresh($((NOW - S_EPOCH))s<=${FRESH}s, same pkg)"; fi
 fi
@@ -46,8 +50,9 @@ PROBE_TOTAL=0; PROBE_PASS=0; PROBE_SKIP=0; PROBLEMS=""
 if [ $REUSE -eq 1 ]; then
   st_begin 5 "三探针（复用 deploy 刚跑的结果）"
   echo "  复用理由: $RREASON（强制冷跑=VERIFY_FORCE_PROBE=1）"
+  echo "  复用日志: $S_LOGD"
   for pr in mcp-probe a2a-probe example-probe; do
-    _L="$(grep -E 'SUMMARY|RESULT' "$LOGD/$pr.log" 2>/dev/null | grep -E '[0-9]+/[0-9]+' | tail -1)"
+    _L="$(grep -E 'SUMMARY|RESULT' "$S_LOGD/$pr.log" 2>/dev/null | grep -E '[0-9]+/[0-9]+' | tail -1)"
     PT="$(printf '%s' "$_L" | grep -oE '[0-9]+/[0-9]+' | head -1)"
     if [ -n "$PT" ]; then
       PROBE_PASS=$((PROBE_PASS + ${PT%%/*})); PROBE_TOTAL=$((PROBE_TOTAL + ${PT##*/}))
@@ -90,7 +95,7 @@ fi
 # 探针刚全绿 → 落候选 stamp（deploy_ok=0，只有 deploy.sh 全链零 FAIL 才升 1）
 if [ -z "$PROBLEMS" ] && [ $REUSE -eq 0 ]; then
   mkdir -p "$(dirname "$STAMP")" 2>/dev/null || true
-  printf 'epoch=%s\npkg=%s\ndeploy_ok=0\n' "$(date +%s)" "$PKG" > "$STAMP" 2>/dev/null || true
+  printf 'epoch=%s\npkg=%s\nlogd=%s\ndeploy_ok=0\n' "$(date +%s)" "$PKG" "$LOGD" > "$STAMP" 2>/dev/null || true
 fi
 
 # ── 5d 终态矩阵 ──
@@ -109,7 +114,9 @@ echo "connector skills=$SKCNT" | tee -a "$LOGD/health.txt"
 ENV_WINDOW=0
 if [ -n "${VM_HOST:-}" ]; then
   # 原生原语（CIM 全枚举 20-35s 是旧版元凶）：schtasks /fo CSV + .NET GetActiveTcpListeners
-  bash "$SCRIPTDIR/ps-run.sh" -c '$r=@(schtasks /query /tn WinVMBridge.Service /fo CSV /nh 2>$null | ConvertFrom-Csv -Header n,next,status); $t=if ($r.Count -gt 0) { [string]$r[0].status } else { "absent" }; $l=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 18443 }).Count; $s=(Get-Service sshd).Status; Write-Output ("VM: task=" + $t + " listen=" + $l + " sshd=" + $s)' \
+  # 编码铁律：PS5.1 重定向 stdout 用控制台代码页（zh-CN=GBK）⇒ 宿主按 UTF-8 读必乱码
+  # （2026-11-16 实测 task=��������）。载荷首句强制 UTF-8，保持纯 ASCII 载荷。
+  bash "$SCRIPTDIR/ps-run.sh" -c 'try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{}; $r=@(schtasks /query /tn WinVMBridge.Service /fo CSV /nh 2>$null | ConvertFrom-Csv -Header n,next,status); $t=if ($r.Count -gt 0) { [string]$r[0].status } else { "absent" }; $l=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 18443 }).Count; $s=(Get-Service sshd).Status; Write-Output ("VM: task=" + $t + " listen=" + $l + " sshd=" + $s)' \
     2>/dev/null | tr -d '\r' > "$LOGD/vm-terminal.txt"; VTRC=${PIPESTATUS[0]}
   cat "$LOGD/vm-terminal.txt" 2>/dev/null
   if [ $VTRC -ne 0 ] || ! grep -q "VM: task=" "$LOGD/vm-terminal.txt" 2>/dev/null; then

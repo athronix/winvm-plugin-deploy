@@ -34,6 +34,7 @@
 | 现象 | 根因 | 处置 |
 |---|---|---|
 | tunnel 日志连续 `All configured authentication methods failed` | `vm-conn.json` 的 `identityFile` 指向未被授权的钥（**单值、无回退链**） | 3a 已自动对齐到 `WINVM_VM_KEY`；仍失败就看 3a 输出里 `→` 的目标文件是否存在 |
+| 手测 `ssh2-conn.mjs ping` 报 `All configured authentication methods failed`，但 `ssh -i` 手连成功 | 手测**漏了 `WINVM_VM_KEY`**，ssh2 回落到默认 `~/.ssh/id_ed25519`（不存在/不对）。这是**假红**，通道其实健康 | 手测必须带 `WINVM_VM_KEY=$HOME/.ssh/id_ed25519_winvm`；看错误是「握手超时」还是「认证失败」：前者=WEDGE，后者=钥配错 |
 | `health` 反复 000 | daemon 没起，或到 VM 18443 不通 | 看 `~/.workbuddy/winvm/tunnel.log`；VM 端服务在不在听由第 4 步 4c 判。**不要重启 VM** |
 | restart 后第 4 步立刻握手失败 | restart 重建到 VM 的 ssh 连接，与第 4 步抢握手槽（2026-11-16 实证） | 3b 已改「health 已 200 就跳过 restart」；第 4 步另有 60s 健康窗门禁 + 一次有界重试 |
 
@@ -41,8 +42,22 @@
 
 | 现象 | 根因 | 处置 |
 |---|---|---|
-| `ssh2 连接错误: Timed out while waiting for handshake` | **WEDGE**：guest sshd 握手段挂起（ping 通、长连活、新建死）。不是网络层 | 按红线**不重启 VM**。等健康窗后 `--only 4`（1~3 步已 PASS 不必重来） |
+| `ssh2 连接错误: Timed out while waiting for handshake` | **WEDGE**：guest sshd 握手段挂起（TCP 通、长连活、新建死）。不是网络层 | 按红线**不重启 VM**。先做三段取证（见下），确认是 sshd 停摆后可**经隧道重启 sshd**（不重启 VM），再 `--only 4` |
 | 同上但 ping 也丢 | VM 离线 | 用户开机；不是脚本问题 |
+
+### WEDGE 三段取证（决定「等」还是「修」）
+
+不要靠单次超时下结论，三个探针同做：
+
+| 探针 | 健康态 | 停摆态 | 说明 |
+|---|---|---|---|
+| `ping` | 0% 丢、0~2ms | 100% 丢 | 100% 丢=VM 离线，不是 WEDGE |
+| 裸 TCP 连 :22 + 读 banner | 连接 <100ms 且立刻收到 `SSH-2.0-...` | **连接 7ms 但 12s 零字节** | 内核完成握手、sshd 未走到发 banner |
+| 宿主侧 `curl :18443/health` | 200 | **也是 200** | 长连旧会话不受影响 ⇒ **health≠新建可用，别拿它当通道判据** |
+
+静默 180s 后单次探测仍握手超时 ⇒ 排除「探测风暴把 sshd accept 槽抽干（MaxStartups）」；同时 VM 内 `ssh 127.0.0.1` 也卡死 ⇒ guest sshd 自身停摆（非宿主 NAT）。
+
+修复（2026-11-16 实证有效，**不重启 VM**）：隧道长连还在时，经 MCP 下发 `system.service.control{name:"sshd",action:"restart"}`（L1，直调；约 1s）。重启只杀**新建**连接的接受能力，已建立的长连存活（隧道不断、`health` 持续 200），所以修完立刻 `ssh2-conn.mjs ping` 就能回到 `pong ready`。
 | prepare-vm 报 node 缺失 | VM 内 node 走 nvm-windows，切版本会让全局 CLI 消失 | 重跑 4a（幂等）；仍缺则查 VM 内 `nvm list` |
 | setup 超 420s 未监听 | 服务「僵而不绑」：8K 工作集、不占端口 | `schtasks /End /tn WinVMBridge.Service` 后 `/Run` |
 | `task_state=Ready` 但服务其实在跑 / GUI 报 `SESSION_UNAVAILABLE` | schtasks 包装器退出后任务态回 Ready；实例落 Session 0 | 判据看 `listen_count=1` + `health_http=200`；GUI 需 `/End`+`/Run` 重触发到交互会话 |

@@ -197,6 +197,12 @@ def c_probe_count(root):
                 bad.append('第 %d 个计数分支的 else 未记 PROBLEMS（无计数照样 PASS=假绿）' % i)
             if 'PROBLEMS' in thenb:
                 bad.append('第 %d 个分支误在 then 里记失败' % i)
+    # 复用路径必须读「上一轮日志目录」：只记 pkg+epoch 时，新 run_dir 下无日志 →
+    # 三探针全 meter-missing → 0/0 假 FAIL（2026-11-16 实测）
+    if 'logd=' not in body:
+        bad.append('stamp 未记 logd（复用会读空目录）')
+    if not re.search(r'"\$S_LOGD/\$pr\.log"', body):
+        bad.append('复用分支未从 S_LOGD 读日志')
     return bad
 
 
@@ -275,12 +281,37 @@ def c_oneclick(root):
     return bad
 
 
+def c_vmcheck_assert(root):
+    """4c 必须自己断言判据。
+
+    vmcheck.ps1 是纯报告器（无退出码逻辑）⇒ 只判 ps-run 的 rc，等于「脚本跑完就 PASS」，
+    拿不到 task_state/listen_count 也绿（v2.0.0 真机首跑实测假绿）。故：
+    必须解析 JSON + 逐项断言；且不得回退成「把日志行摘录当判据」。
+    """
+    bad = []
+    body = strip_comments(read(os.path.join(root, 'scripts', 'deploy-4-vm.sh')))
+    if not re.search(r"""grep -o '\{\.\*\}'""", body):
+        bad.append('4c 未从日志提取判据 JSON')
+    if 'need_py' not in body:
+        bad.append('4c 未声明 need_py（解析器依赖未门禁）')
+    for k in ('task_state', 'listen_count', 'side_json', 'bridge_dir'):
+        if k not in body:
+            bad.append('4c 未断言 %s' % k)
+    if '"FAIL|' not in body:
+        bad.append('4c 无「断言失败」出口（无法 FAIL）')
+    # 反向：判据不得取自日志摘录（老实现 st_end 0 PASS "$(grep -E 'listen_count' ...)"）
+    if re.search(r"st_end 0 PASS \"\$\(grep", body):
+        bad.append('4c 仍以日志摘录当判据（假绿回归）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
     ('ssh-4-steps', c_ssh_4steps), ('probe-count', c_probe_count),
     ('keep-default', c_keep_default), ('payload', c_payload), ('parallel', c_parallel),
     ('no-rebuild', c_no_rebuild), ('links', c_links), ('oneclick', c_oneclick),
+    ('vmcheck-assert', c_vmcheck_assert),
 ]
 
 
@@ -319,6 +350,9 @@ MUTATIONS = [
      'st_begin 1a "判断 host↔VM 免密通道"\nif channel_ready 5000; then',
      'st_begin 1a "判断 host↔VM 免密通道"\nif true; then'),
     ('M6 版本非 SemVer', 'SKILL.md', 'version: 2.0.0', 'version: 2.0'),
+    # 4c 判据断言化是 v2.0.0 真机首跑抓到的假绿（vmcheck 纯报告器 + 只看 rc）。
+    # 去掉解析器门禁 ⇒ vmcheck-assert 必须报「未声明 need_py」。
+    ('M7 4c 判据退化为看 rc', 'scripts/deploy-4-vm.sh', 'need_py', 'true'),
 ]
 
 

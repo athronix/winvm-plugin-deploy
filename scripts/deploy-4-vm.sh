@@ -68,17 +68,63 @@ if [ $SRC -ne 0 ]; then
 fi
 st_end 0 PASS "setup rc=0"
 
-# ── 4c 七判据（服务在跑 + 端口在听 + 本地 health 通 + a2a 可达）──
-st_begin 4c "vmcheck 七判据"
+# ── 4c 七判据（服务在跑 + 端口在听 + health 通 + 旁证就位）──
+# 铁律：vmcheck.ps1 是**纯报告器**（无退出码逻辑），rc=0 只说明「脚本跑完了」。
+# 判据必须由本步自己解析 JSON 并逐项断言，否则「拿不到判据也 PASS」＝假绿。
+st_begin 4c "vmcheck 七判据（逐项断言）"
+need_py
 VL="$(sub_log vmcheck)"
 ( cd "$PKG" && bash "$SCRIPTDIR/ps-run.sh" "$PKG/qa/deploy-probes/vmcheck.ps1" > "$VL" 2>&1 ); VRC=$?
-grep -E 'task_state|listen_count|health_http|a2a|ok' "$VL" | tail -6
+grep -E 'task_state|listen_count|health_http|ok' "$VL" | tail -4
 if [ $VRC -ne 0 ]; then
   tail -12 "$VL"
-  st_end $VRC FAIL "vmcheck rc=$VRC"
-  die "VM 端服务未达七判据" "服务未起/端口未听/health 不通" "$VL" \
-      "Ready 但未监听=scheduled task 僵死：schtasks /End /tn WinVMBridge.Service 后 /Run"
+  st_end $VRC FAIL "vmcheck 通道/载荷出错 rc=$VRC（未取到判据）"
+  die "VM 端体检未跑通" "ps-run 失败（通道坏或载荷超预算）" "$VL" \
+      "rc=124 且零输出=载荷超预算（VM_PS_TIMEOUT），不是通道坏"
 fi
-st_end 0 PASS "$(grep -E 'listen_count' "$VL" | tail -1 | cut -c1-120)"
+VJ="$(tr -d '\r' < "$VL" | grep -o '{.*}' | tail -1)"
+if [ -z "$VJ" ]; then
+  tail -10 "$VL"
+  st_end 1 FAIL "vmcheck 未输出判据 JSON（无从断言）"
+  die "VM 端体检无判据" "载荷输出被截断/格式异常" "$VL" "看 $VL"
+fi
+PYV="$(printf '%s' "$VJ" | "$PY" -c '
+import json,sys
+d=json.load(sys.stdin)
+st=str(d.get("task_state","")).strip()
+cnt=int(d.get("listen_count") or 0)
+side=d.get("side_json") is True
+bdir=d.get("bridge_dir") is True
+hh=d.get("health_http")
+bad=[]
+if st not in ("Running","正在运行"): bad.append("task_state=%s" % st)
+if cnt < 1: bad.append("listen_count=%d" % cnt)
+if not side: bad.append("side_json=false")
+if not bdir: bad.append("bridge_dir=false")
+line="task_state=%s listen_count=%d side_json=%s bridge_dir=%s health_http=%s" % (st,cnt,str(side).lower(),str(bdir).lower(),hh)
+print(("FAIL|" + "; ".join(bad)) if bad else ("OK|" + line))
+')"
+case "$PYV" in
+  OK\|*) VCORE="$(printf '%s' "$PYV" | sed 's/^OK|//')" ;;
+  *)      st_end 1 FAIL "$(printf '%s' "$PYV" | sed 's/^FAIL|//')"
+          die "VM 端服务未达判据" "$(printf '%s' "$PYV" | sed 's/^FAIL|//')" "$VL" \
+              "Ready 但未监听=scheduled task 僵死：schtasks /End /tn WinVMBridge.Service 后 /Run" ;;
+esac
+# health 双口径：VM 自检走 in-guest HTTP（5s 窗，ps-bridge 正忙会被取消）；
+# 宿主侧经隧道 health 才代表「外部可服务」。VM 自检 ERR + 宿主 200 = 服务正常。
+VHH="$(printf '%s' "$VJ" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("health_http"))')"
+if [ "$VHH" = "200" ]; then
+  st_end 0 PASS "$VCORE"
+else
+  HC="$(health_code)"
+  if [ "$HC" = "200" ]; then
+    echo "  VM 自检 health=$VHH（in-guest 5s 窗被自身载荷挤占），宿主侧 health=200 → 服务确实可服务"
+    st_end 0 PASS "$VCORE（VM自检=$VHH，宿主侧=200）"
+  else
+    st_end 1 FAIL "$VCORE 且宿主侧 health=$HC"
+    die "VM 服务 health 不通" "VM 自检=$VHH、宿主侧=$HC" "$VL" \
+        "两者皆非 200=服务真坏；仅 VM 自检非 200=判据窗太紧"
+  fi
+fi
 state_set VM_INSTALLED 1
 steps_report
