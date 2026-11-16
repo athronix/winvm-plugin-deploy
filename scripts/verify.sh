@@ -51,7 +51,11 @@ for pr in mcp-probe a2a-probe example-probe; do
     # 现改为写入复用标记，保留原始明细供事后追查。
     printf '[REUSED] 复用 deploy C5 结果：stamp=%s 新鲜窗=%ss pkg=%s\n原始明细见同一 run 的 deploy 段 %s.log\n' \
       "$PROBE_STAMP" "$FRESH" "$PKG" "$pr" | "$_here/step.sh" log "$pr" >/dev/null 2>&1 || true
-    STEP end VERIFY "5-$pr" 0 PASS "REUSED(deploy C5 fresh)" "none"
+    # v1.9.3 判据可证伪：复用判据带上 deploy C5 落盘的真实计数（旧=静态 "REUSED(deploy C5 fresh)"，
+    # 复用段看不到任何项数 ⇒ 一旦 deploy 段假绿，verify 静默继承）。读不到计数显式标 meter-missing。
+    _RL="$(grep -E 'SUMMARY|RESULT' "$LOGD/$pr.log" 2>/dev/null | tail -1)"
+    _RP="$(printf '%s' "$_RL" | grep -oE '[0-9]+/[0-9]+' | head -1)"
+    STEP end VERIFY "5-$pr" 0 PASS "REUSED(deploy C5 ${_RP:-meter-missing})" "none"
     continue
   fi
   ( cd "$PKG" && "$PY" "qa/deploy-probes/$pr.py" > "$LOGD/$pr.log" 2>&1 ); RC=$?

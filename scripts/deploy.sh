@@ -213,15 +213,38 @@ export PROBE_DEEP="${PROBE_DEEP:-0}"
 STEP begin C5 5 "三探针 34 项（PROBE_DEEP=1 时 38 项；X-5 带宽：冷 ~145s / 深冷 ≤250s）"
 PROBLEMS=""
 PRC_ALL=0
+# v1.9.3 判据可证伪（e2e6 实证）：旧判据是静态字符串「38 项见日志」，与真实计数无关 ⇒
+# 探针静默少测也能报 PASS（典型字符串存在式假绿）。现改为解析三探针日志的 SUMMARY/RESULT
+# 真实计数并累加；提取不到计数即判 FAIL（无法核验=假绿风险），另按 PROBE_DEEP 校验总项/深度项。
+PROBE_TOTAL=0; PROBE_PASS=0; PROBE_SKIP=0
 for pr in mcp-probe a2a-probe example-probe; do
   ( cd "$PKG" && "${PY:-python3}" "qa/deploy-probes/$pr.py" > "$LOGD/$pr.log" 2>&1 ); RC=$?
-  echo "[$pr rc=$RC] $(grep -E 'SUMMARY|RESULT' "$LOGD/$pr.log" | tail -1)"
+  # 只认「带 x/y 计数」的那一行：mcp/a2a 的计数在 SUMMARY，example 的在 RESULT；
+  # 末行恒为裸 "RESULT: PASS"（无计数），故不能直接 tail -1（v1.9.3 回放实测踩到）。
+  LINE="$(grep -E 'SUMMARY|RESULT' "$LOGD/$pr.log" 2>/dev/null | grep -E '[0-9]+/[0-9]+' | tail -1)"
+  echo "[$pr rc=$RC] ${LINE:-no-meter}"
   _step_log "$pr" "$LOGD/$pr.log"
+  PT="$(printf '%s' "$LINE" | grep -oE '[0-9]+/[0-9]+' | head -1)"
+  if [ -n "$PT" ]; then
+    PROBE_PASS=$((PROBE_PASS + ${PT%%/*}))
+    PROBE_TOTAL=$((PROBE_TOTAL + ${PT##*/}))
+  else
+    PROBLEMS="$PROBLEMS $pr:no-count"
+  fi
+  SK="$(printf '%s' "$LINE" | grep -oE '[0-9]+ SKIP deep' | grep -oE '[0-9]+' | head -1)"
+  PROBE_SKIP=$((PROBE_SKIP + ${SK:-0}))
   [ $RC -ne 0 ] && { PROBLEMS="$PROBLEMS $pr:FAIL"; [ $PRC_ALL -eq 0 ] && PRC_ALL=$RC; }
 done
+# 期望口径：deep=0 → 34 项 / 4 SKIP deep；deep=1 → 38 项 / 0 SKIP deep。
+# 探针项数若变动（增删 case）必须同步此处，否则本相位判 FAIL —— 这是刻意的同步面告警。
+EXP_TOTAL="${PROBE_EXPECT_TOTAL:-34}"; EXP_SKIP="${PROBE_EXPECT_SKIP:-4}"
+if [ "$PROBE_DEEP" = "1" ]; then EXP_TOTAL="${PROBE_EXPECT_TOTAL:-38}"; EXP_SKIP="${PROBE_EXPECT_SKIP:-0}"; fi
+[ "$PROBE_TOTAL" != "$EXP_TOTAL" ] && PROBLEMS="$PROBLEMS probes:total-$PROBE_TOTAL!=$EXP_TOTAL"
+[ "$PROBE_SKIP" != "$EXP_SKIP" ] && PROBLEMS="$PROBLEMS probes:skip-$PROBE_SKIP!=$EXP_SKIP"
+JUDGE="PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP deep=$PROBE_DEEP"
 # run17 D-3：探针 rc 入 steps.tsv rc 列（旧=恒 0 只 judgment 显 FAIL）+ 聚合出链非零
 # run18 P-5：end id 与 begin 对齐（旧 end 5.3 无 begin → dur 空）
-STEP end C5 5 $PRC_ALL "$([ -z "$PROBLEMS" ] && echo PASS || echo FAIL)" "38 项见日志" "${PROBLEMS:-none}"
+STEP end C5 5 $PRC_ALL "$([ -z "$PROBLEMS" ] && echo PASS || echo FAIL)" "$JUDGE" "${PROBLEMS:-none}"
 [ -z "$PROBLEMS" ] || _fail_note "C5/5-probes($PROBLEMS)"
 [ -z "$PROBLEMS" ] || { echo "⚠ 探针失败:$PROBLEMS —— 按 troubleshooting 对应行处置（EXECUTION_TIMEOUT vs timed out 两形态勿混）"; }
 # v1.3.0 时间预算战役（run22 账本=装完立即 verify 会把同 3 探针冷跑第二遍，浪费 ~240s）：
