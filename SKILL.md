@@ -50,20 +50,29 @@ $ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-It
 
 ### 远端脚本从哪来（三源回退）
 
-`winvm-sshd-oneclick.ps1` 有三个源，宿主侧逐个 HEAD 探测取首个可达，VM 侧按同一顺序循环兜底
-（2026-11-17 起技能源仓已转 **public**，raw 匿名可下，不再依赖单一 release 资产）：
+`winvm-sshd-oneclick.ps1` 有四个源，宿主侧逐个 HEAD 探测取首个可达，VM 侧按同一顺序循环兜底
+（2026-11-17 起技能源仓 GitHub / Gitee **双端 public**，raw 匿名可下，不再依赖单一 release 资产）：
 
-| 序 | 源 | 地址 |
+| 源 | 地址 | 说明 |
 |---|---|---|
-| 1 | Gitee 母项目 release 资产 | `https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` |
-| 2 | GitHub 技能仓 raw @main | `https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1` |
-| 3 | GitHub 母项目 release 资产 | `https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` |
+| Gitee 技能仓 raw @main | `https://gitee.com/athronix/winvm-plugin-deploy/raw/main/scripts/winvm-sshd-oneclick.ps1` | 国内 + **永远最新** |
+| GitHub 技能仓 raw @main | `https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1` | 最新 |
+| Gitee 母项目 release 资产 | `https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` | 与 tag 绑定，**可能滞后** |
+| GitHub 母项目 release 资产 | `https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` | 与 tag 绑定 |
+
+**顺序随意图翻转**（`sshd_script_urls()` 里是显式 if，不是拍脑袋排序）：
+
+- 默认（不锁版本）⇒ 要给**最新**脚本：`gitee raw` → `gh raw` → `gitee release` → `gh release`
+- `RELEASE_TAG=<tag>` 显式锁版本 ⇒ 要给**该 tag 快照**：`gitee release` → `gh release` → `gitee raw` → `gh raw`
+
+> 为什么默认不把 release 资产放第一：实测 V1.4.30 的第 5 资产（148036B）落后脚本一版，
+> 放第一会让人下到旧脚本（无僵尸服务壳修复）。
 
 > 刻意**不用** `raw@<tag>`：母项目 tag 是 `V1.4.x`、技能仓 tag 是 `v2.0.x`，两个命名空间不可混用，
 > 拿母项目 tag 拼技能仓 raw 路径必然 404（2026-11-17 实测）。
 
 - `<tag>` 由脚本现解 `releases/latest`（`RELEASE_TAG` 显式指定则跳过解析）。
-- 给用户的**那一行命令内联全部候选（≤3 个）**：`foreach` 逐个 `Invoke-WebRequest -TimeoutSec 45`，任一成功即继续，
+- 给用户的**那一行命令内联全部候选（≤4 个）**：`foreach` 逐个 `Invoke-WebRequest -TimeoutSec 45`，任一成功即继续，
   全失败才抛 `DOWNLOAD_ALL_FAILED`。VM 的出口网络与宿主不同，单源 404/超时是部署期最常见的卡点。
 - 换源：`SSHD_SCRIPT_URL=<直链>` 永远排第一，其余候选仍作兜底。
 - 至少一源需宿主侧 HEAD=200，否则第 1 步**直接失败**并逐源打印 `[200]/[---]`——它不会假装通道建好了。

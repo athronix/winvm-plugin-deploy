@@ -100,7 +100,7 @@ print_user_command() {
   [ -n "${ALLOW_FROM:-}" ] && allow_arg=" -AllowFrom '$ALLOW_FROM'"
   # 多源：VM 的出口网络与宿主不同，单源 404/超时会把用户直接卡死。
   # 命令内联候选数组逐个 try，失败才抛错；全程只用单引号（经 Git Bash 粘贴不会被吞引号）。
-  local srcs; srcs="$(sshd_script_srcs_ps 3)"
+  local srcs; srcs="$(sshd_script_srcs_ps 4)"
   [ -n "$srcs" ] || srcs="'$url'"
   # irm 备选命令与 -File 路径共用同一候选数组：VM 出口网络与宿主不同，单源失败率高。
   local raw_main="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1"

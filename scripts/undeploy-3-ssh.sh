@@ -91,7 +91,7 @@ if [ "$CH" = "1" ]; then
   SRCS_PS=""
   URL_FOR_VM="$(sshd_script_url || true)"
   if [ -n "$URL_FOR_VM" ] && url_reachable "$URL_FOR_VM"; then
-    SRCS_PS="$(sshd_script_srcs_ps 3)"
+    SRCS_PS="$(sshd_script_srcs_ps 4)"
     echo "  兜底下载源（首个可达）: $URL_FOR_VM（共 $(printf '%s' "$SRCS_PS" | tr ',' '\n' | awk '{n++} END{print n+0}') 个候选）"
   else
     echo "  [WARN] 远端脚本地址不可达，缺文件时将只能给用户手工命令"

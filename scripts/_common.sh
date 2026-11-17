@@ -234,17 +234,29 @@ sshd_script_urls() { # 候选源，每行一个（显式 SSHD_SCRIPT_URL 永远�
   local tag u; tag="$(_sshd_release_tag)"
   local gitee_rel="" gh_rel=""
   local gh_raw_main="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1"
+  # 技能仓 Gitee 镜像（2026-11-17 建）：国内链路比 GitHub raw 稳，且 raw@main 永远是**最新**
+  # ——release 资产可能滞后于脚本（V1.4.30 的第 5 资产就落后了一版）。
+  local gitee_raw_main="https://gitee.com/athronix/winvm-plugin-deploy/raw/main/scripts/winvm-sshd-oneclick.ps1"
   if [ -n "$tag" ]; then
     gitee_rel="https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/$tag/winvm-sshd-oneclick.ps1"
     gh_rel="https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/$tag/winvm-sshd-oneclick.ps1"
   fi
-  # 排序 rationale：gitee release（国内 VM 最快）→ GitHub raw@main（public 后匿名可下）
-  # → GitHub release 资产（与 gitee 同 tag，跨源兜底）。
+  # 排序随「是否显式锁版本」而变，因为两种意图不同：
+  #  · 未锁版本（默认）⇒ 要**最新**脚本：raw@main 优先（release 资产实测会滞后一版，
+  #    V1.4.30 的第 5 资产就落后于脚本；放第一会让人下到旧脚本）。
+  #  · RELEASE_TAG 显式给定 ⇒ 要**该 tag 的快照**：release 资产优先，raw 只作兜底。
+  # 组内顺序固定 gitee → GitHub（国内链路优先）。
   # 刻意**不用** raw@<tag>：母项目 tag 是 V1.4.x、技能仓 tag 是 v2.0.x，两个命名空间不可混用，
   # 拿母项目 tag 拼技能仓 raw 路径必然 404（2026-11-17 实测）。
-  for u in "$gitee_rel" "$gh_raw_main" "$gh_rel"; do
-    [ -n "$u" ] && printf '%s\n' "$u"
-  done
+  if [ -n "${RELEASE_TAG:-}" ]; then
+    for u in "$gitee_rel" "$gh_rel" "$gitee_raw_main" "$gh_raw_main"; do
+      [ -n "$u" ] && printf '%s\n' "$u"
+    done
+  else
+    for u in "$gitee_raw_main" "$gh_raw_main" "$gitee_rel" "$gh_rel"; do
+      [ -n "$u" ] && printf '%s\n' "$u"
+    done
+  fi
 }
 
 sshd_script_url() { # 首个宿主侧可达的候选；全不可达时退回首个候选（调用方自行判 FAIL）
