@@ -80,10 +80,26 @@ if [ "$HFAIL" != "0" ] || [ "${HPASS:-0}" -lt 11 ] || [ "$VMINHOST" != "0" ]; th
 fi
 st_end 0 PASS "HOST_PASS=$HPASS HOST_FAIL=0 VM_PHASE=0"
 
-st_begin 1c "host 端清空复核"
+st_begin 1c "host 端清空复核（含命名空间兜底）"
 _C1=0
 HC3="$(health_code "${WINVM_TUNNEL_LOCAL_PORT:-18443}" 5)"
 [ "$HC3" = "000" ] || { warn "health=$HC3（隧道仍在）"; _C1=1; }
+# 兜底清除「本项目命名空间」的 mcp.json 条目。
+# 为什么需要：uninstall.mjs 的键表按**包版本**固化——V1.4.30 的 GLOBAL_MCP_KEYS 只有
+# winvm / winvm-a2a，装过含上游工具面的新包（winvm-browser / winvm-desktop）后，
+# 用旧包卸载就会留下两条死条目（2026-11-17 真机实测 1c FAIL 的唯一原因）。
+# 技能层是卸载的最终权威，故按 `^winvm$|^winvm-` 兜底，且只动这一族，不碰用户其它条目。
+MCPJ="$HOME/.workbuddy/mcp.json"
+PURGED="$("$NODE" -e '
+const fs = require("fs"), p = process.argv[1];
+try {
+  const j = JSON.parse(fs.readFileSync(p, "utf8"));
+  const s = j.mcpServers || {};
+  const gone = Object.keys(s).filter((k) => /^winvm($|-)/.test(k));
+  if (gone.length) { for (const k of gone) delete s[k]; fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n"); }
+  process.stdout.write(gone.join(","));
+} catch { process.stdout.write(""); }' "$MCPJ" 2>/dev/null)"
+[ -n "$PURGED" ] && warn "卸载器未清的条目已兜底移除: $PURGED"
 LEFT="$("$NODE" -e 'try{const j=require(process.env.HOME+"/.workbuddy/mcp.json");const k=Object.keys(j.mcpServers||{}).filter(x=>/winvm/i.test(x));process.stdout.write(k.join(","))}catch{process.stdout.write("")}' 2>/dev/null)"
 [ -z "$LEFT" ] && echo "  mcp.json 无 winvm 条目" || { warn "mcp.json 仍留 $LEFT"; _C1=1; }
 st_end $_C1 "$([ $_C1 -eq 0 ] && echo PASS || echo FAIL)" "health=$HC3 mcp_left=${LEFT:-none}"

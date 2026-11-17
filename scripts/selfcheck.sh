@@ -652,6 +652,11 @@ def c_upstream_contract(root):
     uns = strip_comments(read(os.path.join(root, 'scripts', 'undeploy.sh')))
     if '--keep-upstreams' not in uns:
         bad.append('undeploy.sh 未暴露 --keep-upstreams')
+    # 旧包卸载新装的插件会留下 winvm-browser / winvm-desktop（卸载器键表按包版本固化）。
+    # 技能层必须有「本项目命名空间」兜底，否则 1c 必 FAIL 且用户要手工编辑 mcp.json。
+    un1 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-1-host.sh')))
+    if '^winvm($|-)' not in un1:
+        bad.append('undeploy-1 缺 mcp.json 命名空间兜底（旧包卸载会留 winvm-browser/winvm-desktop）')
     return bad
 
 
@@ -769,6 +774,9 @@ MUTATIONS = [
     # 装没装、通不通全测不出来 ⇒ 必须被断言抓到。
     ('M24 上游判据退化为常量', 'scripts/_common.sh',
      'b="$(upstream_tools browser)"; d="$(upstream_tools desktop)"', 'b=33; d=10'),
+    # 命名空间兜底退化成精确单键：旧包卸载新包仍会留下 winvm-browser/winvm-desktop 死条目。
+    ('M25 mcp 兜底退化为单键', 'scripts/undeploy-1-host.sh',
+     'filter((k) => /^winvm($|-)/.test(k))', "filter((k) => k === 'winvm')"),
 ]
 
 
