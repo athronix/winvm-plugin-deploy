@@ -311,6 +311,17 @@ def c_oneclick(root):
     # 相对路径 .\winvm-sshd-oneclick.ps1 在非同一 cwd 下必然找不到 ⇒ 提示必须用绝对路径
     if re.search(r'-File \.\\winvm-sshd-oneclick\.ps1', body):
         bad.append('尾部提示仍用相对路径 .\\winvm-sshd-oneclick.ps1（换个 cwd 就失效）')
+    # MSI 缓存（v2.0.3）：卸载→重建会反复下载同一个 OpenSSH MSI（真机 2.9s~60.2s 波动），
+    # 是阶段 2 唯一的分钟级单点。缓存必须**真接进下载前判据**，否则等于白写。
+    for fn in ('function Restore-MsiCache', 'function Save-MsiCache'):
+        if fn not in body:
+            bad.append('缺 %s（重建通道会重复下载 MSI）' % fn)
+    if '$cacheHit = Restore-MsiCache -Cache $cacheMsi -Dest $MsiFile' not in body:
+        bad.append('MSI 缓存未接进下载前判据（cacheHit 恒 false）')
+    if '$NoMsiCache' not in body:
+        bad.append('缺 -NoMsiCache 逃生开关')
+    if "'cache\\OpenSSH-Win64.msi'" not in body:
+        bad.append('MSI 缓存路径不在 InstallDir\\cache 下（-Rollback 后应仍在）')
     return bad
 
 
@@ -408,7 +419,7 @@ def c_rollback_path(root):
     if not fm:
         bad.append('_common.sh 找不到 sshd_script_url()')
     else:
-        # tag 解析已拆到 _sshd_release_tag()：兜底查找按整个文件判，不绑单个函数。
+        # python3 兜底查找按整个文件判（need_py 里就有），不绑单个函数。
         if 'command -v python3' not in cm:
             bad.append('_common.sh 缺 python3 兜底查找（无 PY 时 URL 解析静默失败）')
     # 裸用 $PY 的检查必须覆盖整个文件：tar 解析拆函数后单看 sshd_script_url 会漏（M10 假绿实证）。
@@ -456,6 +467,12 @@ def c_multi_source(root):
             bad.append('_common.sh 缺 %s' % fn)
     if 'raw.githubusercontent.com' not in cm:
         bad.append('_common.sh 候选链缺 GitHub raw（public 后该源最稳）')
+    # 两仓彻底解耦（2026-11-17 用户裁定）：oneclick 只从技能仓取。
+    # 母项目 release 资产既造成跨仓耦合，又有「资产滞后于脚本」的实测陷阱。
+    if 'workbuddy-virtual-win-plugin' in cm:
+        bad.append('_common.sh 的 oneclick 候选链仍指向母项目 release（技能仓已 public，应只从技能仓取）')
+    if 'releases/latest' in cm:
+        bad.append('_common.sh 仍在解母项目 releases/latest（public 后不需要，且多一个网络单点）')
     m = re.search(r'sshd_script_url\(\)\s*\{(.*?)\n\}', cm, re.S)
     body = m.group(1) if m else ''
     if 'while IFS= read -r u' not in body:
@@ -520,6 +537,27 @@ def c_backend_default(root):
     return bad
 
 
+def c_output_hygiene(root):
+    """输出层两个真实误判（2026-11-17 真机实测）：
+
+    a) 第 1 步打印完命令后 rc=2 —— 那是「等用户去 VM 粘贴」，被汇总成 DEPLOY=FAIL 会
+       让人以为部署失败，实际是正常中间态；
+    b) 步脚本与编排层都调 steps_report ⇒ 同一张计时表打印 2~3 遍，把真正的判据行挤走。
+    """
+    bad = []
+    d = strip_comments(read(os.path.join(root, 'scripts', 'deploy.sh')))
+    if 'DEPLOY=NEED_USER_ACTION' not in d:
+        bad.append('deploy.sh 未把 rc=2 标成 NEED_USER_ACTION（会被误读为部署失败）')
+    cm = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    if 'VMDEPLOY_STEPS_QUIET' not in cm:
+        bad.append('steps_report 未支持编排期静音（计时表会重复打印）')
+    for f in ('deploy.sh', 'undeploy.sh'):
+        t = strip_comments(read(os.path.join(root, 'scripts', f)))
+        if 'export VMDEPLOY_STEPS_QUIET=1' not in t:
+            bad.append('%s 未置 VMDEPLOY_STEPS_QUIET=1（子脚本会再打一遍计时表）' % f)
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -529,7 +567,7 @@ CHECKS = [
     ('vmcheck-assert', c_vmcheck_assert),
     ('health-code', c_health_code), ('rollback-path', c_rollback_path),
     ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
-    ('backend-default', c_backend_default),
+    ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
 ]
 
 
@@ -578,6 +616,17 @@ MUTATIONS = [
     ('M17 irm 自落盘写错位置', 'scripts/winvm-sshd-oneclick.ps1',
      '-OutFile $script:SelfPathFinal -TimeoutSec $tmo',
      '-OutFile (Join-Path $env:TEMP \'wb-self.ps1\') -TimeoutSec $tmo'),
+    # MSI 缓存被短路：判据恒 false ⇒ 缓存白写，重建仍要下载。
+    ('M20 MSI 缓存被短路', 'scripts/winvm-sshd-oneclick.ps1',
+     'if (-not $NoMsiCache) { $cacheHit = Restore-MsiCache -Cache $cacheMsi -Dest $MsiFile }',
+     'if ($false) { $cacheHit = $false }'),
+    # 两仓解耦：把母项目 release 源塞回候选链 ⇒ 必须被 multi-source 抓到。
+    ('M19 oneclick 回退到母项目源', 'scripts/_common.sh',
+     'for u in "$gitee_raw" "$gh_raw"; do',
+     'for u in "$gitee_raw" "https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/V1.4.30/winvm-sshd-oneclick.ps1"; do'),
+    # rc=2（等用户粘贴）被标成 FAIL：真机上极易被当成部署失败去排障。
+    ('M18 rc=2 误标为 FAIL', 'scripts/deploy.sh',
+     'echo "DEPLOY=NEED_USER_ACTION rc=2', 'echo "DEPLOY=FAIL rc=2'),
     # undeploy 1c 假 FAIL 的真因：curl 自带 000 + `|| echo 000` ⇒ "000000"。
     ('M8 health_code 双值回归', 'scripts/_common.sh',
      "*) printf '000' ;;", "*) printf '000'; printf '000' ;;"),
@@ -586,7 +635,7 @@ MUTATIONS = [
      'Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $rb',
      "Write-Output 'SKIP_DOWNLOAD'"),
     # 步脚本可单独重跑 ⇒ 公共函数不许依赖调用方的 PY 初始化。
-    ('M10 公共函数裸用 $PY', 'scripts/_common.sh', 'py="${PY:-}"', 'py="$PY"'),
+    ('M10 公共函数裸用 $PY', 'scripts/_common.sh', 'for p in "${PY:-}"', 'for p in "$PY"'),
     # -AllowFrom 默认成 VM 自身 IP ⇒ 防火墙白名单把宿主挡死（真机实测超时）。
     ('M11 AllowFrom 默认 VM 自身IP', 'scripts/deploy-1-ssh.sh',
      'ALLOW_FROM="${VM_ALLOW_FROM:-}"', 'ALLOW_FROM="${VM_ALLOW_FROM:-$VM_HOST}"'),

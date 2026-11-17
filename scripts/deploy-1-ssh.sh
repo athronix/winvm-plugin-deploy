@@ -118,7 +118,8 @@ print_user_command() {
 \$ErrorActionPreference='Stop';\$src=@($srcs);\$s=\$null;foreach(\$x in \$src){try{\$s=Invoke-RestMethod -UseBasicParsing -Uri \$x -TimeoutSec 45;if(\$s){break}}catch{}};if(-not \$s){throw 'DOWNLOAD_ALL_FAILED'};&([scriptblock]::Create(\$s)) -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT -SelfUrl \$src$allow_arg
 ══════════════════════════════════════════════════════════════
 EOF
-  echo "脚本来源（按序尝试，最多 3 个）:"
+  local nsrc; nsrc="$(printf '%s' "$srcs" | awk -F',' '{print NF}')"
+  echo "脚本来源（按序尝试，共 $nsrc 个）:"
   printf '%s\n' "$srcs" | tr ',' '\n' | sed "s/^/  /;s/'//g"
   echo "公钥指纹: $(ssh-keygen -lf "$KEY.pub" 2>/dev/null || echo '(不可用)')"
   echo "NEED_USER_ACTION=1"

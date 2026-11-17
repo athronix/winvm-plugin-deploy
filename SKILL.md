@@ -1,6 +1,6 @@
 ---
 name: winvm-plugin-deploy
-description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端并起 mcp/a2a ⑤verify）+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务卸 VM 模块 ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本三源回退：gitee release / GitHub raw@main / GitHub release，脚本就近留存在 VM，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验。"
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端并起 mcp/a2a ⑤verify）+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务卸 VM 模块 ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身、irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验。"
 version: 2.0.3
 agent_created: true
 ---
@@ -48,34 +48,25 @@ $ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-It
 - 用户粘完 → **重跑同一条 deploy 命令**：1a 判到 READY 就跳过 1b~1d，直接往下走。已完成的步骤全部幂等。
 - `CHANNEL_WAIT_S=600` 可让第 1 步原地等用户粘贴（默认 0 = 打印完就退出，让命令露在前台）。
 
-### 远端脚本从哪来（三源回退）
+### 远端脚本从哪来（只从技能仓取，双源回退）
 
-`winvm-sshd-oneclick.ps1` 有四个源，宿主侧逐个 HEAD 探测取首个可达，VM 侧按同一顺序循环兜底
-（2026-11-17 起技能源仓 GitHub / Gitee **双端 public**，raw 匿名可下，不再依赖单一 release 资产）：
+`winvm-sshd-oneclick.ps1` **只从技能仓取**，不再从母项目 release 资产取——技能仓 GitHub / Gitee
+双端 public，raw 匿名可下，两仓彻底解耦（2026-11-17 用户裁定）。宿主侧逐个 HEAD 探测取首个可达，
+VM 侧按同一顺序循环兜底：
 
-| 源 | 地址 | 说明 |
-|---|---|---|
-| Gitee 技能仓 raw @main | `https://gitee.com/athronix/winvm-plugin-deploy/raw/main/scripts/winvm-sshd-oneclick.ps1` | 国内 + **永远最新** |
-| GitHub 技能仓 raw @main | `https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1` | 最新 |
-| Gitee 母项目 release 资产 | `https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` | 与 tag 绑定，**可能滞后** |
-| GitHub 母项目 release 资产 | `https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` | 与 tag 绑定 |
+| 源 | 地址 |
+|---|---|
+| Gitee 技能仓 raw | `https://gitee.com/athronix/winvm-plugin-deploy/raw/<ref>/scripts/winvm-sshd-oneclick.ps1` |
+| GitHub 技能仓 raw | `https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/<ref>/scripts/winvm-sshd-oneclick.ps1` |
 
-**顺序随意图翻转**（`sshd_script_urls()` 里是显式 if，不是拍脑袋排序）：
-
-- 默认（不锁版本）⇒ 要给**最新**脚本：`gitee raw` → `gh raw` → `gitee release` → `gh release`
-- `RELEASE_TAG=<tag>` 显式锁版本 ⇒ 要给**该 tag 快照**：`gitee release` → `gh release` → `gitee raw` → `gh raw`
-
-> 为什么默认不把 release 资产放第一：实测 V1.4.30 的第 5 资产（148036B）落后脚本一版，
-> 放第一会让人下到旧脚本（无僵尸服务壳修复）。
-
-> 刻意**不用** `raw@<tag>`：母项目 tag 是 `V1.4.x`、技能仓 tag 是 `v2.0.x`，两个命名空间不可混用，
-> 拿母项目 tag 拼技能仓 raw 路径必然 404（2026-11-17 实测）。
-
-- `<tag>` 由脚本现解 `releases/latest`（`RELEASE_TAG` 显式指定则跳过解析）。
-- 给用户的**那一行命令内联全部候选（≤4 个）**：`foreach` 逐个 `Invoke-WebRequest -TimeoutSec 45`，任一成功即继续，
+- `<ref>` 默认 `main`（永远最新）；要锁脚本版本用 `SSHD_SCRIPT_REF=v2.0.3`（技能仓 tag 命名空间）。
+- 换整条链：`SSHD_SCRIPT_URL=<直链>` 永远排第一，其余候选仍作兜底。
+- 给用户的**那一行命令内联全部候选**：`foreach` 逐个 `Invoke-WebRequest -TimeoutSec 45`，任一成功即继续，
   全失败才抛 `DOWNLOAD_ALL_FAILED`。VM 的出口网络与宿主不同，单源 404/超时是部署期最常见的卡点。
-- 换源：`SSHD_SCRIPT_URL=<直链>` 永远排第一，其余候选仍作兜底。
 - 至少一源需宿主侧 HEAD=200，否则第 1 步**直接失败**并逐源打印 `[200]/[---]`——它不会假装通道建好了。
+- 全链路**不需要任何 token**：两个仓都是 public，Gitee API 也不再被调用（不再解 `releases/latest`）。
+
+> `RELEASE_TAG` 只影响**第 2 步取发布包**（母项目 release 的 zip），与 oneclick 无关。
 
 ## 卸载 = 3 步
 
@@ -128,7 +119,7 @@ VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计�
 | `undeploy-1-host.sh` | 停隧道 + host-only 卸载（把 VM 目标三处屏蔽干净，防重复/挂死） |
 | `undeploy-2-vm.sh` | VM 端停服务 + 删模块 + 五点终态 |
 | `undeploy-3-ssh.sh` | 拆通道（SYSTEM post 动作 / 用户命令）+ 宿主侧精确回滚 |
-| `winvm-sshd-oneclick.ps1` | **VM 侧单脚本**：建通道 / `-Rollback` 逆序还原 / `-Continue` 只读体检；自留存量到 `C:\ProgramData\WinVMDeploy`（`-File` 复制自身，`irm\|iex` 自下载落盘） |
+| `winvm-sshd-oneclick.ps1` | **VM 侧单脚本**：建通道 / `-Rollback` 逆序还原 / `-Continue` 只读体检；自留存量到 `C:\ProgramData\WinVMDeploy`（`-File` 复制自身，`irm\|iex` 自下载落盘）；OpenSSH MSI 缓存在 `WinVMDeploy\cache\`，重建通道直接复用（`-NoMsiCache` 强制重下） |
 | `_common.sh` | 地基：日志、`st_begin/st_end` 计时、状态文件、参数解析、依赖冒烟、`channel_ready`/`health_code` |
 | `vm-conn.sh` / `ssh2-conn.mjs` / `ps-run.sh` | 双后端（默认 ssh2）、ssh2 实体、远端 PS 执行器 |
 | `pkg-root.sh` / `download-verify.sh` / `env-detect.sh` | 包根单一事实源、取包三件套、运行时探测 |

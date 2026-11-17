@@ -106,7 +106,8 @@ param(
   [string]$InstallDir = (Join-Path $env:ProgramData 'WinVMDeploy'),  # 本脚本自留目录（卸载时 -Rollback 的固定路径）
   [switch]$NoSelfStage,                 # 跳过"把自己复制到 InstallDir"（自检/测试用）
   [string[]]$SelfUrl = @(),             # irm|iex 模式的自落盘源（可多个，按序回退）；缺省用技能仓 raw@main
-  [switch]$NoSelfFetch                  # irm|iex 模式下禁止联网自下载（离线/纯演练用）
+  [switch]$NoSelfFetch,                 # irm|iex 模式下禁止联网自下载（离线/纯演练用）
+  [switch]$NoMsiCache                   # 不用 OpenSSH MSI 缓存（强制重新下载；排障用）
 )
 
 $SCRIPT_VERSION = '2.4.0'
@@ -1926,6 +1927,37 @@ function Install-MsiFile {
   return $msiLog
 }
 
+# ── MSI 缓存（2026-11-17）───────────────────────────────────────────────
+# 卸载→重建通道会反复下载同一个 OpenSSH MSI；同一镜像实测 2.9s ~ 60.2s 波动，
+# 是「阶段 2 安装 OpenSSH Server」唯一的分钟级单点（真机：60.2s 下载 / 8.1s 安装）。
+# 缓存放 InstallDir\cache\（-Rollback 不删该目录），重建时本地复制 <1s。
+function Restore-MsiCache {
+  param([string]$Cache, [string]$Dest)
+  try {
+    if (-not (Test-Path -LiteralPath $Cache)) { return $false }
+    if ((Get-Item -LiteralPath $Cache).Length -le 1MB) { return $false }
+    $fs = [System.IO.File]::OpenRead($Cache)
+    try {
+      $buf = New-Object byte[] 4
+      $null = $fs.Read($buf, 0, 4)
+      $hex = ($buf | ForEach-Object { $_.ToString('X2') }) -join ''
+    } finally { $fs.Close() }
+    if ($hex -ne 'D0CF11E0') { return $false }
+    Copy-Item -LiteralPath $Cache -Destination $Dest -Force
+    return $true
+  } catch { return $false }
+}
+
+function Save-MsiCache {
+  param([string]$Source, [string]$Cache)
+  try {
+    if (-not (Test-Path -LiteralPath $Source)) { return $false }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Cache) | Out-Null
+    Copy-Item -LiteralPath $Source -Destination $Cache -Force
+    return $true
+  } catch { return $false }
+}
+
 function Install-ViaMsi {
   param([string]$LocalMsi)
   $MAGIC = 'D0CF11E0'   # OLE 复合文档头（.msi 必有）
@@ -1937,58 +1969,69 @@ function Install-ViaMsi {
     Info ("使用本地 msi：{0}" -f $MsiFile)
   } else {
     $MsiFile = Join-Path $env:TEMP 'OpenSSH-Win64.msi'
-    $cands = @(Get-MsiUrlCandidates)
-    Info ("候选下载地址 {0} 个（GitHub 直连 + 4 个加速镜像 × 4 个版本 tag）" -f $cands.Count)
-
-    # 先做快速 HEAD 探测（8s），避免在不通的镜像上死等
-    $pick = ''
-    foreach ($u in $cands) {
-      Detail ("探测：{0}" -f $u)
-      if (Test-UrlReachable -Url $u) { $pick = $u; Ok ("可用源：{0}" -f $u); break }
-      Detail '  不可用，换下一个'
-    }
-    if (-not $pick) {
-      Warn 'HEAD 探测全部不可用，改为依次直连下载；再不行就查 GitHub API'
-      foreach ($u in $cands) {
-        try { Save-FileFromUrl -Url $u -OutFile $MsiFile -Magic $MAGIC | Out-Null; $pick = $u; break }
-        catch { Warn ("失败：{0}" -f ($_.Exception.Message -split "`n")[0]) }
-      }
+    $cacheMsi = Join-Path $InstallDir 'cache\OpenSSH-Win64.msi'
+    $cacheHit = $false
+    if (-not $NoMsiCache) { $cacheHit = Restore-MsiCache -Cache $cacheMsi -Dest $MsiFile }
+    if ($cacheHit) {
+      Ok ("命中 MSI 缓存：{0}（跳过下载，实测可省 3~60s）" -f $cacheMsi)
+      $script:MsiSourceUrl = 'cache'
     } else {
-      try { Save-FileFromUrl -Url $pick -OutFile $MsiFile -Magic $MAGIC | Out-Null }
-      catch {
-        Warn ("选定源下载失败：{0}；改为查 GitHub API" -f ($_.Exception.Message -split "`n")[0])
-        $pick = ''
-      }
-    }
+      $cands = @(Get-MsiUrlCandidates)
+      Info ("候选下载地址 {0} 个（GitHub 直连 + 4 个加速镜像 × 4 个版本 tag）" -f $cands.Count)
 
-    if (-not $pick) {
-      try {
-        Info '查询 GitHub API 拿最新 release 的 Win64 msi 真实地址 ...'
-        $api = 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases'
-        $ia = @{ Uri = $api; Headers = @{ 'User-Agent' = 'wb-tunnel' }; TimeoutSec = 30; ErrorAction = 'Stop' }
-        if ($script:ProxyUrl) { $ia['Proxy'] = $script:ProxyUrl }
-        $rels = Invoke-RestMethod @ia
-        $url = ''
-        foreach ($rel in $rels) {
-          foreach ($a in $rel.assets) {
-            if ($a.name -match '(?i)^OpenSSH-Win64-.*\.msi$') { $url = $a.browser_download_url; break }
+      # 先做快速 HEAD 探测（8s），避免在不通的镜像上死等
+      $pick = ''
+      foreach ($u in $cands) {
+        Detail ("探测：{0}" -f $u)
+        if (Test-UrlReachable -Url $u) { $pick = $u; Ok ("可用源：{0}" -f $u); break }
+        Detail '  不可用，换下一个'
+      }
+      if (-not $pick) {
+        Warn 'HEAD 探测全部不可用，改为依次直连下载；再不行就查 GitHub API'
+        foreach ($u in $cands) {
+          try { Save-FileFromUrl -Url $u -OutFile $MsiFile -Magic $MAGIC | Out-Null; $pick = $u; break }
+          catch { Warn ("失败：{0}" -f ($_.Exception.Message -split "`n")[0]) }
+        }
+      } else {
+        try { Save-FileFromUrl -Url $pick -OutFile $MsiFile -Magic $MAGIC | Out-Null }
+        catch {
+          Warn ("选定源下载失败：{0}；改为查 GitHub API" -f ($_.Exception.Message -split "`n")[0])
+          $pick = ''
+        }
+      }
+
+      if (-not $pick) {
+        try {
+          Info '查询 GitHub API 拿最新 release 的 Win64 msi 真实地址 ...'
+          $api = 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases'
+          $ia = @{ Uri = $api; Headers = @{ 'User-Agent' = 'wb-tunnel' }; TimeoutSec = 30; ErrorAction = 'Stop' }
+          if ($script:ProxyUrl) { $ia['Proxy'] = $script:ProxyUrl }
+          $rels = Invoke-RestMethod @ia
+          $url = ''
+          foreach ($rel in $rels) {
+            foreach ($a in $rel.assets) {
+              if ($a.name -match '(?i)^OpenSSH-Win64-.*\.msi$') { $url = $a.browser_download_url; break }
+            }
+            if ($url) { break }
           }
-          if ($url) { break }
+          if ($url) {
+            Ok ("API 给出地址：{0}" -f $url)
+            Save-FileFromUrl -Url $url -OutFile $MsiFile -Magic $MAGIC | Out-Null
+            $pick = $url
+          }
+        } catch {
+          Warn ("GitHub API 也不可用：{0}" -f ($_.Exception.Message -split "`n")[0])
         }
-        if ($url) {
-          Ok ("API 给出地址：{0}" -f $url)
-          Save-FileFromUrl -Url $url -OutFile $MsiFile -Magic $MAGIC | Out-Null
-          $pick = $url
-        }
-      } catch {
-        Warn ("GitHub API 也不可用：{0}" -f ($_.Exception.Message -split "`n")[0])
+      }
+
+      if (-not $pick) {
+        throw ("所有下载源都失败。请在能上网的机器下载 OpenSSH-Win64-v10.4.0.0.msi，拷到 VM 后用 -MsiPath 指定路径重跑；或用 -InstallMethod Zip。下载页：https://github.com/PowerShell/Win32-OpenSSH/releases")
+      }
+      $script:MsiSourceUrl = $pick
+      if (-not $NoMsiCache) {
+        if (Save-MsiCache -Source $MsiFile -Cache $cacheMsi) { Detail ("MSI 已缓存：{0}" -f $cacheMsi) }
       }
     }
-
-    if (-not $pick) {
-      throw ("所有下载源都失败。请在能上网的机器下载 OpenSSH-Win64-v10.4.0.0.msi，拷到 VM 后用 -MsiPath 指定路径重跑；或用 -InstallMethod Zip。下载页：https://github.com/PowerShell/Win32-OpenSSH/releases")
-    }
-    $script:MsiSourceUrl = $pick
   }
 
   $script:MsiUsed = $MsiFile

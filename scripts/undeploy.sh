@@ -59,6 +59,7 @@ run_step() {
 }
 
 RC=0; PENDING=0
+export VMDEPLOY_STEPS_QUIET=1   # 子脚本不再各打一遍计时表
 if [ -n "$ONLY" ]; then
   log "━━━ 只跑第 $ONLY 步 ━━━"
   run_step "$ONLY"; RC=$?
@@ -85,7 +86,7 @@ else
   }
 fi
 
-steps_report
+VMDEPLOY_STEPS_QUIET=0 steps_report
 echo
 if [ $RC -ne 0 ]; then
   echo "UNDEPLOY=FAIL rc=$RC  日志 $LOGD"

@@ -71,6 +71,7 @@ stage() { # stage <name> <n1> [n2]
 }
 
 RC=0
+export VMDEPLOY_STEPS_QUIET=1   # 子脚本不再各打一遍计时表
 if [ -n "$ONLY" ]; then
   run_step "$ONLY"; RC=$?
 else
@@ -84,15 +85,15 @@ else
       echo "    · VM 恢复/重建后 authorized_keys 会丢，通道必须重建"
       echo "    · 做完后【重跑同一条命令】即可，已完成的步骤不会重复做"
       echo "════════════════════════════════════════════════════════════"
-      steps_report
+      VMDEPLOY_STEPS_QUIET=0 steps_report
       exit 2
     fi
-    [ $RC -ne 0 ] && { err "阶段 A 失败（rc=$RC）"; steps_report; exit $RC; }
+    [ $RC -ne 0 ] && { err "阶段 A 失败（rc=$RC）"; VMDEPLOY_STEPS_QUIET=0 steps_report; exit $RC; }
   fi
   if [ "$FROM" -le 4 ]; then
     if [ "$FROM" -le 3 ]; then stage "B（第 3‖4 步）" 3 4; else stage "B（第 4 步）" 4; fi
     RC=$?
-    [ $RC -ne 0 ] && { err "阶段 B 失败（rc=$RC）"; steps_report; exit $RC; }
+    [ $RC -ne 0 ] && { err "阶段 B 失败（rc=$RC）"; VMDEPLOY_STEPS_QUIET=0 steps_report; exit $RC; }
   fi
   if [ "$FROM" -le 5 ]; then
     stage "C（第 5 步 verify）" 5
@@ -105,11 +106,15 @@ STAMP="${VMDEPLOY_PROBE_STAMP:-$HOME/wbtmp/winvm-probes-stamp.txt}"
 if [ $RC -eq 0 ] && [ -f "$STAMP" ]; then
   "$NODE" -e 'const fs=require("fs"),p=process.argv[1];let s=fs.readFileSync(p,"utf8");s=s.replace(/^deploy_ok=.*$/m,"deploy_ok=1");if(!/^deploy_ok=/m.test(s))s+="deploy_ok=1\n";fs.writeFileSync(p,s)' "$STAMP" 2>/dev/null || true
 fi
-steps_report
+VMDEPLOY_STEPS_QUIET=0 steps_report
 echo
 if [ $RC -eq 0 ]; then
   echo "DEPLOY=PASS  (host: 插件+连接器+skills · tunnel: health=200 · VM: mcp+a2a · verify: 通过)"
   echo "ALL_DONE=1  RUN_DIR=$VMDEPLOY_RUN_DIR"
+elif [ $RC -eq 2 ]; then
+  # rc=2 = 需要用户去 VM 粘那条命令（第 1 步的唯一人工步骤），**不是失败**。
+  echo "DEPLOY=NEED_USER_ACTION rc=2  第 1 步已打印 VM 侧命令；粘贴完【重跑同一条命令】（已完成步骤幂等）"
+  echo "ALL_DONE=0  RUN_DIR=${VMDEPLOY_RUN_DIR:-$LOGD}"
 else
   echo "DEPLOY=FAIL rc=$RC  失败段日志见 $LOGD"
 fi

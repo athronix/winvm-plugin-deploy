@@ -152,6 +152,9 @@ st_end() { # st_end <rc> <PASS|FAIL|SKIP|WAIT_USER> <judgment> [advice]
 
 steps_report() {
   [ -f "$STEPS_TSV" ] || return 0
+  # 编排层（deploy.sh/undeploy.sh）会在最后统一打印；步脚本也会调一次（单独重跑时有用），
+  # 两者同时生效 ⇒ 同一张表打印 2~3 遍（2026-11-17 实测）。编排期由它置 1 静音子进程。
+  [ "${VMDEPLOY_STEPS_QUIET:-0}" = "1" ] && return 0
   echo
   echo "== 分步计时 =="
   awk -F'\t' 'NR>1{printf "  %-10s %-42s %4ss  %s\n",$1,substr($2,1,42),$4,$3}' "$STEPS_TSV"
@@ -210,53 +213,33 @@ tunnel_alive() { # → 0=daemon 存活 1=不在
 user_home_file() { printf '%s/%s' "$HOME" "$1"; }
 
 # ── 远端 oneclick 脚本地址（deploy 第 1 步与 undeploy 第 3 步共用，单一事实源）──
-# 2026-11-17：技能源仓转 **public**（athronix/winvm-plugin-deploy），raw 匿名可下 ⇒
-# 从「单一 gitee release 资产」升级为**多源候选链**，宿主侧逐个 HEAD 探测，VM 侧循环下载。
-# 「资源难以下载」是部署链最典型的止血点：VM 的出口网络与宿主不同，单源失败=用户卡死。
+# 2026-11-17 用户裁定：**only from 技能仓**。技能仓 GitHub / Gitee 双端 public，raw 匿名可下，
+# 所以 oneclick 不再从母项目 release 资产取——那既是跨仓耦合，也是「资产滞后于脚本」的陷阱。
+# 「资源难以下载」仍是部署链最典型的止血点：VM 的出口网络与宿主不同，故保留两源循环。
 # 本组函数必须自给自足——步脚本可单独重跑，调用方未必跑过 need_py，
 # 所以不许裸用 $PY（set -u 下会 unbound variable，静默把 URL 判成不可达）。
-_sshd_release_tag() { # 母项目最新 release tag（RELEASE_TAG 显式优先）
-  [ -n "${RELEASE_TAG:-}" ] && { printf '%s' "$RELEASE_TAG"; return 0; }
-  local py="${PY:-}" raw="" tag=""
-  [ -n "$py" ] || py="$(command -v python3 2>/dev/null || true)"
-  raw="$(curl -fsSL --connect-timeout 10 --max-time 25 \
-    "https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest" 2>/dev/null)"
-  if [ -n "$py" ]; then
-    tag="$(printf '%s' "$raw" | "$py" -c 'import sys,json;print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
-  fi
-  # python 不可用时退回文本解析（同一 JSON 的 tag_name 字段）
-  [ -n "$tag" ] || tag="$(printf '%s' "$raw" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
-  printf '%s' "$tag"
-}
-
+# 锁版本：SSHD_SCRIPT_REF=<技能仓 tag/分支>（默认 main）；整链替换：SSHD_SCRIPT_URL=<直链>。
 sshd_script_urls() { # 候选源，每行一个（显式 SSHD_SCRIPT_URL 永远排第一）
   [ -n "${SSHD_SCRIPT_URL:-}" ] && printf '%s\n' "$SSHD_SCRIPT_URL"
-  local tag u; tag="$(_sshd_release_tag)"
-  local gitee_rel="" gh_rel=""
-  local gh_raw_main="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1"
-  # 技能仓 Gitee 镜像（2026-11-17 建）：国内链路比 GitHub raw 稳，且 raw@main 永远是**最新**
-  # ——release 资产可能滞后于脚本（V1.4.30 的第 5 资产就落后了一版）。
-  local gitee_raw_main="https://gitee.com/athronix/winvm-plugin-deploy/raw/main/scripts/winvm-sshd-oneclick.ps1"
-  if [ -n "$tag" ]; then
-    gitee_rel="https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/$tag/winvm-sshd-oneclick.ps1"
-    gh_rel="https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/$tag/winvm-sshd-oneclick.ps1"
-  fi
-  # 排序随「是否显式锁版本」而变，因为两种意图不同：
-  #  · 未锁版本（默认）⇒ 要**最新**脚本：raw@main 优先（release 资产实测会滞后一版，
-  #    V1.4.30 的第 5 资产就落后于脚本；放第一会让人下到旧脚本）。
-  #  · RELEASE_TAG 显式给定 ⇒ 要**该 tag 的快照**：release 资产优先，raw 只作兜底。
-  # 组内顺序固定 gitee → GitHub（国内链路优先）。
-  # 刻意**不用** raw@<tag>：母项目 tag 是 V1.4.x、技能仓 tag 是 v2.0.x，两个命名空间不可混用，
-  # 拿母项目 tag 拼技能仓 raw 路径必然 404（2026-11-17 实测）。
-  if [ -n "${RELEASE_TAG:-}" ]; then
-    for u in "$gitee_rel" "$gh_rel" "$gitee_raw_main" "$gh_raw_main"; do
-      [ -n "$u" ] && printf '%s\n' "$u"
-    done
-  else
-    for u in "$gitee_raw_main" "$gh_raw_main" "$gitee_rel" "$gh_rel"; do
-      [ -n "$u" ] && printf '%s\n' "$u"
-    done
-  fi
+  local ref="${SSHD_SCRIPT_REF:-main}" u
+  # 顺序：Gitee（国内链路稳、匿名 200 实测）→ GitHub（同仓同 ref，跨网兜底）。
+  local gitee_raw="https://gitee.com/athronix/winvm-plugin-deploy/raw/$ref/scripts/winvm-sshd-oneclick.ps1"
+  local gh_raw="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/$ref/scripts/winvm-sshd-oneclick.ps1"
+  for u in "$gitee_raw" "$gh_raw"; do
+    [ -n "$u" ] && printf '%s\n' "$u"
+  done
+}
+
+sshd_script_srcs_ps() { # 前 N 个候选拼成 PowerShell 数组元素（'u1','u2'），供 VM 侧多源循环
+  local n="${1:-3}" u out="" i=0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    i=$((i + 1)); [ "$i" -gt "$n" ] && break
+    out="$out${out:+,}'$u'"
+  done <<EOF
+$(sshd_script_urls)
+EOF
+  printf '%s' "$out"
 }
 
 sshd_script_url() { # 首个宿主侧可达的候选；全不可达时退回首个候选（调用方自行判 FAIL）
@@ -270,18 +253,6 @@ $(sshd_script_urls)
 EOF
   [ -n "$first" ] || return 1
   printf '%s' "$first"
-}
-
-sshd_script_srcs_ps() { # 前 N 个候选拼成 PowerShell 数组元素（'u1','u2'），供 VM 侧多源循环
-  local n="${1:-3}" u out="" i=0
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
-    i=$((i + 1)); [ "$i" -gt "$n" ] && break
-    out="$out${out:+,}'$u'"
-  done <<EOF
-$(sshd_script_urls)
-EOF
-  printf '%s' "$out"
 }
 
 url_reachable() { # url_reachable <url> → 200 才算可用（探测窗短，多源串行不拖时间）
