@@ -25,7 +25,10 @@ PKG="$(grep -E '^PKG_ROOT=' "$DV" | tail -1 | cut -d= -f2-)"
   tail -12 "$DV"; st_end 1 FAIL "无 PKG_ROOT 输出"
   die "包根未确定" "download-verify 未输出合法包根" "$DV" "检查 DEPLOY_ROOT=$DEPLOY_ROOT 与缓存"
 }
-VER="$(awk -F= '/^version=/{print $2;exit}' "$PKG/MANIFEST.txt" 2>/dev/null)"
+# MANIFEST.txt 的版本行是 `version: V1.4.30`（**冒号**分隔，母项目 pack-release.mjs 产出），
+# 旧代码按 `^version=`（等号）解析 ⇒ 恒取不到 ⇒ 日志与 state 里版本永远是 unknown
+# （2026-11-17 真机实测：包其实是 V1.4.30）。冒号/等号都吃，兼容历史包。
+VER="$(sed -n 's/^version[[:space:]]*[:=][[:space:]]*//p' "$PKG/MANIFEST.txt" 2>/dev/null | head -1 | tr -d '\r')"
 echo "  包根 = $PKG"
 echo "  版本 = ${VER:-unknown}"
 state_set PKG_ROOT "$PKG"

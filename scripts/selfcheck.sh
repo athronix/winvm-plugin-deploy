@@ -19,6 +19,7 @@
 #  19  multi-source  一次性脚本四源候选链：宿主逐个探测 + VM 侧 foreach 循环兜底
 #  20  backend-default 通道后端默认 auto（v2.0.0 重构退化成 key 的真机事故）
 #  21  iex-safe      载荷无 BOM、首行非 #requires、1c irm 备选做换行归一化
+#  22  pkg-version   包版本从 MANIFEST 的 `version:` 真解析出来（不许恒 unknown）
 #
 # 用法：
 #   bash scripts/selfcheck.sh                  # 末行 SELFCHECK=ALL_GREEN checks=N fails=0
@@ -586,6 +587,22 @@ def c_iex_safe(root):
     return bad
 
 
+def c_pkg_version(root):
+    """包版本必须能从 MANIFEST.txt 真解析出来（否则日志与 state 恒写 unknown）。
+
+    母项目 pack-release.mjs 产出的行是 `version: V1.4.30`（**冒号**分隔），旧代码却按
+    `^version=`（等号）锚定 ⇒ 永远取不到。2026-11-17 真机实测：包确实是 V1.4.30，
+    但 2a 打 `版本 = unknown`、st_end 也记 ver=unknown，用户无法从日志确认装的是哪版。
+    """
+    bad = []
+    t = read(os.path.join(root, 'scripts', 'deploy-2-host.sh'))
+    if 's/^version[[:space:]]*[:=]' not in t:
+        bad.append('deploy-2-host.sh 未按 `version:` 冒号格式解析 MANIFEST（会恒 unknown）')
+    if '/^version=/' in t:
+        bad.append('deploy-2-host.sh 仍用等号锚点解析 MANIFEST 版本')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -596,7 +613,7 @@ CHECKS = [
     ('health-code', c_health_code), ('rollback-path', c_rollback_path),
     ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
     ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
-    ('iex-safe', c_iex_safe),
+    ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
 ]
 
 
@@ -692,6 +709,9 @@ MUTATIONS = [
     # 去掉换行归一化：irm 返回 string[] 时 Create 拼成一行 ⇒ 满屏 ParseException。
     ('M22 irm 备选缺归一化', 'scripts/deploy-1-ssh.sh',
      r'\$s=[string]::Join([char]10,@(\$s));', ''),
+    # MANIFEST 版本按等号解析：母项目产出的是 `version: V1.4.30`，等号锚点恒 unknown。
+    ('M23 版本按等号解析', 'scripts/deploy-2-host.sh',
+     's/^version[[:space:]]*[:=][[:space:]]*//p', 's/^version=//p'),
 ]
 
 

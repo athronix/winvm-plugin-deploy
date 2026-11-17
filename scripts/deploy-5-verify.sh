@@ -67,7 +67,7 @@ if [ $REUSE -eq 1 ]; then
     "REUSED PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP" "${PROBLEMS:-none}"
 else
   st_begin 5 "三探针 ${PROBE_DEEP:+(deep=$PROBE_DEEP)}"
-  echo "  ($RREASON)"
+  echo "  不复用探针结果，实跑三探针（理由：$RREASON；强制复用=调 PROBE_FRESH_BUDGET_S）"
   for pr in mcp-probe a2a-probe example-probe; do
     ( cd "$PKG" && "$PY" "qa/deploy-probes/$pr.py" > "$LOGD/$pr.log" 2>&1 ); RC=$?
     LINE="$(grep -E 'SUMMARY|RESULT' "$LOGD/$pr.log" 2>/dev/null | grep -E '[0-9]+/[0-9]+' | tail -1)"
