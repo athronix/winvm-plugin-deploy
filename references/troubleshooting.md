@@ -68,6 +68,10 @@
 | setup 超 420s 未监听 | 服务「僵而不绑」：8K 工作集、不占端口 | `schtasks /End /tn WinVMBridge.Service` 后 `/Run` |
 | `task_state=Ready` 但服务其实在跑 / GUI 报 `SESSION_UNAVAILABLE` | schtasks 包装器退出后任务态回 Ready；实例落 Session 0 | 判据看 `listen_count=1` + `health_http=200`；GUI 需 `/End`+`/Run` 重触发到交互会话 |
 | 拆除后残留僵尸 node（8K、不绑端口、taskkill/Process.Kill/CIM 全免疫） | 老版本 VM-START 遗留 | 只能 VM 内 `shutdown /r /t 5 /f`（**唯一需要重启的场景，且由用户在 VM 内执行**），再重跑 |
+| **4d 报 `browser=ERR:http-502`** | `agent-browser` 未装到 VM（`[4b/6]` 的 `npm i -g` 失败，安装侧按「可选依赖」降级不阻断） | 重跑 `--only 4`（4b 会补装）；看 `install-vm-run.log` 的 npm 段；不需要该工具面则 `SKIP_UPSTREAMS=1` |
+| **4d 报 `browser=ERR:http-404`** | vm-service 是**旧版**（无 `/mcp/<id>` 路由）——最常见成因：`--only 4` 推了缓存里的旧 dist | 确认包根版本（2a 的 `版本 =`）与 VM 上 `C:\WinVMBridge` 的 `MANIFEST-deploy-*.txt`；用规范包重装（`VMDEPLOY_FORCE_FETCH=1`） |
+| **4d 报 `desktop=75!=10`** | 上游版本变了（白名单外工具数变），或有人改过 `DEFAULT_DESKTOP_TOOL_ALLOWLIST` | 按实际暴露数设 `EXP_DESKTOP_TOOLS`，**不要放宽成 `>=1`**（那就失去发现白名单漂移的能力） |
+| **4d 报 `ERR:rpc-*` / `ERR:URLError`** | 上游进程起不来（缺原生二进制、被杀软拦） | 看 VM 侧 `C:\WinVMBridge\logs` 与 4d 的 stderr tail；`/health.upstreams[].lastError` 有同样信息 |
 
 ## 第 5 步：verify
 
@@ -78,6 +82,8 @@
 | `no-count` / `meter-missing` | 探针日志里找不到 `x/y` 计数 ⇒ 无法核验 | 看对应 `logs/<probe>.log` 尾部；探针崩了就是真 FAIL |
 | 单项探针 > 300s | 服务端闸/网络 | 查该探针日志；`EXECUTION_TIMEOUT`（服务端）与 `timed out`（客户端）两形态别混 |
 | `C3 storage.disk.list` / `C4 app.inventory.list` 恰好 `durationMs≈30200` 后 FAIL | VM 刚开机/刚从挂起恢复时的**冷启**：首调 WMI / 注册表全扫超过服务端 30s 预算。热态实测仅 2.7s / 3.3s | **不是缺陷，别改判据**（否则会掩盖真慢）。等 2~3 分钟重跑 `--only 5` 即 20/20。判据：单独 `command <tool>` 复调 < 5s ⇒ 确认冷启 |
+| `VERIFY=FAIL:upstream`（5e） | 服务 health=200（说明服务活着）但上游工具面取不到计数 ⇒ 真缺陷，不是环境窗 | 同 4d 的 `ERR:http-502/404/rpc-*` 处置；`SKIP_UPSTREAMS=1` 可显式跳过 |
+| 5e 报 `⚠ 服务 health 非 200 ⇒ 归入通道瞬态窗` | 隧道/服务此刻不可用 | 该段记 `ENV_WINDOW`，整体给 `VERIFY=INCOMPLETE`（不判功能失败）；等健康窗只重跑 `verify.sh` |
 
 ## 卸载
 
@@ -85,6 +91,8 @@
 |---|---|---|
 | 通道不在，第 2 步 `exit 2` | **正常输入**，不是故障 | 按提示在 VM 里手工删服务与目录；**绝不为此重建通道** |
 | `HOST_PASS<11` 或 `HOST_FAIL>0` | host 清理项失败 | 看 `uninstall-host.log` 的 `[FAIL] HOST` 行 |
+| **1c 报 `mcp.json 仍留 winvm-browser,winvm-desktop`** | **旧包卸载新装**：`uninstall.mjs` 的键表按包版本固化（V1.4.30 只有 `winvm`/`winvm-a2a`），装过含上游工具面的新包就漏 | v2.1.0 起 1c 自动按 `^winvm$|^winvm-` **命名空间兜底**并打印「卸载器未清的条目已兜底移除: …」——看到这行是兜底生效，不是失败。旧技能层遇到则手工删这两条或跑 `--only 1` |
+| **2c 后 `UPSTREAM_LEFT=agent-desktop`** | `npm uninstall -g` 失败：npm 不在 PATH（**SSH 会话只拿机器 PATH，`C:\nodejs` 在用户 PATH**）或文件被占用 | ps1 与 2d 终态命令均已自拼 `Machine;User` PATH；仍失败看 `vm-remove.log` 的 `[WARN]`，或加 `--keep-upstreams` 声明保留 |
 | `VM_PHASE_IN_HOST≠0` | `.env`/`vm-conn.json` 没屏蔽干净，host 相位跑成了双端 | 已有 trap 还原；若复现说明还有第四处 VM 目标来源，需补屏蔽 |
 | 第 3 步 `TUNNEL=PENDING_USER` | 通道不在，只能用户在 VM 里跑 `-Rollback` | 照打印的那一条执行；宿主侧私钥/known_hosts 已同时清理 |
 | 第 3 步 `3c FAIL health=000`（等满 30 轮 / 123s），但第 4 步 4b/4c 全 PASS | **从零部署的正常中间态**被当成故障：`/health` 是 VM 端 winvm service 的口径，而该服务由并行的第 4 步安装，此刻 18443 后面没人应答 | v2.0.0 起 3c 判据改为「本地端口在监听 + daemon 存活」，`health` 只作信息位（第 5 步才验端到端）。旧包上遇到就 `--only 3` 重跑（4b 已完成，此时 health 已是 200） |

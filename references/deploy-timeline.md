@@ -66,14 +66,16 @@
 | 4.0 通道门禁 | 🔬 1s | 前面步骤把 sshd 打挂后，本步会连吃 3 次超时 | 60s 健康窗 + 有界重试，只跑最短链 | 🔬 1s `channel=READY` |
 | 4a prepare-vm | 🔬 **27s**（轮次 1 为 20s / v2.0.2 为 45s） | node 缺失、防火墙未建、登录态（DB-4 需 VM 内交互一次） | `--ensure-node` 分项打 `[SKIP]` | 🔬 `DB-2/3/6` 全 `[SKIP]`，27s |
 | **4b setup（推包+装+起服务）** | 🔬 **61s**（轮次 1 为 62s，v2.0.2 首跑 168s / 稳态 124s） | 全链最大项；服务装完后 socket 可能假死（网络抖动/挂起），表现为宿主 `curl 52` | `--only-vm --skip-build`；假死时重跑本步即修 | 🔬 61s，**物理下限** |
-| 4c vmcheck 七判据 | 🔬 **14s**（v2.0.2 69s→54s） | `vmcheck.ps1` 是纯报告器（无退出码）⇒ 只看 rc 等于"跑完就算过" | 自解析 JSON 逐项断言 + health 双口径 | 🔬 14s 真断言（**比旧版快 40s 且不再是假绿**） |
+| 4c vmcheck 七判据 | 🔬 **14s**（v2.0.2 69s→54s；全量重装轮 38s） | `vmcheck.ps1` 是纯报告器（无退出码）⇒ 只看 rc 等于"跑完就算过" | 自解析 JSON 逐项断言 + health 双口径 | 🔬 14s 真断言（**比旧版快 40s 且不再是假绿**） |
+| 4d 上游工具面 | 🔬 **12s**（首轮，含懒启动）/ 3s（已就绪） | `/health.upstreams` 是懒启动观测值（刚起恒 `idle`），拿它断言会把"没被调过"误判成"装坏了" | 真打 `POST /mcp/<id>` 的 `tools/list` 计数；期望值 33/10 可 env 覆盖 | 🔬 `browser=33 desktop=10`，顺带验证懒启动通路 |
 
 ### 第 5 步：verify（`deploy-5-verify.sh`）
 
 | 细步骤 | 实测 | 难点 / 风险点 | 优化方案 | 完善效果 |
 |---|---|---|---|---|
 | 5 三探针 | 🔬 **16s**（冷跑 34 项）<br>1s（stamp 复用） | 项数漂移（38↔34）让汇总判据失去意义；静默少测=最危险假绿 | 探针分级：默认 34（`PROBE_DEEP=1` 跑 38）；SKIP 必须打印并计入；取不到真实计数即 FAIL | 🔬 `34/34 SKIP=4`，16s（v2.0.2 为 38s） |
-| 5d 终态矩阵 | 🔬 **8s**（v2.0.2 为 26s） | 缓存与仓库构建物漂移会让人误以为"装的是新代码" | 逐文件 SHA256 `fresh` 对账 + disabledTools + connector skills + VM 三态 | 🔬 8s 一次给齐五维 |
+| 5d 终态矩阵 | 🔬 **8s**（v2.0.2 为 26s） | 缓存与仓库构建物漂移会让人误以为"装的是新代码" | 逐文件 SHA256 `fresh` 对账 + disabledTools + connector skills（现要求 ≥10）+ VM 三态 | 🔬 8s 一次给齐五维 |
+| 5e 上游工具面 | 🔬 **3s** | 4d 只在第 4 步跑；verify 单独调用于排障时就没有复验面 | 与 4d 同一 `upstream_judge`；失败按 health 分流（200=真缺陷，非 200=ENV_WINDOW） | 🔬 `browser=33 desktop=10` |
 
 **deploy 总账**：轮次 1/2 全链 🔬 **126s / 135s** = 1a 1 + 2 步 3 + 3 步 2 + 4 步 102 + 5 步 24 + 收尾；
 轮次 3 为 **274s**（4 步 251s），归因见 §四。
@@ -87,7 +89,7 @@
 |---|---|---|---|---|
 | 1a 停隧道 | 🔬 2s | `curl` 连不上时自己吐 `000`，再 `|| echo 000` ⇒ `000000`，判据恒假 | `health_code` 捕获后 case 归一（恒 3 字符） | 🔬 旧版假 FAIL → 2s PASS |
 | 1b 卸 host 插件 | 🔬 2s | host-only 卸载若漏屏蔽 VM 目标，会连 VM 一起卸 | 三处 VM 目标来源全部屏蔽 + `VM_PHASE=0` 断言 | 🔬 host 端清空 |
-| 1c 清空复核 | 🔬 0s | 残留 mcp 条目/隧道进程会导致下次部署双开 | 复核 health=000 + `mcp_left=none` | 🔬 0s |
+| 1c 清空复核 | 🔬 0s | ① 残留 mcp 条目/隧道进程会导致下次部署双开；② **旧包卸载新装**必留 `winvm-browser`/`winvm-desktop`（卸载器键表按包版本固化） | 复核 health=000 + `mcp_left=none`；新增 `^winvm$|^winvm-` **命名空间兜底**并打印被移除项 | 🔬 兜底实测移除 2 条死条目 → `UNDEPLOY=PASS` |
 
 ### 第 2 步：停 VM 服务 + 卸模块（`undeploy-2-vm.sh`）
 
@@ -95,8 +97,8 @@
 |---|---|---|---|---|
 | 2a 通道状态 | 🔬 1s | 通道不在是**正常输入**，不是故障 | 只判不建（红线：卸载绝不重建通道） | 🔬 1s |
 | 2b 推卸载脚本 | 🔬 3s | 远端脚本缺失只能干等 | scp `vm-remove-local.ps1` 后就地执行 | 🔬 3s |
-| 2c 停服务 + 卸模块 | 🔬 **70s** | 僵尸 node 进程（不绑端口、taskkill 免疫） | 服务停止 + 端口复查 + 目录清理三段断言 | 🔬 70s `VM_CLEANUP_DONE` |
-| 2d VM 终态五点 | 🔬 **19s**（v2.0.2 为 35s） | "删了但没删干净" | 任务/端口/进程/目录/服务五点复核 | 🔬 19s 五点全 clean |
+| 2c 停服务 + 卸模块 | 🔬 **70s** / 58s（含卸上游 CLI） | 僵尸 node 进程（不绑端口、taskkill 免疫）；**SSH 会话 PATH 无 `C:\nodejs`** ⇒ `Get-Command npm` 为空、上游清理会静默降级 | 服务停止 + 端口复查 + 目录清理三段断言；段 8 杀孤儿上游进程 + `npm uninstall -g`；ps1/终态命令自拼 `Machine;User` PATH | 🔬 `VM_CLEANUP_DONE` + `UPSTREAM_LEFT=NONE` |
+| 2d VM 终态五点 | 🔬 **19s**（v2.0.2 为 35s）/ 17s | "删了但没删干净"；上游 CLI 残留不看就发现不了 | 任务/端口/进程/目录/服务 + **上游**六点复核 | 🔬 六点全 clean（`=> False False 0 Running True NONE`） |
 
 ### 第 3 步：拆 ssh 通道（`undeploy-3-ssh.sh`）
 
@@ -165,3 +167,42 @@
 3. **⚠ `-AllowFrom` 默认不传的副作用**：防火墙规则对任意来源放行（仍受 `ListenAddress` 收窄）。oneclick 会打印"建议配 -AllowFrom <宿主机IP>"，但没告诉用户去哪找宿主 IP —— 文案待改进。
 4. **⚠ 两仓解耦后 oneclick 的唯一来源是技能仓 raw@main**：技能仓若临时不可达（Gitee + GitHub 双挂）则 1c 无源可发。当前靠双源回退兜底；无离线介质方案，属已知边界。
 5. **⏳ `4b` 缺「包内容未变则短路」（母项目 backlog，本技能仓改不了）**：每轮无条件 `tar` + `scp` 8MB + `install-vm` + 重启服务，实测 95.6s+44.0s。优化方向=VM 上 `MANIFEST-deploy-*.txt` 的 `total-sha256` 与本地比，相同则整段跳过，预计省 100~140s/轮。**在此之前，重复部署耗时会按 VM 侧负载在 61~155s 之间浮动，属预期而非回归。**
+
+## 六、V1.4.31 / 技能 v2.1.0 真机账（2026-11-17 19:47~19:59，同一台 VM）
+
+样本 = 「先完整 undeploy、再全新 deploy」的从零闭环（与历史轮次的最大差异：这次含两个上游 MCP 的装与卸）。
+
+| 段 | 实测 | 说明 |
+|---|---|---|
+| undeploy 全链 | 🔬 **79s** | 1a 3 + 1b 2 + 1c 1 + 2a 1 + 2b 2 + **2c 58** + 2d 17 |
+| 其中 2c（含卸上游 CLI） | 58s | 历史同段 70s；本轮 `UPSTREAM_LEFT=NONE`（两个全局包已删除） |
+| **undeploy 判据** | **首跑 `FAIL rc=1`**（1c） | 见下方「真缺陷」；兜底修复后 `--only 1` 复跑 **PASS（5s）** |
+| deploy 全链 | 🔬 **413s** | 见下分解；**历史 126~274s**，本轮偏高，主因是从零重装 + 上游首次安装 |
+| 2 步（host） | 6s | 2a 1s（缓存命中）/ 2b 1s / 2c 0s / 2d 1s / **2e skills=10** |
+| 3 步（隧道） | 2s | 3b 幂等短路 |
+| 4a prepare-vm | **76s** | 六项全 `[SKIP]` 仍 76s（历史 20~65s）——只读探测的通道往返，对 VM 负载敏感 |
+| 4b setup（含装上游） | **226s** | `[VM] 165.6 + [VM-START] 42.6 + [QA-PROBE] 18.3` |
+| 4c 七判据 | 38s | `health_http=200` |
+| **4d 上游工具面** | **12s** | 首次调用触发懒启动（browser+desktop 各一次 `tools/list`） |
+| 5 三探针 | 35s | 34/34 SKIP=4（stamp 过期 11001s，冷跑） |
+| 5d 矩阵 | 13s | `connector skills=10` / `disabledTools=8` / `health=200` |
+| **5e 上游工具面** | **3s** | 上游已 ready，秒回 |
+| **verify** | **PASS** | `DEPLOY=PASS` |
+
+**上游 CLI 的耗时账（首次 vs 幂等）** —— 取自 VM 侧 `install-vm-run.log` 的 `[t+Xs]` 打点：
+
+| 事实 | 数值 | 判读 |
+|---|---|---|
+| `[4b/6]` 段（`npm i -g agent-browser agent-desktop`） | **47.9s**（t+8.8 → t+56.7） | **首次**安装成本；含两个包下载 + 全局落盘 |
+| 之后每轮同段 | **≈0s** | `Get-Command` 命中即跳过（幂等），4 个 `[SKIP]` 级别 |
+| `npm warn install-scripts ... postinstall` | 两个包都告警 | npm 11 `allow-scripts` 默认拦 postinstall；**CLI 实测正常**（原生二进制走平台子包），故不加 `--allow-scripts` |
+| 全局包体积对 `[VM]` 相位的影响 | 165.6s 中含 47.9s npm | 若不需要这两个工具面：`SKIP_UPSTREAMS=1` 可省下这 48s |
+
+**本轮抓到的真缺陷（已修）**：`undeploy` 1c 报 `mcp.json 仍留 winvm-browser,winvm-desktop`。
+
+- **现象**：`UNDEPLOY=FAIL rc=1`，host 端已卸干净、VM 端五点全 clean，只有全局 `~/.workbuddy/mcp.json` 残留两条死条目。
+- **根因**：V1.4.30 的 `delivery/uninstall.mjs` 键表按**包版本**固化（`GLOBAL_MCP_KEYS=['winvm','winvm-a2a']`），而安装侧（V1.4.31 前的 install-host）已写入 4 条 ⇒ **旧包卸载新装必然漏**。这不是偶发，任何「装的版本比卸载器新」的场景都会踩。
+- **处置**：① 技能层 1c 加 `^winvm$|^winvm-` **命名空间兜底**（只动本项目命名空间，打印被移除项）；② 母项目 `uninstall.mjs` 键表扩到 4 条与 `install-host` 的 `ourKeys` 对齐；③ 门禁 +M25 变异（兜底退化成单键必须被抓）。
+- **复验**：`undeploy.sh --only 1` → `卸载器未清的条目已兜底移除: winvm-browser,winvm-desktop` → `UNDEPLOY=PASS`（5s）。
+
+**本轮耗时偏高的归因（不算回归）**：① 从零重装（`C:\WinVMBridge` 被上一轮卸载删空）⇒ `[VM]` 相位走全新解压，165.6s；② 上游 CLI 首次安装 47.9s；③ `4a` 76s / `4c` 38s 属历史波动带（20~76s / 13~38s）。可再压的两处仍是母项目 backlog：`4b` 内容短路（省 100~140s）、`4a` 只读探测合并往返。
