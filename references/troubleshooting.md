@@ -17,6 +17,7 @@
 | 多行命令粘进去后 PowerShell 报 `行:1 字符:NN`，多条语句挤在同一条报错里 | 终端把多行粘贴**折叠成单行**（换行丢失），`if { }` 块被压平后语法崩 | **给用户的命令一律写成单行 `;` 串联**（块体压成 `{ a; b }` 也可），永不依赖换行 |
 | 三轮都没建起来 | 密钥 / 网络 / 权限三者之一 | 看 `1b.*`/`1c.*` 各轮日志；VM 侧 build 段应有 `[+]` 行而无 `[x]` |
 | `ping` 100% 丢包 | VM 整机离线（关机/暂停/断网） | 用户在 VM 管理端开机/恢复。脚本救不了，别循环重试 |
+| **每步都报 `NO_CHANNEL`，但 `ping` 通、`health=200`** | 通道后端默认值退化成 `key`（**v2.0.0 重构引入的回归**，v2.0.2 已修）。鸿蒙宿主机上 OpenSSH 二进制会相位性挂在**认证段**（`rc=124`、stderr 为空），而 `ssh2-conn.mjs ping` 同一秒仍是 `pong ready` | 先看 `vm-conn.sh` 的 `VM_SSH_BACKEND` 默认值须为 **`auto`**；临时绕过：`VM_SSH_BACKEND=ssh2 bash scripts/deploy.sh`。注意 `All configured authentication methods failed` 是**钥配错**，与本条不同 |
 
 **通道判定只用新建连接实测**（`ssh2-conn.mjs ping`）。`health=200` 是**长连**健康，不等于新建可用——
 两者分叉正是 WEDGE 的指纹。
@@ -75,6 +76,7 @@
 | `total-33!=34` / `skip-N!=4` | 探针项数被改动 | 同步改 `deploy-5-verify.sh` 的 `EXP_TOTAL/EXP_SKIP`。**刻意告警，别放宽** |
 | `no-count` / `meter-missing` | 探针日志里找不到 `x/y` 计数 ⇒ 无法核验 | 看对应 `logs/<probe>.log` 尾部；探针崩了就是真 FAIL |
 | 单项探针 > 300s | 服务端闸/网络 | 查该探针日志；`EXECUTION_TIMEOUT`（服务端）与 `timed out`（客户端）两形态别混 |
+| `C3 storage.disk.list` / `C4 app.inventory.list` 恰好 `durationMs≈30200` 后 FAIL | VM 刚开机/刚从挂起恢复时的**冷启**：首调 WMI / 注册表全扫超过服务端 30s 预算。热态实测仅 2.7s / 3.3s | **不是缺陷，别改判据**（否则会掩盖真慢）。等 2~3 分钟重跑 `--only 5` 即 20/20。判据：单独 `command <tool>` 复调 < 5s ⇒ 确认冷启 |
 
 ## 卸载
 

@@ -26,14 +26,17 @@ _ssh_t() { timeout "${VM_SSH_EXEC_TIMEOUT:-$VM_SSH_TIMEOUT}" "$@"; }
 : "${VM_HOST:=}"; : "${VM_USER:=User}"; : "${VM_SSH_PORT:=22}"
 VM_CHANNEL="${VM_CHANNEL:-}"
 
-# ── run16 定谳：node ssh2 后端（VM_SSH_BACKEND=key|ssh2|auto，默认 key=现状零冲击）──
+# ── node ssh2 后端（VM_SSH_BACKEND=auto|ssh2|key，默认 auto）──
 # OpenSSH 二进制对 VM 相位性挂起（raw TCP+banner 通、认证段随机死 rc=124；同秒对照
 # ssh2 READY 654ms rc=0 vs 二进制 rc=124 实锤；tunnel-daemon 靠 ssh2 全天恒通）。
-#   key  = 只走 ssh/scp 二进制（原路径，发布面默认）
-#   ssh2 = 走 ssh2-conn.mjs（exec/put/get/ping），失败兜底二进制（保险丝）
-#   auto = ssh2 优先、二进制作 fallback（同 ssh2；二进制不可靠已由同秒对照定谳）
-# 启用方式：调用方（driver/编排）显式 export VM_SSH_BACKEND=ssh2。
-VM_SSH_BACKEND="${VM_SSH_BACKEND:-key}"
+#   auto = ssh2 优先、二进制 fallback（默认；无 node / 无 ssh2-conn.mjs 时自动降级二进制）
+#   ssh2 = 强制 ssh2（仍带二进制兜底保险丝）
+#   key  = 只走 ssh/scp 二进制（排障用：需要验证「纯二进制链路」本身时显式指定）
+# 【v2.0.2 回归修复】v2.0.0 重构把默认值写成 key，而 legacy 层（context/channel/roundtrip）
+#   全部是 VM_SSH_BACKEND:-ssh2 —— 重构静默降低了后端默认，导致鸿蒙沙箱宿主机上
+#   vm_channel_probe 走二进制认证段必挂 rc=124 → 误报 NO_CHANNEL（真机实测：同一秒
+#   `ssh2-conn.mjs ping` = pong ready、裸 TCP banner 190ms 就回）。默认必须是 auto。
+VM_SSH_BACKEND="${VM_SSH_BACKEND:-auto}"
 # 专属变量名：不覆盖调用方（deploy/ps-run/verify 等）的 _here；同 scripts/ 目录，pwd 归一化后一致
 _vmconn_here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _ssh2n="${VMDEPLOY_NODE:-${NODE:-}}"

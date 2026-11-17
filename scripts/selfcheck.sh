@@ -17,6 +17,7 @@
 #  13  links         SKILL.md 相对链接目标存在
 #  14  oneclick      VM 单脚本具备自归位 + 公钥文件回填 + 固定 -Rollback 路径
 #  19  multi-source  一次性脚本四源候选链：宿主逐个探测 + VM 侧 foreach 循环兜底
+#  20  backend-default 通道后端默认 auto（v2.0.0 重构退化成 key 的真机事故）
 #
 # 用法：
 #   bash scripts/selfcheck.sh                  # 末行 SELFCHECK=ALL_GREEN checks=N fails=0
@@ -473,6 +474,37 @@ def c_multi_source(root):
     return bad
 
 
+def c_backend_default(root):
+    """通道后端默认值必须是 auto —— v2.0.0 重构把它退化成 key 的真机事故。
+
+    现象：鸿蒙宿主机上每一步都先走 OpenSSH 二进制，认证相位挂 rc=124 ⇒
+    vm_channel_probe 判 NO_CHANNEL；同一秒 `ssh2-conn.mjs ping` 返 pong ready、
+    裸 TCP 190ms 就收到 banner。根因是重构把 `:-ssh2` 写成了 `:-key`。
+    """
+    bad = []
+    vc = strip_comments(read(os.path.join(root, 'scripts', 'vm-conn.sh')))
+    m = re.search(r'^VM_SSH_BACKEND="\$\{VM_SSH_BACKEND:-([A-Za-z0-9_]+)\}"', vc, re.M)
+    if not m:
+        bad.append('vm-conn.sh 未声明 VM_SSH_BACKEND 默认值（调用方须能零配置工作）')
+        return bad
+    default = m.group(1)
+    if default != 'auto':
+        bad.append('VM_SSH_BACKEND 默认=%s（必须 auto：ssh2 优先、无 node 降级二进制）' % default)
+    # 新旧默认值不许互相矛盾：legacy 层历史上就是 ssh2。
+    for rel in ('scripts/legacy/context.sh', 'scripts/legacy/channel.sh',
+                'scripts/legacy/roundtrip.sh'):
+        p = os.path.join(root, rel)
+        if not os.path.exists(p):
+            continue
+        body = strip_comments(read(p))
+        if 'VM_SSH_BACKEND:-ssh2' not in body and 'VM_SSH_BACKEND:=ssh2' not in body:
+            bad.append('%s 不再默认 ssh2（新旧后端默认互相矛盾）' % rel)
+    # auto 必须真的能降级：无 node 时 _use_ssh2 返回 1，二进制路径仍可用。
+    if '_use_ssh2' not in vc:
+        bad.append('vm-conn.sh 缺 _use_ssh2（auto 降级判定不存在）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -482,6 +514,7 @@ CHECKS = [
     ('vmcheck-assert', c_vmcheck_assert),
     ('health-code', c_health_code), ('rollback-path', c_rollback_path),
     ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
+    ('backend-default', c_backend_default),
 ]
 
 
@@ -506,7 +539,7 @@ def run_all(root):
 _M1_TAIL = 'grep -c foo /dev/null'
 _M1_OR = ' || echo 0'
 
-_CUR_VER = (re.search(r'^version:\s*(\S+)', read(os.path.join(ROOT, 'SKILL.md')), re.M) or [None, '2.0.1'])[1]
+_CUR_VER = (re.search(r'^version:\s*(\S+)', read(os.path.join(ROOT, 'SKILL.md')), re.M) or [None, '2.0.2'])[1]
 
 MUTATIONS = [
     ('M1 grep-c 假红回归', 'scripts/_common.sh',
@@ -551,6 +584,9 @@ MUTATIONS = [
     # 命令内联空数组：foreach 空转，等于没下载。
     ('M15 命令内联空候选数组', 'scripts/deploy-1-ssh.sh',
      '$src=@($srcs)', '$src=@()'),
+    # 后端默认退化成 key：鸿蒙宿主机上每步都误报 NO_CHANNEL（rc=124 相位挂）。
+    ('M16 后端默认退化为 key', 'scripts/vm-conn.sh',
+     'VM_SSH_BACKEND="${VM_SSH_BACKEND:-auto}"', 'VM_SSH_BACKEND="${VM_SSH_BACKEND:-key}"'),
 ]
 
 
