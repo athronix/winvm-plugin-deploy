@@ -603,6 +603,58 @@ def c_pkg_version(root):
     return bad
 
 
+def c_upstream_contract(root):
+    """上游 MCP 工具面（agent-browser / agent-desktop）三段闭环必须齐全。
+
+    这两个 stdio MCP server 是本项目交付物的一部分（装/卸/验三处都要有）：
+      · 装：install-vm 的 [4b/6] 全局 npm 安装（母项目侧，本技能只负责判据）；
+      · 验：deploy-4 的 4d 与 verify 的 5e 必须用**真实 tools/list 计数**，
+        `/health.upstreams[]` 是懒启动观测值（刚起恒 idle）⇒ 拿它断言必假红；
+      · 卸：vm-remove-local.ps1 必须真的卸全局 CLI，并且要自补 PATH
+        （SSH 会话只拿到机器 PATH，C:\\nodejs 是用户 PATH 条目 ⇒ Get-Command npm 为空）。
+    """
+    bad = []
+    cm = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    if 'upstream_tools()' not in cm:
+        bad.append('_common.sh 缺 upstream_tools()（上游工具面无处可取真实计数）')
+    if 'upstream_judge()' not in cm:
+        bad.append('_common.sh 缺 upstream_judge()（deploy/verify 口径会各自漂移）')
+    for up in ('browser', 'desktop'):
+        if ('upstream_tools %s' % up) not in cm:
+            bad.append('upstream_judge 未真调 upstream_tools %s（会退化成常量断言）' % up)
+    for ev in ('EXP_BROWSER_TOOLS', 'EXP_DESKTOP_TOOLS'):
+        if ev not in cm:
+            bad.append('计数期望值不可覆盖（缺 %s）' % ev)
+    # 公共函数不许裸用 $PY（步脚本可单独重跑，调用方未必跑过 need_py）
+    seg = cm[cm.index('upstream_tools()'):]
+    seg = seg[:seg.index('upstream_judge()')] if 'upstream_judge()' in seg else seg
+    if 'local py="${PY:-}"' not in seg:
+        bad.append('upstream_tools 裸用 $PY（set -u 下步脚本单独跑会 unbound）')
+
+    d4 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-4-vm.sh')))
+    if 'st_begin 4d' not in d4 or 'upstream_judge' not in d4:
+        bad.append('deploy-4 缺 4d 上游工具面判据')
+    d5 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-5-verify.sh')))
+    if 'st_begin 5e' not in d5 or 'upstream_judge' not in d5:
+        bad.append('deploy-5 缺 5e 上游工具面判据（verify 单独调用时无复验面）')
+
+    un2 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-2-vm.sh')))
+    if '-KeepUpstreams' not in un2:
+        bad.append('undeploy-2 未把 -KeepUpstreams 传给 VM 侧脚本')
+    if 'UPSTREAM_LEFT' not in un2:
+        bad.append('undeploy-2 未断言 UPSTREAM_LEFT（卸没卸干净无从判断）')
+    ps1 = strip_comments(read(os.path.join(root, 'scripts', 'vm-remove-local.ps1')))
+    if 'npm uninstall -g' not in ps1:
+        bad.append('vm-remove-local.ps1 未卸全局上游 CLI')
+    for need in ('[switch]$KeepUpstreams', "GetEnvironmentVariable('Path', 'Machine')", 'UPSTREAM_LEFT='):
+        if need not in ps1:
+            bad.append('vm-remove-local.ps1 缺 %s' % need)
+    uns = strip_comments(read(os.path.join(root, 'scripts', 'undeploy.sh')))
+    if '--keep-upstreams' not in uns:
+        bad.append('undeploy.sh 未暴露 --keep-upstreams')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -614,6 +666,7 @@ CHECKS = [
     ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
     ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
     ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
+    ('upstream-contract', c_upstream_contract),
 ]
 
 
@@ -712,6 +765,10 @@ MUTATIONS = [
     # MANIFEST 版本按等号解析：母项目产出的是 `version: V1.4.30`，等号锚点恒 unknown。
     ('M23 版本按等号解析', 'scripts/deploy-2-host.sh',
      's/^version[[:space:]]*[:=][[:space:]]*//p', 's/^version=//p'),
+    # 上游判据退化成常量：/health.upstreams 的懒启动状态（刚起恒 idle）于是能"过"，
+    # 装没装、通不通全测不出来 ⇒ 必须被断言抓到。
+    ('M24 上游判据退化为常量', 'scripts/_common.sh',
+     'b="$(upstream_tools browser)"; d="$(upstream_tools desktop)"', 'b=33; d=10'),
 ]
 
 

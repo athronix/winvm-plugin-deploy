@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # deploy-4-vm.sh · 装 VM 端并起 winvm service（mcp + a2a）（deploy 第 4 步，与第 3 步并行）
 #
-# 三件：① 补齐 VM 运行时依赖（node，幂等）② 推包 + 装 VM 端 + 起服务 ③ 七判据体检
+# 四件：① 补齐 VM 运行时依赖（node，幂等）② 推包 + 装 VM 端（含 npm 上游 agent-browser /
+# agent-desktop）+ 起服务 ③ 七判据体检 ④ MCP 上游工具面判据（真实 tools/list）
 # 全程只经现役 ssh 通道；不建通道、不重启 VM。
 #
 # 用法：VM_HOST=... bash scripts/deploy-4-vm.sh [--purge-workspace]
@@ -11,6 +12,9 @@ set -u
 
 resolve_env; need_node; need_bash; require_host
 state_load
+# 单个脚本也能跑（编排层不在场）：自行把 SKIP_UPSTREAMS 映射到 setup.mjs 认的 env。
+: "${SKIP_UPSTREAMS:=0}"; export SKIP_UPSTREAMS
+[ "$SKIP_UPSTREAMS" = "1" ] && export WINVM_SKIP_UPSTREAMS=1
 PKG="${PKG_ROOT:-}"
 [ -n "$PKG" ] && [ -f "$PKG/delivery/setup.mjs" ] \
   || die "找不到包根" "第 2 步未完成" "state=$STATE_FILE" "先跑 bash scripts/deploy-2-host.sh"
@@ -59,7 +63,9 @@ st_end 0 PASS "依赖就绪"
 st_begin 4b "setup --only-vm --skip-build（推包+装 VM 端+起服务）"
 SL="$(sub_log setup)"
 ( cd "$PKG" && "$NODE" delivery/setup.mjs --apply --skip-build --only-vm > "$SL" 2>&1 ); SRC=$?
-grep -E '部署全部完成|个步骤失败|降级 SKIP|VM_START|TUNNEL|QA-PROBE' "$SL" | tail -8
+# 上游安装行（[4b/6] / 已安装 / ⚠ ... 安装失败）必须露出来：它是「可选依赖」，
+# 失败不阻断部署，但 4d 会立刻把它变成硬判据——日志里得能看见它在哪一步掉的。
+grep -E '部署全部完成|个步骤失败|降级 SKIP|VM_START|TUNNEL|QA-PROBE|\[4b/6\]|npm install -g|已安装：|安装失败' "$SL" | tail -10
 if [ $SRC -ne 0 ]; then
   tail -14 "$SL"
   st_end $SRC FAIL "setup rc=$SRC"
@@ -125,6 +131,29 @@ else
     die "VM 服务 health 不通" "VM 自检=$VHH、宿主侧=$HC" "$VL" \
         "两者皆非 200=服务真坏；仅 VM 自检非 200=判据窗太紧"
   fi
+fi
+
+# ── 4d MCP 上游工具面（agent-browser / agent-desktop）──
+# 这两个 stdio MCP server 由 install-vm 的 [4b/6] `npm i -g` 装到 VM，再由 vm-service
+# 懒启动反代成 `/mcp/browser`、`/mcp/desktop`。判据取**真实 tools/list 计数**：
+#   · `/health.upstreams[]` 是懒启动的观测值，服务刚起时恒 idle ⇒ 拿它断言必假红；
+#   · 「路由存在」也不等于「上游可用」——未安装时路由返回 502。
+# 本段同时验证懒启动通路（首次调用即拉起子进程，桌面类首次 8~12s 属正常）。
+# SKIP_UPSTREAMS=1 是显式逃生阀（对应 install-vm 的 --skip-upstreams）。
+st_begin 4d "MCP 上游工具面（真实 tools/list）"
+if [ "${SKIP_UPSTREAMS:-0}" = "1" ]; then
+  st_end 0 SKIP "SKIP_UPSTREAMS=1（明确不要这两个工具面）"
+else
+  UV="$(upstream_judge)"
+  echo "  $UV"
+  case "$UV" in
+    OK\ *) st_end 0 PASS "$(printf '%s' "$UV" | sed 's/^OK //')" ;;
+    *)     st_end 1 FAIL "$(printf '%s' "$UV" | sed 's/^FAIL //')"
+           die "MCP 上游工具面不可用" \
+               "agent-browser/agent-desktop 未装到 VM，或 vm-service 未挂载 /mcp/<id> 路由" \
+               "计数见上：ERR:http-502=上游未安装；ERR:http-404=路由缺失；ERR:rpc-* =上游启动失败" \
+               "重跑本步（4b 会补装 npm 上游）；不需要这两个工具面时用 SKIP_UPSTREAMS=1" ;;
+  esac
 fi
 state_set VM_INSTALLED 1
 steps_report

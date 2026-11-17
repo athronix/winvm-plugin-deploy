@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # deploy-5-verify.sh · 复验（deploy 第 5 步；也是独立 verify 的唯一入口）
 #
-# 三探针（按 PROBE_DEEP 分级，34 项 / 38 项）+ 终态矩阵（fresh / mcp / health / skills / VM 三点）。
+# 三探针（按 PROBE_DEEP 分级，34 项 / 38 项）+ 终态矩阵（fresh / mcp / health / skills / VM 三点）
+# + 上游工具面（5e：agent-browser / agent-desktop 的真实 tools/list 计数，与 deploy 4d 同口径）。
 # 不建通道、不修通道、不重启 VM。通道瞬态窗 → VERIFY=INCOMPLETE rc=2（既不假绿也不误报功能失败）。
 #
 # 新鲜复用：deploy 刚在本进程跑完探针时，同包根 + 600s 内可只跑矩阵（省 ~100s）。
@@ -109,7 +110,9 @@ HC="$(health_code "${WINVM_TUNNEL_LOCAL_PORT:-18443}" 15)"; echo "health=$HC" | 
 [ "$HC" = "200" ] || VRC=1
 SKCNT="$(ls "$HOME/.workbuddy/connectors/skills/connector-winvm/" 2>/dev/null | awk 'END{print NR+0}')"
 echo "connector skills=$SKCNT" | tee -a "$LOGD/health.txt"
-[ "${SKCNT:-0}" -ge 8 ] || VRC=1
+# 10 = 1 总控 + 5 领域 + 1 MCP 参考 + 1 宿主分派 + 2 上游工具面（agent-browser/agent-desktop）。
+# 少于 10 ⇒ 装的是旧包（skills 未随包分发）或上游工具面指导缺失。
+[ "${SKCNT:-0}" -ge 10 ] || VRC=1
 
 ENV_WINDOW=0
 if [ -n "${VM_HOST:-}" ]; then
@@ -131,6 +134,28 @@ st_end $VRC "$([ $VRC -eq 0 ] && echo PASS || echo FAIL)" \
   "matrix$( [ "$ENV_WINDOW" = "1" ] && echo ' +ENV_WINDOW')" \
   "$([ $VRC -eq 0 ] && echo none || echo "看 $LOGD")"
 [ $VRC -ne 0 ] && FAILS="$FAILS matrix"
+
+# ── 5e MCP 上游工具面（agent-browser / agent-desktop，与 4d 同一口径）──
+# 独立成段的理由：4d 只在 deploy 第 4 步跑，而 verify 可能被单独调用于排障；
+# 两个上游是本项目交付物的一部分，必须和 54 能力一样可复验。
+# 失败分流：health=200 仍失败=真缺陷；health 非 200=通道瞬态窗（记 ENV_WINDOW，不误报）。
+st_begin 5e "MCP 上游工具面（agent-browser / agent-desktop）"
+if [ "${SKIP_UPSTREAMS:-0}" = "1" ]; then
+  st_end 0 SKIP "SKIP_UPSTREAMS=1"
+else
+  UV="$(upstream_judge)"
+  echo "  $UV"
+  case "$UV" in
+    OK\ *) st_end 0 PASS "$(printf '%s' "$UV" | sed 's/^OK //')" ;;
+    *)     st_end 1 FAIL "$(printf '%s' "$UV" | sed 's/^FAIL //')"
+           if [ "$(health_code "${WINVM_TUNNEL_LOCAL_PORT:-18443}" 8)" = "200" ]; then
+             FAILS="$FAILS upstream"
+           else
+             echo "⚠ 服务 health 非 200 ⇒ 归入通道瞬态窗，不判功能失败" >&2
+             ENV_WINDOW=1
+           fi ;;
+  esac
+fi
 
 steps_report
 if [ -n "$FAILS" ]; then

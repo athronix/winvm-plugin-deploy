@@ -196,6 +196,70 @@ port_listening() { # port_listening <port> [host] → 本地/远端端口是否�
   ( exec 3<>"/dev/tcp/$h/$1" ) >/dev/null 2>&1
 }
 
+# ───────── MCP 上游工具面（agent-browser / agent-desktop）─────────
+# 这两个 stdio MCP server 装在 VM 上、由 vm-service 反代成 `/mcp/<id>`，宿主侧只是
+# 多两个 connector 条目。**判据只能取真实 tools/list 计数**：
+#   · `/health.upstreams[]` 是懒启动的观测值，服务刚起来时恒 `idle`，
+#     拿它断言会把「还没被调用」误判成「装坏了」（假红）；
+#   · 反过来「路由存在」也不等于「上游可用」——未安装时路由返回 502。
+# 函数自给自足解析解释器（不裸用 $PY：步脚本可单独重跑，M10 变异锁过这条）。
+upstream_tools() { # upstream_tools <browser|desktop> [port] → 打印工具数；失败打印 ERR:<reason>
+  local id="${1:?upstream id}" port="${2:-${WINVM_TUNNEL_LOCAL_PORT:-18443}}"
+  local py="${PY:-}" c
+  if [ -z "$py" ]; then
+    for c in /data/service/hnp/bin/python3 "$(command -v python3 2>/dev/null)" python3; do
+      [ -n "$c" ] && "$c" -c 'import sys;sys.exit(0)' >/dev/null 2>&1 && { py="$c"; break; }
+    done
+  fi
+  [ -n "$py" ] || { printf 'ERR:no-python'; return 0; }
+  "$py" - "$id" "$port" <<'PYEOF'
+import json, sys, urllib.request, urllib.error
+up, port = sys.argv[1], sys.argv[2]
+payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+req = urllib.request.Request(
+    "http://127.0.0.1:%s/mcp/%s" % (port, up), data=payload,
+    headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+# 显式空 ProxyHandler：鸿蒙宿主可能带 http_proxy，会把 127.0.0.1 也送进代理
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(req, timeout=60) as r:
+        raw = r.read().decode("utf-8", "replace")
+except urllib.error.HTTPError as e:
+    print("ERR:http-%d" % e.code); raise SystemExit(0)
+except Exception as e:
+    print("ERR:%s" % type(e).__name__); raise SystemExit(0)
+body = raw.strip()
+if body.startswith(("event:", "data:")):          # 兼容 SSE 帧
+    parts = [l[5:].strip() for l in body.splitlines() if l.startswith("data:")]
+    body = parts[-1] if parts else ""
+try:
+    d = json.loads(body)
+except Exception:
+    print("ERR:bad-json"); raise SystemExit(0)
+if isinstance(d.get("error"), dict):
+    print("ERR:rpc-%s" % d["error"].get("code")); raise SystemExit(0)
+tools = ((d.get("result") or {}).get("tools")) or []
+print(len(tools))
+PYEOF
+}
+
+# 上游工具面判据（deploy 4d 与 verify 5e 共用同一口径，避免两处漂移）。
+# 期望值是**精确断言**并可用 env 覆盖：上游升级或白名单调整后计数会变，此时刻意报警，
+# 由运维显式改 EXP_* 或 env（同 EXP_TOTAL 的「项数即断言」风格）。
+UPSTREAM_EXP_BROWSER="${EXP_BROWSER_TOOLS:-33}"   # 33 个工具全量暴露
+UPSTREAM_EXP_DESKTOP="${EXP_DESKTOP_TOOLS:-10}"   # 服务端白名单默认 10
+upstream_judge() { # → 打印 "OK <browser=N desktop=M>" 或 "FAIL <原因>"
+  local b d bad=""
+  b="$(upstream_tools browser)"; d="$(upstream_tools desktop)"
+  case "$b" in ''|ERR:*) bad="browser=$b" ;; esac
+  case "$d" in ''|ERR:*) bad="${bad:+$bad; }desktop=$d" ;; esac
+  if [ -z "$bad" ]; then
+    [ "$b" = "$UPSTREAM_EXP_BROWSER" ] || bad="browser=$b!=${UPSTREAM_EXP_BROWSER}"
+    [ "$d" = "$UPSTREAM_EXP_DESKTOP" ] || bad="${bad:+$bad; }desktop=$d!=${UPSTREAM_EXP_DESKTOP}"
+  fi
+  if [ -n "$bad" ]; then echo "FAIL $bad（browser=$b desktop=$d）"; else echo "OK browser=$b desktop=$d"; fi
+}
+
 tunnel_pid() { # → 隧道 daemon pid（读不到/无文件输出 0）
   # tunnel.pid 是 JSON（{"pid":57857,...}），不是纯数字文本。
   # 早期用 `tr -dc '0-9'` 会把 11 行 JSON 里所有数字拼成一串，kill -0 必然失败（2026-11-16 实测）。

@@ -4,8 +4,8 @@
 #   1 建 host↔VM 免密 SSH 通道      ─┐ 并行
 #   2 取包 + 装 host 端插件          ─┘
 #   3 起 winvm-tunnel service 并验证 ─┐ 并行（需 1+2）
-#   4 装 VM 端 + 起 mcp/a2a service  ─┘
-#   5 verify（三探针 + 终态矩阵）
+#   4 装 VM 端（含 npm 上游 agent-browser/agent-desktop）+ 起 mcp/a2a service + 上游判据 ─┘
+#   5 verify（三探针 + 终态矩阵 + 上游工具面）
 #
 # 用法：
 #   VM_HOST=172.16.100.2 bash scripts/deploy.sh                 # 全链
@@ -13,6 +13,7 @@
 #   VM_HOST=... bash scripts/deploy.sh --from 3                 # 从第 3 步起
 #   VM_HOST=... bash scripts/deploy.sh --serial                 # 关并行（排障用）
 #   VM_HOST=... RELEASE_TAG=V1.4.30 bash scripts/deploy.sh      # 锁版本
+#   VM_HOST=... SKIP_UPSTREAMS=1 bash scripts/deploy.sh         # 不装/不验两个上游工具面
 #
 # 首次运行会在第 1 步打印一条「用户只需要做这一件事」的命令并退出（rc=2）。
 # 用户在 VM 粘贴执行后，**重跑同一条命令**即可；已完成的步骤幂等跳过。
@@ -26,7 +27,7 @@ while [ $# -gt 0 ]; do
     --only) ONLY="$2"; shift ;;
     --from) FROM="$2"; shift ;;
     --serial) SERIAL=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -34,6 +35,11 @@ done
 
 resolve_env; need_node; need_py; need_bash
 require_host
+# 上游工具面开关（agent-browser / agent-desktop）：0=装且验（默认），1=既不装也不验。
+# 两个下游口径同源：SKIP_UPSTREAMS → deploy-4/5 跳过判据；WINVM_SKIP_UPSTREAMS → setup.mjs 透传
+# --skip-upstreams（否则会出现「装了但不验」或「验了但没装」的错配）。
+: "${SKIP_UPSTREAMS:=0}"; export SKIP_UPSTREAMS
+[ "$SKIP_UPSTREAMS" = "1" ] && export WINVM_SKIP_UPSTREAMS=1
 state_set VM_HOST "$VM_HOST"; state_set VM_USER "$VM_USER"; state_set VM_SSH_PORT "$VM_SSH_PORT"
 
 echo "════════════════════════════════════════════════════════════"

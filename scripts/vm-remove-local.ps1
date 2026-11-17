@@ -1,6 +1,7 @@
 param(
   [switch]$Apply,
   [switch]$PurgeWorkspace,
+  [switch]$KeepUpstreams,
   [switch]$ScheduleTunnelRollback
 )
 # winvm-plugin-deploy v1.5.0 - VM-side LOCAL uninstaller.
@@ -10,6 +11,11 @@ param(
 # SYSTEM task so the VM executes it after the current session is gone.
 # ASCII-only on purpose (ps-run.sh payload guard); never touches sshd by itself.
 $ErrorActionPreference = 'Continue'
+# SSH sessions (Windows OpenSSH -> cmd.exe/powershell) get the bare machine PATH only:
+# C:\nodejs (where npm/node and the upstream CLIs live) is a USER path entry on this VM.
+# Without this fix `Get-Command npm` returns nothing and the upstream cleanup silently
+# degrades to a warning (2026-11-17 real-machine finding).
+$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
 $TaskName = 'WinVMBridge.Service'
 $BridgeDir = 'C:\WinVMBridge'
 $WorkspaceDir = 'C:\WinVMWorkspace'
@@ -119,7 +125,58 @@ if (Test-Path $side) {
   if ($Apply) { Remove-Item $side -Force }
 } else { Write-Output '[SKIP] VM side.json not present' }
 
-# ---------- 8) OPTIONAL POST ACTION: tunnel rollback on the VM itself ----------
+# ---------- 8) MCP upstream CLIs (agent-browser / agent-desktop) ----------
+# These are installed by install-vm.mjs [4b/6] as GLOBAL npm packages and proxied by
+# vm-service as /mcp/browser and /mcp/desktop. Uninstalling the plugin leaves them
+# orphaned (nothing else on this VM uses them), so they are removed by default;
+# -KeepUpstreams opts out.
+# Two steps: (a) kill orphan upstream processes - children of the killed vm-service
+# may outlive it (headed Chromium, agent-desktop daemons); (b) npm uninstall -g.
+Write-Output '--- 8) MCP upstream CLIs (agent-browser / agent-desktop) ---'
+$UpPkgs = @('agent-browser', 'agent-desktop')
+
+function Kill-UpstreamProc {
+  $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ProcessId -ne $PID -and $_.CommandLine -and (
+      ($_.CommandLine -match 'agent-desktop') -or
+      ($_.CommandLine -match 'agent-browser') -or
+      ($_.CommandLine -match 'ms-playwright')
+    )
+  }
+  if (-not $procs) { Write-Output '[SKIP] no orphan upstream process'; return }
+  foreach ($p in $procs) {
+    Act ('taskkill /T /F ' + $p.Name + ' PID ' + $p.ProcessId)
+    if ($Apply) { $null = taskkill /PID $p.ProcessId /T /F 2> $null }
+  }
+}
+Kill-UpstreamProc
+
+if ($KeepUpstreams) {
+  Write-Output '[KEEP] upstream CLIs kept (-KeepUpstreams)'
+} elseif (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+  Write-Output '[WARN] npm not found on PATH; upstream CLIs left in place'
+} else {
+  foreach ($pkg in $UpPkgs) {
+    if (-not (Get-Command $pkg -ErrorAction SilentlyContinue)) {
+      Write-Output ('[SKIP] ' + $pkg + ' not installed')
+      continue
+    }
+    Act ('npm uninstall -g ' + $pkg)
+    if ($Apply) {
+      & npm uninstall -g $pkg --no-fund --no-audit 2>&1 | Out-Null
+      if ($LASTEXITCODE -eq 0) { Write-Output ('[OK]  npm uninstall -g ' + $pkg) }
+      else { Write-Output ('[WARN] npm uninstall -g ' + $pkg + ' exit=' + $LASTEXITCODE) }
+    }
+  }
+}
+$leftUp = @()
+foreach ($pkg in $UpPkgs) {
+  if (Get-Command $pkg -ErrorAction SilentlyContinue) { $leftUp += $pkg }
+}
+$leftUpTxt = if ($leftUp.Count -eq 0) { 'NONE' } else { $leftUp -join ',' }
+Write-Output ('UPSTREAM_LEFT=' + $leftUpTxt)
+
+# ---------- 9) OPTIONAL POST ACTION: tunnel rollback on the VM itself ----------
 # The hos template -Rollback removes the authorized key / sshd_config / firewall,
 # which kills this very session. Scheduling it as a SYSTEM task lets the VM finish
 # the teardown on its own. Same mechanism as hos destroy-tunnel.sh.
@@ -147,6 +204,11 @@ $l2 = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyC
 Write-Output ('PORT_LISTEN=' + [bool]$l2)
 $leftNodes = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match [regex]::Escape($BridgeDir) }
 Write-Output ('BRIDGE_NODE_LEFT=' + [bool]$leftNodes)
+$leftUp2 = @()
+foreach ($pkg in $UpPkgs) {
+  if (Get-Command $pkg -ErrorAction SilentlyContinue) { $leftUp2 += $pkg }
+}
+Write-Output ('UPSTREAM_LEFT=' + $(if ($leftUp2.Count -eq 0) { 'NONE' } else { $leftUp2 -join ',' }))
 $sshd2 = Get-Service sshd -ErrorAction SilentlyContinue
 Write-Output ('SSHD=' + $(if ($sshd2) { $sshd2.Status } else { 'NOT_FOUND' }))
 if ($Apply) { Write-Output 'VM_CLEANUP_DONE' }

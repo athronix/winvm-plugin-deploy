@@ -2,13 +2,14 @@
 # undeploy.sh · 卸载 WinVM Bridge（3 步，单命令）
 #
 #   1 停 winvm-tunnel service + 卸 host 端插件   ─┐ 并行（互不依赖）
-#   2 停 VM 端 service + 卸 VM 端模块            ─┘
+#   2 停 VM 端 service + 卸 VM 端模块 + 卸上游 MCP CLI  ─┘
 #   3 拆 SSH 通道（--remove-ssh-tunnel yes|no，默认 no）← 需第 2 步完成
 #
 # 用法：
 #   VM_HOST=172.16.100.2 bash scripts/undeploy.sh                        # 默认保留通道
 #   VM_HOST=... bash scripts/undeploy.sh --remove-ssh-tunnel yes         # 连通道一起拆
 #   VM_HOST=... bash scripts/undeploy.sh --purge-workspace               # 连 C:\WinVMWorkspace 一起删
+#   VM_HOST=... bash scripts/undeploy.sh --keep-upstreams                # 保留 agent-browser/agent-desktop
 #   VM_HOST=... bash scripts/undeploy.sh --dry-run                       # 只打印计划
 #   VM_HOST=... bash scripts/undeploy.sh --only 2                        # 定点重跑
 #
@@ -17,16 +18,17 @@ set -u
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/_common.sh"
 
-RM_TUNNEL="no"; PURGE=0; DRY=0; ONLY=""; SERIAL=0
+RM_TUNNEL="no"; PURGE=0; DRY=0; ONLY=""; SERIAL=0; KEEP_UP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --remove-ssh-tunnel) RM_TUNNEL="${2:-no}"; shift ;;
     --remove-ssh-tunnel=*) RM_TUNNEL="${1#*=}" ;;
     --purge-workspace) PURGE=1 ;;
+    --keep-upstreams) KEEP_UP=1 ;;
     --dry-run) DRY=1 ;;
     --only) ONLY="$2"; shift ;;
     --serial) SERIAL=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -43,7 +45,7 @@ echo "════════════════════════�
 if [ "$DRY" = "1" ]; then
   echo "DRY-RUN：不加 --dry-run 即执行。预计 3 段："
   echo "  1a tunnel stop  1b uninstall.mjs --apply(host-only)  1c host 复核"
-  echo "  2a 通道判定    2b scp 卸载脚本  2c schtasks+删目录  2d VM 五点"
+  echo "  2a 通道判定    2b scp 卸载脚本  2c schtasks+删目录+卸上游CLI$([ "$KEEP_UP" = "1" ] && echo '（--keep-upstreams 跳过）')  2d VM 终态"
   echo "  3  --remove-ssh-tunnel=$RM_TUNNEL $([ "$RM_TUNNEL" = "yes" ] && echo '(SYSTEM post 动作或用户命令)')"
   echo "CHANNEL_UP=$(channel_ready 5000 && echo 1 || echo 0)  REBUILD=NO"
   exit 0
@@ -52,7 +54,9 @@ fi
 run_step() {
   case "$1" in
     1) bash "$SCRIPTDIR/undeploy-1-host.sh" ;;
-    2) bash "$SCRIPTDIR/undeploy-2-vm.sh" $([ "$PURGE" = "1" ] && echo --purge-workspace) ;;
+    2) bash "$SCRIPTDIR/undeploy-2-vm.sh" \
+         $([ "$PURGE" = "1" ] && echo --purge-workspace) \
+         $([ "$KEEP_UP" = "1" ] && echo --keep-upstreams) ;;
     3) bash "$SCRIPTDIR/undeploy-3-ssh.sh" --remove-ssh-tunnel "$RM_TUNNEL" ;;
     *) echo "无此步骤: $1" >&2; return 2 ;;
   esac
