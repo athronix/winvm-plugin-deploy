@@ -102,6 +102,8 @@ print_user_command() {
   # 命令内联候选数组逐个 try，失败才抛错；全程只用单引号（经 Git Bash 粘贴不会被吞引号）。
   local srcs; srcs="$(sshd_script_srcs_ps 3)"
   [ -n "$srcs" ] || srcs="'$url'"
+  # irm 备选命令与 -File 路径共用同一候选数组：VM 出口网络与宿主不同，单源失败率高。
+  local raw_main="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1"
   cat <<EOF
 
 ════════════════════ user 只需要做这一件事 ════════════════════
@@ -111,6 +113,9 @@ print_user_command() {
 
 脚本会自己存到 VM 的 C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1
 （卸载通道时直接：powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1 -Rollback）
+
+【备选：不想先落盘时用 irm|iex 直跑】脚本会把自己再下载落盘到同一路径，功能等价：
+\$ErrorActionPreference='Stop';\$src=@($srcs);\$s=\$null;foreach(\$x in \$src){try{\$s=Invoke-RestMethod -UseBasicParsing -Uri \$x -TimeoutSec 45;if(\$s){break}}catch{}};if(-not \$s){throw 'DOWNLOAD_ALL_FAILED'};&([scriptblock]::Create(\$s)) -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT -SelfUrl \$src$allow_arg
 ══════════════════════════════════════════════════════════════
 EOF
   echo "脚本来源（按序尝试，最多 3 个）:"

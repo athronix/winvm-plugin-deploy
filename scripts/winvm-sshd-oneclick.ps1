@@ -104,7 +104,9 @@ param(
   [int]   $DownloadTimeoutSec = 180,
   [string]$PublicKeyFile,               # 公钥文件路径（-PublicKey 未给/为占位符时读这里）
   [string]$InstallDir = (Join-Path $env:ProgramData 'WinVMDeploy'),  # 本脚本自留目录（卸载时 -Rollback 的固定路径）
-  [switch]$NoSelfStage                  # 跳过"把自己复制到 InstallDir"（自检/测试用）
+  [switch]$NoSelfStage,                 # 跳过"把自己复制到 InstallDir"（自检/测试用）
+  [string[]]$SelfUrl = @(),             # irm|iex 模式的自落盘源（可多个，按序回退）；缺省用技能仓 raw@main
+  [switch]$NoSelfFetch                  # irm|iex 模式下禁止联网自下载（离线/纯演练用）
 )
 
 $SCRIPT_VERSION = '2.4.0'
@@ -119,16 +121,53 @@ if ($env:SSH_CONNECTION) { try { [Console]::OutputEncoding = [System.Text.Encodi
 #     powershell -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1 -Rollback
 #  journal 在 C:\ProgramData\ssh\wb-tunnel-state.json，与本脚本位置无关，故复制不影响可逆性。
 # =====================================================================
-$script:SelfStaged = $false
+$script:SelfStaged    = $false
+$script:SelfStageMode = 'none'          # copy / existing / fetch / none
+$script:SelfUrlUsed   = ''
 $script:SelfPathFinal = Join-Path $InstallDir 'winvm-sshd-oneclick.ps1'
+# 缺省自落盘源：技能源仓已 public，raw@main 匿名可下，且永远是最新版（不带 tag 是为了
+# 兼容 irm|iex——这种执行方式拿不到任何版本上下文）。
+$script:SelfUrlDefault = 'https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1'
+
 if (-not $NoSelfStage) {
   try {
-    $src = $PSCommandPath
-    if ($src -and ([IO.Path]::GetFullPath($src) -ne [IO.Path]::GetFullPath($script:SelfPathFinal))) {
+    $src = ''
+    try { $src = [string]$PSCommandPath } catch { $src = '' }
+    if (-not $src) { try { $src = [string]$MyInvocation.MyCommand.Path } catch { $src = '' } }
+    $finalFull = [IO.Path]::GetFullPath($script:SelfPathFinal)
+    $srcFull = ''
+    if ($src) { try { $srcFull = [IO.Path]::GetFullPath($src) } catch { $srcFull = '' } }
+
+    if ($srcFull -and (Test-Path -LiteralPath $srcFull) -and ($srcFull -ne $finalFull)) {
+      # 1) 常规 -File 执行：复制自身
       New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-      Copy-Item -LiteralPath $src -Destination $script:SelfPathFinal -Force
-      $script:SelfStaged = $true
-    } elseif (Test-Path -LiteralPath $script:SelfPathFinal) { $script:SelfStaged = $true }
+      Copy-Item -LiteralPath $srcFull -Destination $script:SelfPathFinal -Force
+      $script:SelfStaged = $true; $script:SelfStageMode = 'copy'
+    } elseif (Test-Path -LiteralPath $script:SelfPathFinal) {
+      # 2) 已落盘（重复执行）
+      $script:SelfStaged = $true; $script:SelfStageMode = 'existing'
+    } elseif (-not $NoSelfFetch) {
+      # 3) irm <url> | iex —— $PSCommandPath 为空，内存里只有脚本文本。
+      #    必须先把自身下载落盘，否则将来没有 -Rollback 可执行文件（通道拆不掉）。
+      $srcList = @()
+      foreach ($u in @($SelfUrl)) { if (-not [string]::IsNullOrWhiteSpace($u)) { $srcList += $u.Trim() } }
+      if ($script:SelfUrlDefault) { $srcList += $script:SelfUrlDefault }
+      New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+      $tmo = 45
+      if ($DownloadTimeoutSec -gt $tmo) { $tmo = $DownloadTimeoutSec }
+      foreach ($u in $srcList) {
+        try {
+          Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $script:SelfPathFinal -TimeoutSec $tmo -ErrorAction Stop
+          if ((Test-Path -LiteralPath $script:SelfPathFinal) -and ((Get-Item -LiteralPath $script:SelfPathFinal).Length -gt 1024)) {
+            $script:SelfStaged = $true; $script:SelfStageMode = 'fetch'; $script:SelfUrlUsed = $u
+            break
+          }
+        } catch { }
+      }
+      if (-not $script:SelfStaged) {
+        Remove-Item -LiteralPath $script:SelfPathFinal -Force -ErrorAction SilentlyContinue
+      }
+    }
   } catch { }
 }
 
@@ -1334,7 +1373,9 @@ function Invoke-Rollback {
   Say '   sh ~/.workbuddy/skills/winvm-plugin-deploy/scripts/verify-tunnel.sh 172.16.100.2 User' 'White'
   Say ''
   Info '如需继续检查当前状态：'
-  Say '   powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1 -Continue' 'White'
+  $selfHint = $script:SelfPathFinal
+  if (-not $script:SelfStaged) { $selfHint = '<oneclick 脚本路径（本脚本未落盘，请先下载）>' }
+  Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $selfHint + '" -Continue') 'White'
   Say ''
 }
 
@@ -1681,7 +1722,7 @@ function Show-Diagnostics {
   if (-not $svc) {
     Err '结论：sshd 未安装 —— 通道尚未构建，或已被 -Rollback 卸载。'
     Say '    下一步：以管理员执行 build：' 'Yellow'
-    Say '      powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1' 'White'
+    Say ('      powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '"') 'White'
   } elseif (-not $svcRunning) {
     Err ("结论：服务存在但状态是 {0} —— 没在跑。" -f $svc.Status)
     Say '    下一步：Start-Service sshd；若起不来，看第 11 项事件日志的错误码。' 'Yellow'
@@ -2279,6 +2320,8 @@ try {
   } catch { $script:IsAdmin = $false }
 
   try { $script:SelfPath = [string]$MyInvocation.MyCommand.Path } catch { $script:SelfPath = '' }
+  # irm|iex 时 MyCommand.Path 为空，但脚本已自落盘 ⇒ 用落盘副本做身份（sha256 才能对上）
+  if (-not $script:SelfPath -and $script:SelfStaged -and (Test-Path -LiteralPath $script:SelfPathFinal)) { $script:SelfPath = $script:SelfPathFinal }
   if (-not $script:SelfPath) { $script:SelfPath = 'interactive-paste（整段粘贴执行）' }
   if ($script:SelfPath -and (Test-Path -LiteralPath $script:SelfPath)) { $script:SelfSha = Get-FileShaSafe $script:SelfPath }
 
@@ -2298,6 +2341,9 @@ try {
   elseif ($dryRunMode) { $modeLabel = '预演（-DryRun，零副作用）' }
   Say (" wb-tunnel v{0}   {1}" -f $SCRIPT_VERSION, $modeLabel) 'Cyan'
   Say (" 目标：{0}@{1}:{2}     管理员：{3}     日志：{4}" -f $User, $env:COMPUTERNAME, $Port, $script:IsAdmin, $script:LogFile) 'Cyan'
+  $stageNote = 'selfstage=' + $script:SelfStageMode
+  if ($script:SelfUrlUsed) { $stageNote = $stageNote + '  <- ' + $script:SelfUrlUsed }
+  Say (" 自落盘：{0}" -f $stageNote) 'Cyan'
   Say '================================================================' 'Cyan'
 
   # ---------- 1) -Rollback（可先回滚，再体检） ----------
@@ -2945,10 +2991,15 @@ try {
   Detail ("操作日志：{0} 条 -> {1}" -f @($script:state.ops).Count, $StateFile)
   Detail ("本次运行日志：{0}" -f $script:LogFile)
   Say ''
-  Info '随时可做的三件事：'
-  Say '   powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1 -Continue          # 只读体检' 'White'
-  Say '   powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1 -Rollback -DryRun  # 预演回滚' 'White'
-  Say '   powershell -NoProfile -ExecutionPolicy Bypass -File .\winvm-sshd-oneclick.ps1 -Rollback          # 真回滚' 'White'
+  if ($script:SelfStaged) {
+    Info '随时可做的三件事：'
+    Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Continue          # 只读体检') 'White'
+    Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Rollback -DryRun  # 预演回滚') 'White'
+    Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Rollback          # 真回滚') 'White'
+  } else {
+    Warn ('脚本未能自落盘（selfstage=none）⇒ 将来没有确定的 -Rollback 可执行文件。')
+    Warn ('请立刻把内存里的脚本文本另存为 C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1，或用 -SelfUrl <直链> 重跑。')
+  }
   Say ''
 }
 catch {
@@ -3017,7 +3068,11 @@ catch {
   Say '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' 'Red'
   Say ''
   Say '已做过的变更都记在 journal 里，随时可精确还原：' 'Yellow'
-  Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Rollback -DryRun') 'White'
-  Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Continue') 'White'
+  if ($script:SelfStaged) {
+    Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Rollback -DryRun') 'White'
+    Say ('   powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script:SelfPathFinal + '" -Continue') 'White'
+  } else {
+    Say ('   ⚠ 脚本未落盘。请先下载 oneclick 到 ' + $script:SelfPathFinal + ' 再执行 -Rollback') 'Red'
+  }
   Say ''
 }

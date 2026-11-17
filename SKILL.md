@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端并起 mcp/a2a ⑤verify）+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务卸 VM 模块 ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本三源回退：gitee release / GitHub raw@main / GitHub release，脚本就近留存在 VM，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验。"
-version: 2.0.2
+version: 2.0.3
 agent_created: true
 ---
 
@@ -40,7 +40,11 @@ $ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-It
 
 - 命令由 `deploy-1-ssh.sh` 现拼（公钥、端口都已填好），**不需要用户改任何东西**。
 - `-AllowFrom` **默认不带**：它在 VM 侧落成防火墙白名单（只放行该来源），默认传错值会直接把宿主挡死（实测症状=连接超时）。要收紧来源才加 `VM_ALLOW_FROM=<宿主源IP>`（如 `172.16.100.1`）。
-- 脚本执行时把自己复制到 `C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1`，所以卸载阶段有确定路径。
+- 脚本执行时把自己**落盘**到 `C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1`，所以卸载阶段有确定路径。
+  - `-File` 执行 → 直接复制自身；
+  - `irm <url> | iex` 执行（`$PSCommandPath` 为空）→ **脚本先把自己下载到该路径**再跑，功能等价；
+    下载源 `-SelfUrl`（可多个，缺省 `raw@main`），离线演练可 `-NoSelfFetch` 跳过；
+  - 落盘失败会打 `selfstage=none` 警告，并明确「将来没有 -Rollback 可执行文件」。
 - 用户粘完 → **重跑同一条 deploy 命令**：1a 判到 READY 就跳过 1b~1d，直接往下走。已完成的步骤全部幂等。
 - `CHANNEL_WAIT_S=600` 可让第 1 步原地等用户粘贴（默认 0 = 打印完就退出，让命令露在前台）。
 
@@ -115,7 +119,7 @@ VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计�
 | `undeploy-1-host.sh` | 停隧道 + host-only 卸载（把 VM 目标三处屏蔽干净，防重复/挂死） |
 | `undeploy-2-vm.sh` | VM 端停服务 + 删模块 + 五点终态 |
 | `undeploy-3-ssh.sh` | 拆通道（SYSTEM post 动作 / 用户命令）+ 宿主侧精确回滚 |
-| `winvm-sshd-oneclick.ps1` | **VM 侧单脚本**：建通道 / `-Rollback` 逆序还原 / `-Continue` 只读体检；自留存量到 `C:\ProgramData\WinVMDeploy` |
+| `winvm-sshd-oneclick.ps1` | **VM 侧单脚本**：建通道 / `-Rollback` 逆序还原 / `-Continue` 只读体检；自留存量到 `C:\ProgramData\WinVMDeploy`（`-File` 复制自身，`irm\|iex` 自下载落盘） |
 | `_common.sh` | 地基：日志、`st_begin/st_end` 计时、状态文件、参数解析、依赖冒烟、`channel_ready`/`health_code` |
 | `vm-conn.sh` / `ssh2-conn.mjs` / `ps-run.sh` | 双后端（默认 ssh2）、ssh2 实体、远端 PS 执行器 |
 | `pkg-root.sh` / `download-verify.sh` / `env-detect.sh` | 包根单一事实源、取包三件套、运行时探测 |

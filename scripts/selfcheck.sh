@@ -298,6 +298,19 @@ def c_oneclick(root):
             bad.append('Ensure-OpenSSHServer 未真正探测 sshd.exe（僵尸服务壳会被误判已安装）')
         if 'sc.exe delete sshd' not in s:
             bad.append('Ensure-OpenSSHServer 未清壳（sc.exe delete sshd）')
+    # irm|iex 自落盘（v2.0.3）：$PSCommandPath 为空时必须能把自己下载到 InstallDir，
+    # 否则通道建好了却没有 -Rollback 可执行文件 ⇒ 卸载只能靠人肉重下。
+    if '[string[]]$SelfUrl' not in body:
+        bad.append('缺 -SelfUrl 参数（irm|iex 自落盘源）')
+    if "SelfStageMode = 'fetch'" not in body:
+        bad.append('缺 irm|iex 自落盘分支（SelfStageMode=fetch）')
+    if not re.search(r'Invoke-WebRequest[^\n]*-OutFile \$script:SelfPathFinal', body):
+        bad.append('自落盘分支没有真正落盘（缺 -OutFile $script:SelfPathFinal）')
+    if '$NoSelfFetch' not in body:
+        bad.append('缺 -NoSelfFetch 离线开关')
+    # 相对路径 .\winvm-sshd-oneclick.ps1 在非同一 cwd 下必然找不到 ⇒ 提示必须用绝对路径
+    if re.search(r'-File \.\\winvm-sshd-oneclick\.ps1', body):
+        bad.append('尾部提示仍用相对路径 .\\winvm-sshd-oneclick.ps1（换个 cwd 就失效）')
     return bad
 
 
@@ -457,6 +470,8 @@ def c_multi_source(root):
         bad.append('deploy-1 用户命令不是多源循环（VM 侧单源失败即卡死）')
     if '@($srcs)' not in d1:
         bad.append('deploy-1 命令未内联候选数组（@($srcs) 缺失）')
+    if d1.count('@($srcs)') < 2:
+        bad.append('deploy-1 只有一条命令内联候选（-File 主路径与 irm 备选都要多源）')
     if 'DOWNLOAD_ALL_FAILED' not in d1:
         bad.append('deploy-1 缺「全部源失败」显式出口')
 
@@ -559,6 +574,10 @@ MUTATIONS = [
     # 4c 判据断言化是 v2.0.0 真机首跑抓到的假绿（vmcheck 纯报告器 + 只看 rc）。
     # 去掉解析器门禁 ⇒ vmcheck-assert 必须报「未声明 need_py」。
     ('M7 4c 判据退化为看 rc', 'scripts/deploy-4-vm.sh', 'need_py', 'true'),
+    # irm|iex 自落盘：把「落到 InstallDir」改成「落到 TEMP」⇒ oneclick 断言必须报未真正落盘。
+    ('M17 irm 自落盘写错位置', 'scripts/winvm-sshd-oneclick.ps1',
+     '-OutFile $script:SelfPathFinal -TimeoutSec $tmo',
+     '-OutFile (Join-Path $env:TEMP \'wb-self.ps1\') -TimeoutSec $tmo'),
     # undeploy 1c 假 FAIL 的真因：curl 自带 000 + `|| echo 000` ⇒ "000000"。
     ('M8 health_code 双值回归', 'scripts/_common.sh',
      "*) printf '000' ;;", "*) printf '000'; printf '000' ;;"),
@@ -582,8 +601,10 @@ MUTATIONS = [
     ('M14 多源退化为盲选首条', 'scripts/_common.sh',
      'url_reachable "$u" && {', ': && {'),
     # 命令内联空数组：foreach 空转，等于没下载。
+    # 注入点必须唯一：1c 现在有两条命令（-File 主路径 + irm 备选）都含 $src=@($srcs)，
+    # 用更长的串锚定主路径，否则变异因 count=2 而 MISS（门禁自伤）。
     ('M15 命令内联空候选数组', 'scripts/deploy-1-ssh.sh',
-     '$src=@($srcs)', '$src=@()'),
+     '$src=@($srcs);\$ok=\$false;foreach(\$x in \$src)', '$src=@();\$ok=\$false;foreach(\$x in \$src)'),
     # 后端默认退化成 key：鸿蒙宿主机上每步都误报 NO_CHANNEL（rc=124 相位挂）。
     ('M16 后端默认退化为 key', 'scripts/vm-conn.sh',
      'VM_SSH_BACKEND="${VM_SSH_BACKEND:-auto}"', 'VM_SSH_BACKEND="${VM_SSH_BACKEND:-key}"'),
