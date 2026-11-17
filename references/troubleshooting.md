@@ -18,6 +18,7 @@
 | 三轮都没建起来 | 密钥 / 网络 / 权限三者之一 | 看 `1b.*`/`1c.*` 各轮日志；VM 侧 build 段应有 `[+]` 行而无 `[x]` |
 | `ping` 100% 丢包 | VM 整机离线（关机/暂停/断网） | 用户在 VM 管理端开机/恢复。脚本救不了，别循环重试 |
 | **每步都报 `NO_CHANNEL`，但 `ping` 通、`health=200`** | 通道后端默认值退化成 `key`（**v2.0.0 重构引入的回归**，v2.0.2 已修）。鸿蒙宿主机上 OpenSSH 二进制会相位性挂在**认证段**（`rc=124`、stderr 为空），而 `ssh2-conn.mjs ping` 同一秒仍是 `pong ready` | 先看 `vm-conn.sh` 的 `VM_SSH_BACKEND` 默认值须为 **`auto`**；临时绕过：`VM_SSH_BACKEND=ssh2 bash scripts/deploy.sh`。注意 `All configured authentication methods failed` 是**钥配错**，与本条不同 |
+| 粘 `irm\|iex` 备选命令后满屏 `意外的属性 CmdletBinding` / `表达式或语句中包含意外的标记 param` / `赋值表达式无效`（`Create` 阶段就抛） | ① 载荷文件带 **UTF-8 BOM** 或首行是 `#requires` ⇒ `[scriptblock]::Create` 的解析器不把 `param` 当参数区；② `Invoke-RestMethod` 对 text/plain 返回 `string[]`，`Create` 按 `$OFS`（空格）**拼成一行** | **脚本一行都没执行**，别去查密钥/网络。v2.0.3 起：载荷保持 UTF-8 无 BOM、版本门槛改运行期检查、1c 备选命令内联 `[string]::Join([char]10,@($s))` 归一化；门禁 `iex-safe` + M21/M22 双锁。旧包临时绕过：改用 `-File` 主路径（`Invoke-WebRequest -OutFile` + `powershell -File`，不走 scriptblock） |
 
 **通道判定只用新建连接实测**（`ssh2-conn.mjs ping`）。`health=200` 是**长连**健康，不等于新建可用——
 两者分叉正是 WEDGE 的指纹。

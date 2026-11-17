@@ -1,4 +1,3 @@
-﻿#requires -Version 5.1
 <#
   hos-winvm-ssh-tunnel / Windows 侧「一次性」配置脚本
 
@@ -109,6 +108,14 @@ param(
   [switch]$NoSelfFetch,                 # irm|iex 模式下禁止联网自下载（离线/纯演练用）
   [switch]$NoMsiCache                   # 不用 OpenSSH MSI 缓存（强制重新下载；排障用）
 )
+
+# ⚠ 本文件必须保持「UTF-8 无 BOM」且首行不是 #requires：
+#   irm|iex / [scriptblock]::Create(<字符串>) 模式下，BOM 会让解析器不认 #requires，
+#   进而把 param 块判为非法语句（实测报错：意外的属性 (CmdletBinding)），整条引导命令挂掉。
+#   版本门槛改为运行期检查（见下），param 块仍必须是 scriptblock 的第一条语句。
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+  throw ('本脚本需要 Windows PowerShell 5.1 或更高（当前：' + $PSVersionTable.PSVersion + '）')
+}
 
 $SCRIPT_VERSION = '2.4.0'
 $ErrorActionPreference = 'Stop'

@@ -18,10 +18,11 @@
 #  14  oneclick      VM 单脚本具备自归位 + 公钥文件回填 + 固定 -Rollback 路径
 #  19  multi-source  一次性脚本四源候选链：宿主逐个探测 + VM 侧 foreach 循环兜底
 #  20  backend-default 通道后端默认 auto（v2.0.0 重构退化成 key 的真机事故）
+#  21  iex-safe      载荷无 BOM、首行非 #requires、1c irm 备选做换行归一化
 #
 # 用法：
 #   bash scripts/selfcheck.sh                  # 末行 SELFCHECK=ALL_GREEN checks=N fails=0
-#   bash scripts/selfcheck.sh --mutate         # 变异自证（6 组缺陷必须被对应断言抓到）
+#   bash scripts/selfcheck.sh --mutate         # 变异自证（每组缺陷必须被对应断言抓到）
 #   SELFCHECK_WORK=<dir> bash scripts/selfcheck.sh
 #
 # 退出码：0 全绿 / 1 有 FAIL / 2 前置缺失
@@ -558,6 +559,33 @@ def c_output_hygiene(root):
     return bad
 
 
+def c_iex_safe(root):
+    """irm|iex 兼容性（2026-11-17 真机实测的三个死因，逐个锁死）。
+
+    用户不想先落盘时用备选命令直跑，PS5.1 的解析器在这条路径上比 `-File` 严格：
+      a) 文件带 UTF-8 BOM ⇒ 解析器不认首行是 #requires，把它当普通注释，
+         于是 param 块不再位于「脚本参数区」，报
+         「意外的属性 CmdletBinding」/「表达式或语句中包含意外的标记 param」——
+         脚本一行都没执行，用户只看到满屏红字。
+      b) 首行 #requires ⇒ scriptblock 上下文不保证支持，统一改运行期版本检查。
+      c) Invoke-RestMethod 对 text/plain 可能返回 string[]，
+         [scriptblock]::Create 会按 $OFS（空格）拼成**一行** ⇒ 同样解析失败。
+         故命令必须先 [string]::Join([char]10, ...) 归一化。
+    """
+    bad = []
+    p = os.path.join(root, 'scripts', 'winvm-sshd-oneclick.ps1')
+    raw = open(p, 'rb').read()
+    if raw[:3] == b'\xef\xbb\xbf':
+        bad.append('winvm-sshd-oneclick.ps1 带 UTF-8 BOM（irm|iex 下 Create 解析必挂）')
+    first = raw.split(b'\n', 1)[0].strip().lower()
+    if first.startswith(b'#requires'):
+        bad.append('oneclick 首行是 #requires（scriptblock 场景不保证支持，改运行期检查）')
+    d1 = read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh'))
+    if '[string]::Join([char]10' not in d1:
+        bad.append('1c 的 irm 备选缺换行归一化（irm 返回 string[] 时会被拼成一行）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -568,6 +596,7 @@ CHECKS = [
     ('health-code', c_health_code), ('rollback-path', c_rollback_path),
     ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
     ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
+    ('iex-safe', c_iex_safe),
 ]
 
 
@@ -657,6 +686,12 @@ MUTATIONS = [
     # 后端默认退化成 key：鸿蒙宿主机上每步都误报 NO_CHANNEL（rc=124 相位挂）。
     ('M16 后端默认退化为 key', 'scripts/vm-conn.sh',
      'VM_SSH_BACKEND="${VM_SSH_BACKEND:-auto}"', 'VM_SSH_BACKEND="${VM_SSH_BACKEND:-key}"'),
+    # irm 备选命令把 #requires 当首行：scriptblock 上下文不保证支持，真机验证前必须拦住。
+    ('M21 首行退回 #requires', 'scripts/winvm-sshd-oneclick.ps1',
+     '<#\n  hos-winvm-ssh-tunnel', '#requires -Version 5.1\n<#\n  hos-winvm-ssh-tunnel'),
+    # 去掉换行归一化：irm 返回 string[] 时 Create 拼成一行 ⇒ 满屏 ParseException。
+    ('M22 irm 备选缺归一化', 'scripts/deploy-1-ssh.sh',
+     r'\$s=[string]::Join([char]10,@(\$s));', ''),
 ]
 
 

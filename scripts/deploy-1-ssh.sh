@@ -115,7 +115,7 @@ print_user_command() {
 （卸载通道时直接：powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1 -Rollback）
 
 【备选：不想先落盘时用 irm|iex 直跑】脚本会把自己再下载落盘到同一路径，功能等价：
-\$ErrorActionPreference='Stop';\$src=@($srcs);\$s=\$null;foreach(\$x in \$src){try{\$s=Invoke-RestMethod -UseBasicParsing -Uri \$x -TimeoutSec 45;if(\$s){break}}catch{}};if(-not \$s){throw 'DOWNLOAD_ALL_FAILED'};&([scriptblock]::Create(\$s)) -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT -SelfUrl \$src$allow_arg
+\$ErrorActionPreference='Stop';\$src=@($srcs);\$s=\$null;foreach(\$x in \$src){try{\$s=Invoke-RestMethod -UseBasicParsing -Uri \$x -TimeoutSec 45;if(\$s){break}}catch{}};if(-not \$s){throw 'DOWNLOAD_ALL_FAILED'};\$s=[string]::Join([char]10,@(\$s));&([scriptblock]::Create(\$s)) -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT -SelfUrl \$src$allow_arg
 ══════════════════════════════════════════════════════════════
 EOF
   local nsrc; nsrc="$(printf '%s' "$srcs" | awk -F',' '{print NF}')"
