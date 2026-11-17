@@ -16,6 +16,7 @@
 #  12  no-rebuild    卸载脚本不出现建通道字样
 #  13  links         SKILL.md 相对链接目标存在
 #  14  oneclick      VM 单脚本具备自归位 + 公钥文件回填 + 固定 -Rollback 路径
+#  19  multi-source  一次性脚本四源候选链：宿主逐个探测 + VM 侧 foreach 循环兜底
 #
 # 用法：
 #   bash scripts/selfcheck.sh                  # 末行 SELFCHECK=ALL_GREEN checks=N fails=0
@@ -393,11 +394,12 @@ def c_rollback_path(root):
     if not fm:
         bad.append('_common.sh 找不到 sshd_script_url()')
     else:
-        fbody = fm.group(1)
-        if re.search(r'(?<!\$\{)"\$PY"', fbody):
-            bad.append('sshd_script_url 裸用 "$PY"（set -u 下 unbound variable，URL 静默变空）')
-        if 'command -v python3' not in fbody:
-            bad.append('sshd_script_url 缺 python3 兜底查找')
+        # tag 解析已拆到 _sshd_release_tag()：兜底查找按整个文件判，不绑单个函数。
+        if 'command -v python3' not in cm:
+            bad.append('_common.sh 缺 python3 兜底查找（无 PY 时 URL 解析静默失败）')
+    # 裸用 $PY 的检查必须覆盖整个文件：tar 解析拆函数后单看 sshd_script_url 会漏（M10 假绿实证）。
+    if re.search(r'(?<!\$\{)"\$PY"', cm):
+        bad.append('_common.sh 裸用 "$PY"（set -u 下 unbound variable，URL 静默变空）')
     return bad
 
 
@@ -425,6 +427,52 @@ def c_vmcheck_assert(root):
     return bad
 
 
+def c_multi_source(root):
+    """远端一次性脚本必须多源可取——这是部署/拆通道最常见的「资源下不下来」死点。
+
+    a) _common.sh 提供候选列表 + 逐个可达性探测 + PS 数组拼接（不许多源退化成单源）；
+    b) deploy-1 给用户的命令内含 foreach 多源循环，全失败必须显式抛错；
+    c) undeploy-3 的 PS 模板同样多源；
+    d) SKILL.md 不得再声称源仓 private（2026-11-17 已转 public），且必须记载 raw 源。
+    """
+    bad = []
+    cm = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    for fn in ('sshd_script_urls()', 'sshd_script_srcs_ps()'):
+        if fn not in cm:
+            bad.append('_common.sh 缺 %s' % fn)
+    if 'raw.githubusercontent.com' not in cm:
+        bad.append('_common.sh 候选链缺 GitHub raw（public 后该源最稳）')
+    m = re.search(r'sshd_script_url\(\)\s*\{(.*?)\n\}', cm, re.S)
+    body = m.group(1) if m else ''
+    if 'while IFS= read -r u' not in body:
+        bad.append('sshd_script_url 未逐个探测候选（直接取第一条=单源退化）')
+    if 'url_reachable' not in body:
+        bad.append('sshd_script_url 未做可达性探测')
+
+    d1 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh')))
+    # 注：命令行落在 bash heredoc 里，源码含 `\$` 转义（运行期还原成 `$`），
+    # 故断言只锚不含 `$` 的片段，避免被转义写法绑架。
+    if 'foreach(' not in d1:
+        bad.append('deploy-1 用户命令不是多源循环（VM 侧单源失败即卡死）')
+    if '@($srcs)' not in d1:
+        bad.append('deploy-1 命令未内联候选数组（@($srcs) 缺失）')
+    if 'DOWNLOAD_ALL_FAILED' not in d1:
+        bad.append('deploy-1 缺「全部源失败」显式出口')
+
+    u3 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-3-ssh.sh')))
+    if '$src = @(__SRCS__)' not in u3:
+        bad.append('undeploy-3 下载模板未内联多源数组')
+    if 'DOWNLOAD_FAILED' not in u3:
+        bad.append('undeploy-3 缺下载失败出口')
+
+    sk = strip_comments(read(os.path.join(root, 'SKILL.md')))
+    if 'private' in sk:
+        bad.append('SKILL.md 仍含 private 表述（源仓 2026-11-17 已转 public）')
+    if 'raw.githubusercontent.com' not in sk:
+        bad.append('SKILL.md 未记载 GitHub raw 源（文档与实现脱节）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -433,7 +481,7 @@ CHECKS = [
     ('no-rebuild', c_no_rebuild), ('links', c_links), ('oneclick', c_oneclick),
     ('vmcheck-assert', c_vmcheck_assert),
     ('health-code', c_health_code), ('rollback-path', c_rollback_path),
-    ('tunnel-signal', c_tunnel_signal),
+    ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
 ]
 
 
@@ -458,6 +506,8 @@ def run_all(root):
 _M1_TAIL = 'grep -c foo /dev/null'
 _M1_OR = ' || echo 0'
 
+_CUR_VER = (re.search(r'^version:\s*(\S+)', read(os.path.join(ROOT, 'SKILL.md')), re.M) or [None, '2.0.1'])[1]
+
 MUTATIONS = [
     ('M1 grep-c 假红回归', 'scripts/_common.sh',
      "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n'",
@@ -471,7 +521,8 @@ MUTATIONS = [
     ('M5 1a 判据改成常量', 'scripts/deploy-1-ssh.sh',
      'st_begin 1a "判断 host↔VM 免密通道"\nif channel_ready 5000; then',
      'st_begin 1a "判断 host↔VM 免密通道"\nif true; then'),
-    ('M6 版本非 SemVer', 'SKILL.md', 'version: 2.0.0', 'version: 2.0'),
+    # 版本号会被升版改掉 ⇒ 注入点必须现读，否则每次升版 M6 都 MISS（门禁自伤）。
+    ('M6 版本非 SemVer', 'SKILL.md', 'version: ' + _CUR_VER, 'version: 2.0'),
     # 4c 判据断言化是 v2.0.0 真机首跑抓到的假绿（vmcheck 纯报告器 + 只看 rc）。
     # 去掉解析器门禁 ⇒ vmcheck-assert 必须报「未声明 need_py」。
     ('M7 4c 判据退化为看 rc', 'scripts/deploy-4-vm.sh', 'need_py', 'true'),
@@ -494,6 +545,12 @@ MUTATIONS = [
     ('M13 3c 退回只看 health', 'scripts/deploy-3-tunnel.sh',
      'if port_listening "$PORT"; then OK=1; break; fi',
      'HC0="$(health_code "$PORT" 6)"; [ "$HC0" = "200" ] && { OK=1; break; }'),
+    # 多源退化成"盲选第一条"：拿不到可达性就发命令 ⇒ VM 侧 404 时用户彻底卡死。
+    ('M14 多源退化为盲选首条', 'scripts/_common.sh',
+     'url_reachable "$u" && {', ': && {'),
+    # 命令内联空数组：foreach 空转，等于没下载。
+    ('M15 命令内联空候选数组', 'scripts/deploy-1-ssh.sh',
+     '$src=@($srcs)', '$src=@()'),
 ]
 
 

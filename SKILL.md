@@ -1,6 +1,6 @@
 ---
 name: winvm-plugin-deploy
-description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。v2.0.0 起结构定为 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端并起 mcp/a2a ⑤verify）+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务卸 VM 模块 ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（脚本由 VM 从远端下载就近留存，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包下载失败、插件健康复验。"
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端并起 mcp/a2a ⑤verify）+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务卸 VM 模块 ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本三源回退：gitee release / GitHub raw@main / GitHub release，脚本就近留存在 VM，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验。"
 version: 2.0.1
 agent_created: true
 ---
@@ -44,16 +44,25 @@ $ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-It
 - 用户粘完 → **重跑同一条 deploy 命令**：1a 判到 READY 就跳过 1b~1d，直接往下走。已完成的步骤全部幂等。
 - `CHANNEL_WAIT_S=600` 可让第 1 步原地等用户粘贴（默认 0 = 打印完就退出，让命令露在前台）。
 
-### 远端脚本从哪来
+### 远端脚本从哪来（三源回退）
 
-技能源仓是 **private**，`raw.githubusercontent.com` 匿名拉不到。`winvm-sshd-oneclick.ps1` 随母项目 release 作为**独立资产**发布，VM 用 gitee 直链下载：
+`winvm-sshd-oneclick.ps1` 有三个源，宿主侧逐个 HEAD 探测取首个可达，VM 侧按同一顺序循环兜底
+（2026-11-17 起技能源仓已转 **public**，raw 匿名可下，不再依赖单一 release 资产）：
 
-```
-https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1
-```
+| 序 | 源 | 地址 |
+|---|---|---|
+| 1 | Gitee 母项目 release 资产 | `https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` |
+| 2 | GitHub 技能仓 raw @main | `https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1` |
+| 3 | GitHub 母项目 release 资产 | `https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/<tag>/winvm-sshd-oneclick.ps1` |
 
-`<tag>` 由脚本现解 `releases/latest`。要换源：`SSHD_SCRIPT_URL=<直链> bash scripts/deploy-1-ssh.sh`。
-URL 不可达时第 1 步会**直接失败并说明**——它不会假装通道建好了。
+> 刻意**不用** `raw@<tag>`：母项目 tag 是 `V1.4.x`、技能仓 tag 是 `v2.0.x`，两个命名空间不可混用，
+> 拿母项目 tag 拼技能仓 raw 路径必然 404（2026-11-17 实测）。
+
+- `<tag>` 由脚本现解 `releases/latest`（`RELEASE_TAG` 显式指定则跳过解析）。
+- 给用户的**那一行命令内联全部候选（≤3 个）**：`foreach` 逐个 `Invoke-WebRequest -TimeoutSec 45`，任一成功即继续，
+  全失败才抛 `DOWNLOAD_ALL_FAILED`。VM 的出口网络与宿主不同，单源 404/超时是部署期最常见的卡点。
+- 换源：`SSHD_SCRIPT_URL=<直链>` 永远排第一，其余候选仍作兜底。
+- 至少一源需宿主侧 HEAD=200，否则第 1 步**直接失败**并逐源打印 `[200]/[---]`——它不会假装通道建好了。
 
 ## 卸载 = 3 步
 
@@ -128,11 +137,19 @@ bash scripts/selfcheck.sh --mutate        # 变异自证：往副本注缺陷，
 | 现象 | 处置 |
 |---|---|
 | 第 1 步打印命令后退出 2 | 正常：去 VM 粘那条命令，回来重跑 deploy |
-| 第 1 步报 URL 不可达 | 该 tag 的 release 没带 `winvm-sshd-oneclick.ps1` → 发新版，或 `SSHD_SCRIPT_URL` 指定直链 |
+| 第 1 步报「全部候选源宿主侧不可达」 | 该 tag 的 release 没带 `winvm-sshd-oneclick.ps1`，且 GitHub raw 也拉不到 → 看逐源 `[200]/[---]` 输出；发新版，或 `SSHD_SCRIPT_URL` 指定直链 |
 | 通道 READY 但隧道报 `All configured authentication methods failed` | `vm-conn.json` 的 `identityFile` 指向了未被授权的钥。`deploy-3` 会自动对齐；症状仍在就看第 3 步 3a 输出 |
 | 第 3 步 health ≠ 200 | 看 `~/.workbuddy/winvm/tunnel.log`；确认 VM 端 18443 在听（第 4 步 4c 会查）。**不要重启 VM** |
 | 第 4 步 setup 超 420s 未监听 | 服务僵死：`schtasks /End /tn WinVMBridge.Service` 后 `/Run` |
 | verify 报 `ENV_WINDOW=1` | 通道瞬态窗，环境问题非功能失败。等健康窗只重跑 `verify.sh` |
 | 探针报 `total-33!=34` / `skip-N!=4` | 探针项数被改动 → 同步改 `deploy-5-verify.sh` 的 `EXP_TOTAL/EXP_SKIP`（刻意告警，别放宽） |
 
-细表见 `references/troubleshooting.md`；耗时预期见 `references/known-good-flow.md`；效率分析见 `references/performance-audit.md`。
+## 参考文档（渐进披露）
+
+| 文件 | 何时读 |
+|---|---|
+| `references/deploy-timeline.md` | 想知道每一步**该花多久**、难在哪、怎么再快一点（含实测效果列） |
+| `references/known-good-flow.md` | 想知道"正常长什么样"：各步预期输出与判据 |
+| `references/troubleshooting.md` | 任何一步报错，按病征查根因与处置 |
+| `references/performance-audit.md` | 优化耗时的历史账本与取舍理由 |
+| `references/legacy/` | v1.x 旧编排与旧通道文档，**仅留档，不作判据** |

@@ -87,23 +87,30 @@ if [ "$CH" = "1" ]; then
   # 首选 VM 上已存的那份（deploy 第 1 步留下的）；缺失时**就地下载**再跑，
   # 因为「让用户手敲一条指向不存在文件的命令」是死路（实测踩到）。
   # 绝不 scp 新模板、绝不为拆通道而重建通道。
-  URL_FOR_VM=""
-  if URL_FOR_VM="$(sshd_script_url)" && url_reachable "$URL_FOR_VM"; then
-    echo "  兜底下载源: $URL_FOR_VM"
+  # 多源：VM 出口网络与宿主不同，单源 404 会让「拆通道」直接死路，故内联候选数组逐个试。
+  SRCS_PS=""
+  URL_FOR_VM="$(sshd_script_url || true)"
+  if [ -n "$URL_FOR_VM" ] && url_reachable "$URL_FOR_VM"; then
+    SRCS_PS="$(sshd_script_srcs_ps 3)"
+    echo "  兜底下载源（首个可达）: $URL_FOR_VM（共 $(printf '%s' "$SRCS_PS" | tr ',' '\n' | awk '{n++} END{print n+0}') 个候选）"
   else
-    URL_FOR_VM=""; echo "  [WARN] 远端脚本地址不可达，缺文件时将只能给用户手工命令"
+    echo "  [WARN] 远端脚本地址不可达，缺文件时将只能给用户手工命令"
   fi
   cat > "$PL.ps1" <<'PS1'
-$rb = 'C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1'
-$u  = '__URL__'
+$rb  = 'C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1'
+$src = @(__SRCS__)
 if (-not (Test-Path $rb)) {
-  if (-not $u) { Write-Output 'NO_LOCAL_SCRIPT_NO_URL'; exit 3 }
-  try {
-    New-Item -ItemType Directory -Force -Path (Split-Path $rb) | Out-Null
-    Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $rb
-    Unblock-File $rb
-    Write-Output 'DOWNLOADED'
-  } catch { Write-Output ('DOWNLOAD_FAILED: ' + $_.Exception.Message); exit 4 }
+  if ($src.Count -eq 0) { Write-Output 'NO_LOCAL_SCRIPT_NO_URL'; exit 3 }
+  $ok = $false
+  foreach ($u in $src) {
+    try {
+      New-Item -ItemType Directory -Force -Path (Split-Path $rb) | Out-Null
+      Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $rb -TimeoutSec 45
+      Unblock-File $rb; $ok = $true; break
+    } catch { Write-Output ('src-fail: ' + $u) }
+  }
+  if (-not $ok) { Write-Output 'DOWNLOAD_FAILED: all sources'; exit 4 }
+  Write-Output 'DOWNLOADED'
 }
 $tr = 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + $rb + ' -Rollback'
 $a1 = @('/Create','/TN','WbTunnelRollback','/TR',$tr,'/SC','ONCE','/ST','00:00','/RL','HIGHEST','/RU','SYSTEM','/F')
@@ -113,7 +120,7 @@ $a2 = @('/Run','/TN','WbTunnelRollback')
 Write-Output 'POST_ROLLBACK_SCHEDULED'
 PS1
   # 占位替换注入 URL（比 unquoted heredoc 转义 PS 变量安全）
-  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];fs.writeFileSync(p,fs.readFileSync(p,"utf8").replace("__URL__",process.argv[2]))' "$PL.ps1" "${URL_FOR_VM:-}"
+  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];fs.writeFileSync(p,fs.readFileSync(p,"utf8").replace("__SRCS__",process.argv[2]))' "$PL.ps1" "${SRCS_PS:-}"
   bash "$SCRIPTDIR/ps-run.sh" "$PL.ps1" > "$PL" 2>&1; PRC=$?
   tr -d '\r' < "$PL" | tail -4
   if [ $PRC -eq 0 ] && grep -q 'POST_ROLLBACK_SCHEDULED' "$PL" 2>/dev/null; then

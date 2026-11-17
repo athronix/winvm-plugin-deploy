@@ -98,18 +98,23 @@ print_user_command() {
   # 只有用户显式给 VM_ALLOW_FROM=<宿主源IP> 时才带。
   local allow_arg=""
   [ -n "${ALLOW_FROM:-}" ] && allow_arg=" -AllowFrom '$ALLOW_FROM'"
+  # 多源：VM 的出口网络与宿主不同，单源 404/超时会把用户直接卡死。
+  # 命令内联候选数组逐个 try，失败才抛错；全程只用单引号（经 Git Bash 粘贴不会被吞引号）。
+  local srcs; srcs="$(sshd_script_srcs_ps 3)"
+  [ -n "$srcs" ] || srcs="'$url'"
   cat <<EOF
 
 ════════════════════ user 只需要做这一件事 ════════════════════
 把下面【一整行】复制到 VM 的【管理员 PowerShell】里回车（约 1~3 分钟，含装 OpenSSH）
 
-\$ErrorActionPreference='Stop';\$d=Join-Path \$env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path \$d|Out-Null;iwr -UseBasicParsing -Uri '$url' -OutFile "\$d\\winvm-sshd-oneclick.ps1";Unblock-File "\$d\\winvm-sshd-oneclick.ps1";powershell -NoProfile -ExecutionPolicy Bypass -File "\$d\\winvm-sshd-oneclick.ps1" -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT$allow_arg
+\$ErrorActionPreference='Stop';\$d=Join-Path \$env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path \$d|Out-Null;\$f=Join-Path \$d 'winvm-sshd-oneclick.ps1';\$src=@($srcs);\$ok=\$false;foreach(\$x in \$src){try{Invoke-WebRequest -UseBasicParsing -Uri \$x -OutFile \$f -TimeoutSec 45;\$ok=\$true;break}catch{Write-Host ('src-fail: '+\$x)}};if(-not \$ok){throw 'DOWNLOAD_ALL_FAILED'};Unblock-File \$f;powershell -NoProfile -ExecutionPolicy Bypass -File \$f -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT$allow_arg
 
 脚本会自己存到 VM 的 C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1
 （卸载通道时直接：powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1 -Rollback）
 ══════════════════════════════════════════════════════════════
 EOF
-  echo "脚本来源: $url"
+  echo "脚本来源（按序尝试，最多 3 个）:"
+  printf '%s\n' "$srcs" | tr ',' '\n' | sed "s/^/  /;s/'//g"
   echo "公钥指纹: $(ssh-keygen -lf "$KEY.pub" 2>/dev/null || echo '(不可用)')"
   echo "NEED_USER_ACTION=1"
 }
@@ -143,14 +148,21 @@ while [ "$CH_ROUND" -lt "$ROUNDS" ]; do
   if ! URL="$(sshd_script_url)"; then
     st_end 1 FAIL "无法解析远端脚本 URL"
     die "拿不到 winvm-sshd-oneclick.ps1 的远端地址" \
-        "release 资产未发布或网络不可达" \
-        "gitee latest 解析失败" \
+        "多源候选全空（tag 解析失败且无 SSHD_SCRIPT_URL）" \
+        "sshd_script_urls() 输出为空" \
         "显式指定：SSHD_SCRIPT_URL=<直链> bash scripts/deploy-1-ssh.sh"
   fi
   if ! url_reachable "$URL"; then
-    st_end 1 FAIL "URL 不可达 $URL"
-    die "远端脚本地址不可达" "该 tag 的 release 未包含 winvm-sshd-oneclick.ps1" \
-        "HEAD $URL → 非 200" \
+    st_end 1 FAIL "全部候选源宿主侧不可达（首个 $URL）"
+    echo "  候选源（宿主侧探测结果）："
+    while IFS= read -r _u; do
+      [ -n "$_u" ] || continue
+      if url_reachable "$_u"; then echo "    [200] $_u"; else echo "    [---] $_u"; fi
+    done <<UEOF
+$(sshd_script_urls)
+UEOF
+    die "远端脚本地址全部不可达" "该 tag 的 release 未含 ps1，且 GitHub raw 也拉不到" \
+        "见上方逐源探测结果" \
         "先发布新版（资产含该 ps1），或 SSHD_SCRIPT_URL 指向可用直链"
   fi
   # -AllowFrom = VM 侧防火墙白名单（只放行该来源）。默认留空=不限定来源，

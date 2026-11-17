@@ -210,28 +210,70 @@ tunnel_alive() { # → 0=daemon 存活 1=不在
 user_home_file() { printf '%s/%s' "$HOME" "$1"; }
 
 # ── 远端 oneclick 脚本地址（deploy 第 1 步与 undeploy 第 3 步共用，单一事实源）──
-# 技能源仓是 private ⇒ raw 匿名 404，只能走母项目 release 资产（第 5 资产）。
-# 注意：本函数必须自给自足——步脚本可单独重跑，调用方未必跑过 need_py，
+# 2026-11-17：技能源仓转 **public**（athronix/winvm-plugin-deploy），raw 匿名可下 ⇒
+# 从「单一 gitee release 资产」升级为**多源候选链**，宿主侧逐个 HEAD 探测，VM 侧循环下载。
+# 「资源难以下载」是部署链最典型的止血点：VM 的出口网络与宿主不同，单源失败=用户卡死。
+# 本组函数必须自给自足——步脚本可单独重跑，调用方未必跑过 need_py，
 # 所以不许裸用 $PY（set -u 下会 unbound variable，静默把 URL 判成不可达）。
-sshd_script_url() {
-  [ -n "${SSHD_SCRIPT_URL:-}" ] && { printf '%s' "$SSHD_SCRIPT_URL"; return 0; }
-  local tag="${RELEASE_TAG:-}" py="${PY:-}" raw=""
-  if [ -z "$tag" ]; then
-    [ -n "$py" ] || py="$(command -v python3 2>/dev/null || true)"
-    raw="$(curl -fsSL --connect-timeout 10 --max-time 25 \
-      "https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest" 2>/dev/null)"
-    if [ -n "$py" ]; then
-      tag="$(printf '%s' "$raw" | "$py" -c 'import sys,json;print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
-    fi
-    # python 不可用时退回文本解析（同一 JSON 的 tag_name 字段）
-    [ -n "$tag" ] || tag="$(printf '%s' "$raw" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+_sshd_release_tag() { # 母项目最新 release tag（RELEASE_TAG 显式优先）
+  [ -n "${RELEASE_TAG:-}" ] && { printf '%s' "$RELEASE_TAG"; return 0; }
+  local py="${PY:-}" raw="" tag=""
+  [ -n "$py" ] || py="$(command -v python3 2>/dev/null || true)"
+  raw="$(curl -fsSL --connect-timeout 10 --max-time 25 \
+    "https://gitee.com/api/v5/repos/athronix/workbuddy-virtual-win-plugin/releases/latest" 2>/dev/null)"
+  if [ -n "$py" ]; then
+    tag="$(printf '%s' "$raw" | "$py" -c 'import sys,json;print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null)"
   fi
-  [ -n "$tag" ] || return 1
-  printf 'https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/%s/winvm-sshd-oneclick.ps1' "$tag"
+  # python 不可用时退回文本解析（同一 JSON 的 tag_name 字段）
+  [ -n "$tag" ] || tag="$(printf '%s' "$raw" | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+  printf '%s' "$tag"
 }
 
-url_reachable() { # url_reachable <url> → 200 才算可用
-  local code
-  code="$(curl -sIL --connect-timeout 12 --max-time 30 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null)"
+sshd_script_urls() { # 候选源，每行一个（显式 SSHD_SCRIPT_URL 永远排第一）
+  [ -n "${SSHD_SCRIPT_URL:-}" ] && printf '%s\n' "$SSHD_SCRIPT_URL"
+  local tag u; tag="$(_sshd_release_tag)"
+  local gitee_rel="" gh_rel=""
+  local gh_raw_main="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1"
+  if [ -n "$tag" ]; then
+    gitee_rel="https://gitee.com/athronix/workbuddy-virtual-win-plugin/releases/download/$tag/winvm-sshd-oneclick.ps1"
+    gh_rel="https://github.com/athronix/workbuddy-virtual-win-plugin/releases/download/$tag/winvm-sshd-oneclick.ps1"
+  fi
+  # 排序 rationale：gitee release（国内 VM 最快）→ GitHub raw@main（public 后匿名可下）
+  # → GitHub release 资产（与 gitee 同 tag，跨源兜底）。
+  # 刻意**不用** raw@<tag>：母项目 tag 是 V1.4.x、技能仓 tag 是 v2.0.x，两个命名空间不可混用，
+  # 拿母项目 tag 拼技能仓 raw 路径必然 404（2026-11-17 实测）。
+  for u in "$gitee_rel" "$gh_raw_main" "$gh_rel"; do
+    [ -n "$u" ] && printf '%s\n' "$u"
+  done
+}
+
+sshd_script_url() { # 首个宿主侧可达的候选；全不可达时退回首个候选（调用方自行判 FAIL）
+  local u first=""
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    [ -n "$first" ] || first="$u"
+    url_reachable "$u" && { printf '%s' "$u"; return 0; }
+  done <<EOF
+$(sshd_script_urls)
+EOF
+  [ -n "$first" ] || return 1
+  printf '%s' "$first"
+}
+
+sshd_script_srcs_ps() { # 前 N 个候选拼成 PowerShell 数组元素（'u1','u2'），供 VM 侧多源循环
+  local n="${1:-3}" u out="" i=0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    i=$((i + 1)); [ "$i" -gt "$n" ] && break
+    out="$out${out:+,}'$u'"
+  done <<EOF
+$(sshd_script_urls)
+EOF
+  printf '%s' "$out"
+}
+
+url_reachable() { # url_reachable <url> → 200 才算可用（探测窗短，多源串行不拖时间）
+  local t="${VM_URL_PROBE_T:-8}" code
+  code="$(curl -sIL --connect-timeout "$t" --max-time "$((t * 2))" -o /dev/null -w '%{http_code}' "$1" 2>/dev/null)"
   [ "$code" = "200" ]
 }
