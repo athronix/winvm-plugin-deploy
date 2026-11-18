@@ -849,6 +849,97 @@ def c_password_bootstrap(root):
     return bad
 
 
+def c_purge_all(root):
+    """--purge-all（彻底卸载到裸机）必须存在，且顺序硬约束要被代码固定下来。
+
+    核心不变量：会自断会话的动作（卸 sshd）必须排在最后，并且必须在同一个
+    SYSTEM 计划任务里 —— 通道一断就再没有自动化入口，顺序错了就是永久失联。
+    """
+    bad = []
+    u = strip_comments(read(os.path.join(root, 'scripts', 'undeploy.sh')))
+    if '--purge-all' not in u:
+        bad.append('undeploy.sh 缺 --purge-all（无法回到裸机）')
+    if '--purge-all' in u and 'RM_TUNNEL=yes' not in u:
+        bad.append('--purge-all 未强制 --remove-ssh-tunnel yes（sshd 永远卸不掉）')
+    if '--keep-winvmdeploy' not in u:
+        bad.append('undeploy.sh 未向第 2 步传 --keep-winvmdeploy（3b 要用的 oneclick 会被提前删）')
+    if '--purge-sshd' not in u:
+        bad.append('undeploy.sh 未向第 3 步传 --purge-sshd')
+    # --only 路径必须把 rc=2 归零：否则 `RC -ne 0` 分支先命中，PENDING 分支永远
+    # 到不了，通道 DOWN 时 `--only 3` 会报 UNDEPLOY=FAIL（11-18 实测踩到）。
+    # 两条路径（--only 与全链）都归零才是对的 ⇒ 数次数，不能只查存在。
+    _m2 = re.search(r'run_step "\$ONLY"; RC=\$\?(.*?)\nelse', u, re.S)
+    if not _m2 or 'RC=0' not in _m2.group(1):
+        bad.append('undeploy.sh 的 --only 分支未把 rc=2 归零（会误报 UNDEPLOY=FAIL）')
+
+    u2 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-2-vm.sh')))
+    if 'st_begin 2e' not in u2:
+        bad.append('undeploy-2 缺 2e（运行时深清：node/codebuddy/私钥）')
+    for k in ('CMD_NODE', 'CMD_CODEBUDDY', 'CMD_AGENT_BROWSER', 'CMD_AGENT_DESKTOP'):
+        if k not in u2:
+            bad.append('2e 未断言 %s（深清不彻底也报 PASS）' % k)
+    if 'NODEJS_DIR=False' not in u2 or 'NVM_DIR=False' not in u2:
+        bad.append('2e 未断言 node 运行时目录已消失')
+    if '-KeepWinVMDeploy' not in u2:
+        bad.append('2e 未接 -KeepWinVMDeploy（会先删掉 3b 依赖的 oneclick 脚本）')
+    # 停 sshd 会立刻杀掉执行它的会话 ⇒ 绝不能出现在第 2 步
+    if 'purge-sshd.ps1' in u2:
+        bad.append('2e 里调了 vm-purge-sshd.ps1（自断会话，必须留给第 3 步的 SYSTEM 任务）')
+
+    u3 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-3-ssh.sh')))
+    if '--purge-sshd' not in u3:
+        bad.append('undeploy-3 缺 --purge-sshd（sshd 与两处 authorized_keys 无出口）')
+    if 'WbPurgeAll' not in u3:
+        bad.append('3b 未生成 wrapper（一个 SYSTEM 任务只能挂一条命令行）')
+    if "PURGE_WRAPPER_READY" not in u3:
+        bad.append('3b 未回执 PURGE_WRAPPER_READY（wrapper 是否写成无从判断）')
+    if "'/ST','00:00'" in u3:
+        bad.append('3b 的 /ST 仍是 00:00（过去时刻 ⇒ schtasks 警告且任务不会自己触发）')
+    if 'AddMinutes' not in u3:
+        bad.append('3b 的 /ST 未用未来时刻')
+    # 通道已断时也必须能彻底卸：用户命令要自包含 sshd 清理，否则跑完 -Rollback
+    # 通道照旧不回来，而技能这边再没有入口补那一段。
+    if 'FromBase64String(' not in u3 or 'PB64U' not in u3:
+        bad.append('3b 的用户命令未内联 vm-purge-sshd（通道已断时 sshd 永远卸不掉）')
+    if '-Apply' not in u3:
+        bad.append('3b 的用户命令未真正执行 sshd 清理（缺 -Apply）')
+
+    for f in ('vm-purge-runtime.ps1', 'vm-purge-sshd.ps1'):
+        p = os.path.join(root, 'scripts', f)
+        if not os.path.exists(p):
+            bad.append('缺 %s' % f)
+            continue
+        b = open(p, 'rb').read()
+        if any(x > 127 for x in b):
+            bad.append('%s 含非 ASCII 字节（ps-run.sh 会 exit 3）' % f)
+        if b[:3] == b'\xef\xbb\xbf':
+            bad.append('%s 带 BOM（-File 解码会吞掉首行）' % f)
+        if not f.endswith('sshd.ps1') and 'PURGE_RUNTIME_DONE' not in b.decode('utf-8', 'replace'):
+            bad.append('%s 缺 PURGE_RUNTIME_DONE 回执' % f)
+
+    pss = os.path.join(root, 'scripts', 'vm-purge-sshd.ps1')
+    if os.path.exists(pss):
+        ps = read(pss)
+        # 必须锚定「目录清单」这一处：'C:\ProgramData\ssh' 在 FINAL 的 Test-Path
+        # 探针里也出现，用子串匹配会被「只删清单元素」的变异骗过（M40 就是这么 MISS 的）。
+        _m = re.search(r'foreach \(\$dir in @\(([^)]*)\)', ps)
+        _dirs = _m.group(1) if _m else ''
+        for k in ('ProgramData\\ssh', 'Program Files\\OpenSSH', 'System32\\OpenSSH'):
+            if k not in _dirs:
+                bad.append('vm-purge-sshd 的删除清单缺 %s（残留等于没卸干净）' % k)
+        for k in ('administrators_authorized_keys', 'msiexec', 'Uninstall'):
+            if k not in ps:
+                bad.append('vm-purge-sshd 未覆盖 %s' % k)
+        if 'winvm-purge-sshd.log' not in ps:
+            bad.append('vm-purge-sshd 未落日志（通道已断，没有证据就无从复盘）')
+
+    # P3：ssh-keygen -lf 的 $2 自带 SHA256: 前缀，再套一层会渲成 sha256:SHA256:…
+    d1 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh')))
+    if 'pub=sha256:' in d1:
+        bad.append('1b.1 指纹前缀重复（渲成 sha256:SHA256:…）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -861,7 +952,7 @@ CHECKS = [
     ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
     ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
     ('upstream-contract', c_upstream_contract), ('step4-honesty', c_step4_honesty),
-    ('password-bootstrap', c_password_bootstrap),
+    ('password-bootstrap', c_password_bootstrap), ('purge-all', c_purge_all),
 ]
 
 
@@ -1018,6 +1109,26 @@ MUTATIONS = [
     ('M35 undeploy 3c 复活', 'scripts/undeploy-3-ssh.sh',
      '    TUNNEL=SCHEDULED\n',
      '    st_begin 3c "宿主侧回滚"\n    TUNNEL=SCHEDULED\n'),
+    # --purge-all 不强制拆通道 ⇒ sshd 永远卸不掉，「彻底卸载」只剩半个。
+    ('M37 purge-all 不拆通道', 'scripts/undeploy.sh',
+     '  RM_TUNNEL=yes\nfi', '  :\nfi'),
+    # 3b 的 /ST 退回过去时刻 ⇒ schtasks 警告且任务不会自己触发（静默不执行）。
+    ('M38 3b 的 /ST 用过去时刻', 'scripts/undeploy-3-ssh.sh',
+     "'/SC','ONCE','/ST',$st,", "'/SC','ONCE','/ST','00:00',"),
+    # 2e 少一个 CLI 断言 ⇒ node 残留也报 PASS（「彻底」变成口号）。
+    ('M39 2e 漏断言 node', 'scripts/undeploy-2-vm.sh',
+     'for _k in CMD_NODE CMD_NPM CMD_CODEBUDDY', 'for _k in CMD_NPM CMD_CODEBUDDY'),
+    # sshd 清理不覆盖 administrators_authorized_keys ⇒ 管理员钥残留，等于没去 key。
+    ('M40 sshd 清理漏管理员钥', 'scripts/vm-purge-sshd.ps1',
+     "'C:\\ProgramData\\ssh', 'C:\\Windows\\System32\\OpenSSH'",
+     "'C:\\Windows\\System32\\OpenSSH'"),
+    # --only 分支 rc=2 不归零 ⇒ 通道 DOWN 时 --only 3 报 UNDEPLOY=FAIL（中间态误标成失败）。
+    ('M42 --only 把 rc=2 报成 FAIL', 'scripts/undeploy.sh',
+     'PENDING=1; RC=0; }\nelse', 'PENDING=1; }\nelse'),
+    # 2e 里直接调 purge-sshd ⇒ 停 sshd 时杀掉自己，后续清理全丢（永久失联风险）。
+    ('M41 2e 内联卸 sshd', 'scripts/undeploy-2-vm.sh',
+     'KWD_ARG=""; [ "$KEEP_WD" = "1" ] && KWD_ARG=" -KeepWinVMDeploy"',
+     'KWD_ARG=""; [ "$KEEP_WD" = "1" ] && KWD_ARG=" -KeepWinVMDeploy"\n  bash "$SCRIPTDIR/ps-run.sh" -c "& .\\vm-purge-sshd.ps1 -Apply" >/dev/null 2>&1'),
 ]
 
 

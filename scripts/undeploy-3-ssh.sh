@@ -11,16 +11,24 @@
 #
 # 注意：绝不为了拆通道而重建通道；绝不重启 VM。
 #
-# 用法：bash scripts/undeploy-3-ssh.sh [--remove-ssh-tunnel yes|no]
+# 用法：bash scripts/undeploy-3-ssh.sh [--remove-ssh-tunnel yes|no] [--purge-sshd]
+#
+#   --purge-sshd ：在同一个 SYSTEM 任务里，-Rollback 之后再跑 vm-purge-sshd.ps1：
+#                  停/删 sshd 服务、卸 OpenSSH MSI（product code 从注册表解析）、
+#                  删 C:\Program Files\OpenSSH、C:\ProgramData\ssh（含
+#                  administrators_authorized_keys 与用户 authorized_keys）、
+#                  System32\OpenSSH、防火墙规则，最后删 C:\ProgramData\WinVMDeploy。
+#                  证据留在 C:\ProgramData\winvm-purge-sshd.log（通道已断，只能靠它复盘）。
 set -u
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/_common.sh"
 
-REMOVE="no"
+REMOVE="no"; PURGE_SSHD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --remove-ssh-tunnel) REMOVE="${2:-no}"; shift ;;
     --remove-ssh-tunnel=*) REMOVE="${1#*=}" ;;
+    --purge-sshd) PURGE_SSHD=1 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -68,6 +76,7 @@ if [ "$CH" = "1" ]; then
   cat > "$PL.ps1" <<'PS1'
 $rb  = 'C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1'
 $src = @(__SRCS__)
+$purgeB64 = '__PURGE_B64__'
 if (-not (Test-Path $rb)) {
   if ($src.Count -eq 0) { Write-Output 'NO_LOCAL_SCRIPT_NO_URL'; exit 3 }
   $ok = $false
@@ -81,19 +90,48 @@ if (-not (Test-Path $rb)) {
   if (-not $ok) { Write-Output 'DOWNLOAD_FAILED: all sources'; exit 4 }
   Write-Output 'DOWNLOADED'
 }
-$tr = 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + $rb + ' -Rollback'
-$a1 = @('/Create','/TN','WbTunnelRollback','/TR',$tr,'/SC','ONCE','/ST','00:00','/RL','HIGHEST','/RU','SYSTEM','/F')
+if ($purgeB64 -ne 'NONE') {
+  # --purge-all: the same deferred SYSTEM task must also delete sshd itself.
+  # A wrapper is required because the task action takes a single command line.
+  $purgePath = 'C:\ProgramData\WinVMDeploy\vm-purge-sshd.ps1'
+  New-Item -ItemType Directory -Force -Path (Split-Path $purgePath) | Out-Null
+  [IO.File]::WriteAllBytes($purgePath, [Convert]::FromBase64String($purgeB64))
+  Unblock-File $purgePath
+  $wrap = 'C:\ProgramData\WinVMDeploy\WbPurgeAll.ps1'
+  $body = @(
+    ('$rb = ' + [char]39 + $rb + [char]39),
+    ('& powershell -NoProfile -ExecutionPolicy Bypass -File $rb -Rollback'),
+    ('& powershell -NoProfile -ExecutionPolicy Bypass -File ' + [char]39 + $purgePath + [char]39 + ' -Apply')
+  ) -join [char]10
+  [IO.File]::WriteAllText($wrap, $body, (New-Object Text.UTF8Encoding($false)))
+  Unblock-File $wrap
+  $tr = 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + $wrap
+  Write-Output 'PURGE_WRAPPER_READY'
+} else {
+  $tr = 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + $rb + ' -Rollback'
+}
+# /ST must be a FUTURE time: a past value makes schtasks warn and the task would
+# never fire on its own (we rely on /Run, but a silent no-fire is unrecoverable).
+$st = (Get-Date).AddMinutes(10).ToString('HH:mm')
+$a1 = @('/Create','/TN','WbTunnelRollback','/TR',$tr,'/SC','ONCE','/ST',$st,'/RL','HIGHEST','/RU','SYSTEM','/F')
 & schtasks.exe $a1 | Out-Null
 $a2 = @('/Run','/TN','WbTunnelRollback')
 & schtasks.exe $a2 | Out-Null
 Write-Output 'POST_ROLLBACK_SCHEDULED'
 PS1
-  # 占位替换注入 URL（比 unquoted heredoc 转义 PS 变量安全）
-  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];fs.writeFileSync(p,fs.readFileSync(p,"utf8").replace("__SRCS__",process.argv[2]))' "$PL.ps1" "${SRCS_PS:-}"
+  # 占位替换注入 URL 与（purge-all 时的）sshd 清理脚本 base64
+  PB64="NONE"
+  [ "$PURGE_SSHD" = "1" ] && PB64="$("$NODE" -e 'const fs=require("fs");process.stdout.write(fs.readFileSync(process.argv[1]).toString("base64"))' "$SCRIPTDIR/vm-purge-sshd.ps1")"
+  "$NODE" -e 'const fs=require("fs");const p=process.argv[1];let s=fs.readFileSync(p,"utf8");s=s.replace("__SRCS__",process.argv[2]);s=s.replace("__PURGE_B64__",process.argv[3]);fs.writeFileSync(p,s)' "$PL.ps1" "${SRCS_PS:-}" "$PB64"
   bash "$SCRIPTDIR/ps-run.sh" "$PL.ps1" > "$PL" 2>&1; PRC=$?
-  tr -d '\r' < "$PL" | tail -4
+  tr -d '\r' < "$PL" | tail -5
   if [ $PRC -eq 0 ] && grep -q 'POST_ROLLBACK_SCHEDULED' "$PL" 2>/dev/null; then
-    st_end 0 PASS "SYSTEM 任务已触发（VM 在本会话断开后自行完成 -Rollback）"
+    if [ "$PURGE_SSHD" = "1" ]; then
+      grep -q 'PURGE_WRAPPER_READY' "$PL" 2>/dev/null || echo "  [WARN] wrapper 未确认（$PL）"
+      st_end 0 PASS "SYSTEM 任务已触发：-Rollback → vm-purge-sshd（卸 sshd + 两处 authorized_keys + WinVMDeploy）"
+    else
+      st_end 0 PASS "SYSTEM 任务已触发（VM 在本会话断开后自行完成 -Rollback）"
+    fi
     # v2.4.0：原 3d「等通道消失」已删。理由：拆通道是 SYSTEM 任务的异步结果，
     # 宿主空等 6~27s 只影响"本次是否打印 REMOVED"，不改变任何终态；
     # 真需要确认时重跑 deploy 第 1 步（1a 会实测），比在这里轮询更准。
@@ -110,13 +148,29 @@ fi
 
 # 通道不在 / post 失败 → 给用户那一条命令
 st_begin 3b "输出用户命令（通道不可用时唯一安全路径）"
-cat <<EOF
+if [ "$PURGE_SSHD" = "1" ]; then
+  # 通道已断时，「彻底」必须也包含 sshd —— 否则用户跑完 -Rollback 通道照旧
+  # 不回来（sshd 服务还在但钥已删），而技能这边再也没有入口补那一段。
+  # 命令做成自包含：内联 base64 写出 vm-purge-sshd.ps1 → -Rollback → -Apply。
+  PB64U="$("$NODE" -e 'const fs=require("fs");process.stdout.write(fs.readFileSync(process.argv[1]).toString("base64"))' "$SCRIPTDIR/vm-purge-sshd.ps1")"
+  cat <<EOF
+
+════════════════ 彻底卸载：在 VM 管理员 PowerShell 里执行这一整条 ════════════════
+\$ErrorActionPreference='Continue'; \$d='C:\\ProgramData\\WinVMDeploy'; New-Item -ItemType Directory -Force -Path \$d|Out-Null; \$p=Join-Path \$d 'vm-purge-sshd.ps1'; [IO.File]::WriteAllBytes(\$p,[Convert]::FromBase64String('$PB64U')); Unblock-File \$p; \$rb=Join-Path \$d 'winvm-sshd-oneclick.ps1'; if (Test-Path \$rb) { powershell -NoProfile -ExecutionPolicy Bypass -File \$rb -Rollback }; powershell -NoProfile -ExecutionPolicy Bypass -File \$p -Apply
+══════════════════════════════════════════════════════════════════════════════════
+（一条命令三段：写出 sshd 清理脚本 → 若 oneclick 脚本仍在则 -Rollback → 停/删 sshd、
+  卸 OpenSSH MSI、删 C:\\ProgramData\\ssh 的两处 authorized_keys、删 WinVMDeploy。
+  过程中 SSH 会断，属预期；证据留在 C:\\ProgramData\\winvm-purge-sshd.log）
+EOF
+else
+  cat <<EOF
 
 ════════════════════ 卸载通道：在 VM 管理员 PowerShell 里执行这一条 ════════════════════
 $USER_CMD
 ══════════════════════════════════════════════════════════════════════════════════════
 （该脚本是 deploy 第 1 步下载并留在 VM 上的；它按 journal 逆序精确还原，可重复执行）
 EOF
+fi
 st_end 0 WAIT_USER "TUNNEL_REMOVE_PENDING_USER"
 echo "TUNNEL=PENDING_USER"
 echo "NEED_USER_ACTION=1"

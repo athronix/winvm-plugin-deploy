@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
-description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
-version: 2.4.0
+description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）；--purge-all 一键回到裸机（②追加 2e 运行时深清 node/codebuddy/私钥，③的同一 SYSTEM 任务里卸 sshd MSI 与两处 authorized_keys）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
+version: 2.5.0
 agent_created: true
 ---
 
@@ -74,8 +74,8 @@ VM 侧按同一顺序循环兜底：
 | # | 做什么 | 脚本 | 依赖 |
 |---|---|---|---|
 | **1** | 停 `winvm-tunnel` + 卸 host 端插件（不需通道） | `undeploy-1-host.sh` | — |
-| **2** | 停 VM 端 service + 卸 VM 端模块 + **卸全局上游 CLI**（`--keep-upstreams` 保留） | `undeploy-2-vm.sh` | — |
-| **3** | 拆 ssh 通道（`--remove-ssh-tunnel yes\|no`，**默认 no**） | `undeploy-3-ssh.sh` | 2 完成 |
+| **2** | 停 VM 端 service + 卸 VM 端模块 + **卸全局上游 CLI**（`--keep-upstreams` 保留）；`--purge-all` 时加 **2e 运行时深清**（node 运行时 / codebuddy / VM 侧 `~/.ssh` 私钥 / npm 缓存 / 死 PATH） | `undeploy-2-vm.sh` | — |
+| **3** | 拆 ssh 通道（`--remove-ssh-tunnel yes\|no`，**默认 no**）；`--purge-all` 时 `--purge-sshd` 在同一个 SYSTEM 任务里追加「停/删 sshd + 卸 OpenSSH MSI + 删两处 authorized_keys + WinVMDeploy」 | `undeploy-3-ssh.sh` | 2 完成 |
 
 **1‖2 并行**，然后 3。
 
@@ -84,6 +84,7 @@ VM_HOST=... bash scripts/undeploy.sh                            # 默认保留�
 VM_HOST=... bash scripts/undeploy.sh --remove-ssh-tunnel yes    # 连通道一起拆
 VM_HOST=... bash scripts/undeploy.sh --purge-workspace          # 连 C:\WinVMWorkspace 一起删
 VM_HOST=... bash scripts/undeploy.sh --keep-upstreams           # 保留 agent-browser / agent-desktop
+VM_HOST=... bash scripts/undeploy.sh --purge-all                # 彻底卸载到裸机（隐含拆通道）
 VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计划
 ```
 
@@ -147,13 +148,15 @@ VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计�
 | `deploy-4-vm.sh` | VM 依赖（node/codebuddy/agent-desktop/agent-browser）+ 推包装服务 + 4c 七判据（含两上游工具面，真实 tools/list） |
 | `deploy-5-verify.sh`（`verify.sh`） | 三探针 + 上游工具面 + 终态矩阵；唯一 verify 实现 |
 | `undeploy-1-host.sh` | 停隧道 + host-only 卸载（把 VM 目标三处屏蔽干净，防重复/挂死） |
-| `undeploy-2-vm.sh` | VM 端停服务 + 删模块 + 卸上游 CLI + 五点终态（含 `UPSTREAM_LEFT`） |
-| `undeploy-3-ssh.sh` | 拆通道：3a 派生 `WbTunnelRollback` SYSTEM 任务 + 3b 判据（VM 自行 `-Rollback`）；**不再做宿主侧回滚**（私钥是可复用资产，基线由 `host-state.json` 保证） |
+| `undeploy-2-vm.sh` | VM 端停服务 + 删模块 + 卸上游 CLI + 五点终态（含 `UPSTREAM_LEFT`）；`--purge-all` 追加 2e 运行时深清 |
+| `undeploy-3-ssh.sh` | 拆通道：3a 派生 `WbTunnelRollback` SYSTEM 任务 + 3b 判据（VM 自行 `-Rollback`）；`--purge-sshd` 时任务改挂临时 wrapper `WbPurgeAll`（VM 侧运行时生成，不随包分发）（`-Rollback` → `vm-purge-sshd.ps1`）；**不再做宿主侧回滚**（私钥是可复用资产，基线由 `host-state.json` 保证） |
 | `winvm-sshd-oneclick.ps1` | **VM 侧单脚本**：建通道 / `-Rollback` 逆序还原 / `-Continue` 只读体检；自留存量到 `C:\ProgramData\WinVMDeploy`（`-File` 复制自身，`irm\|iex` 自下载落盘）；OpenSSH MSI 缓存在 `WinVMDeploy\cache\`，重建通道直接复用（`-NoMsiCache` 强制重下） |
 | `_common.sh` | 地基：日志、`st_begin/st_end` 计时、状态文件、参数解析、依赖冒烟、`channel_ready`/`health_code` |
 | `vm-conn.sh` / `ssh2-conn.mjs` / `ps-run.sh` | 双后端（默认 ssh2）、ssh2 实体、远端 PS 执行器 |
 | `pkg-root.sh` / `download-verify.sh` / `env-detect.sh` | 包根单一事实源、取包三件套、运行时探测 |
 | `vm-remove-local.ps1` | VM 端本地卸载（`undeploy-2` 推过去执行）：服务/目录/任务/挂载点/PATH/side.json + **段 8 上游 CLI 清理**（杀孤儿进程 + `npm uninstall -g`；`-KeepUpstreams` 保留） |
+| `vm-purge-runtime.ps1` | 2e 运行时深清（`--purge-all`）：`C:\nodejs` + nvm、codebuddy 包与 shim、VM 侧 `~/.ssh` 六个文件、npm 缓存、死 PATH、残留任务与防火墙；`-KeepWinVMDeploy` 留给 3b |
+| `vm-purge-sshd.ps1` | 3b 的 sshd 清理（SYSTEM 延迟执行）：停/删服务、卸 MSI（product code 从注册表解析）、删三个程序/配置目录、防火墙、最后删 WinVMDeploy；日志落 `C:\ProgramData\winvm-purge-sshd.log` |
 | `selfcheck.sh` | 离线自检门禁（不需要 VM）：语法/控制字符/frontmatter/结构断言/变异自证 |
 | `scripts/legacy/`、`references/legacy/` | v1.x 编排层与旧通道文档，**仅留档，不入发布包、不作判据** |
 

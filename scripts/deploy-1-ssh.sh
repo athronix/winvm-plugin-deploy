@@ -166,7 +166,9 @@ while [ "$CH_ROUND" -lt "$ROUNDS" ]; do
 
   st_begin "1b.$CH_ROUND" "准备 host 端密钥（round $CH_ROUND/$ROUNDS rotate=$ROT）"
   prepare_key "$ROT" || die "备钥失败" "1b 未产出可用密钥" "见上" "修好后重跑本脚本"
-  st_end 0 PASS "key=$KEY pub=sha256:$(ssh-keygen -lf "$KEY.pub" 2>/dev/null | awk '{print $2}')"
+  # ssh-keygen -lf 的 $2 本身已带 "SHA256:" 前缀，再套一层会印成 sha256:SHA256:…
+  PUB_FP="$(ssh-keygen -lf "$KEY.pub" 2>/dev/null | awk '{print $2}')"
+  st_end 0 PASS "key=$KEY pub=${PUB_FP:-unknown}"
 
   st_begin "1c.$CH_ROUND" "打印 VM 侧一键命令（远端下载）"
   if ! URL="$(sshd_script_url)"; then

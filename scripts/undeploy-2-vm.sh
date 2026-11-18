@@ -4,16 +4,25 @@
 # 只经现役 ssh 通道；通道不在 = 正常输入，**绝不为此重建通道**。
 # 通道不在时本步如实报 SKIP 并给出用户手工命令（第 3 步会把两份命令合并展示）。
 #
-# 用法：bash scripts/undeploy-2-vm.sh [--purge-workspace]
+# 用法：bash scripts/undeploy-2-vm.sh [--purge-workspace] [--keep-upstreams]
+#                                    [--purge-all] [--keep-winvmdeploy]
+#
+#   --purge-all        追加 2e 运行时深清：node 运行时（C:\nodejs + nvm）、codebuddy、
+#                      VM 侧 ~/.ssh 私钥、npm 缓存、死 PATH、残留任务与防火墙。
+#                      不碰 sshd（停 sshd 会杀掉执行它的会话 ⇒ 归第 3 步 SYSTEM 任务）。
+#   --keep-winvmdeploy 2e 时保留 C:\ProgramData\WinVMDeploy（第 3 步 3b 还要用里面
+#                      的 oneclick 脚本做 -Rollback 与 MSI 缓存；由 3b 最后删掉）。
 set -u
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/_common.sh"
 
-PURGE=0; KEEP_UP=0
+PURGE=0; KEEP_UP=0; PURGE_ALL=0; KEEP_WD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --purge-workspace) PURGE=1 ;;
     --keep-upstreams) KEEP_UP=1 ;;
+    --purge-all) PURGE_ALL=1 ;;
+    --keep-winvmdeploy) KEEP_WD=1 ;;
     --pkg) shift ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac; shift
@@ -35,9 +44,17 @@ st_end 0 PASS "channel=READY"
 
 st_begin 2b "推 VM 侧卸载脚本"
 # 用 vm-conn.sh 的 vmscp（双后端一致）
-( set +u; . "$SCRIPTDIR/vm-conn.sh"; \
-  vmscp "$SCRIPTDIR/vm-remove-local.ps1" "${VM_USER}@${VM_HOST}:vm-remove-local.ps1" ) \
-  > "$(sub_log vmscp)" 2>&1; SRC=$?
+# --purge-all 时多推一个 vm-purge-runtime.ps1（node/codebuddy/keys/npm-cache 深清），
+# 它必须在本步跑完——通道一断就没入口了，所以绝不能留到第 3 步之后。
+PUSH_LIST="vm-remove-local.ps1"
+[ "$PURGE_ALL" = "1" ] && PUSH_LIST="$PUSH_LIST vm-purge-runtime.ps1"
+SRC=0
+for _f in $PUSH_LIST; do
+  ( set +u; . "$SCRIPTDIR/vm-conn.sh"; \
+    vmscp "$SCRIPTDIR/$_f" "${VM_USER}@${VM_HOST}:$_f" ) \
+    >> "$(sub_log vmscp)" 2>&1 || SRC=$?
+  [ $SRC -ne 0 ] && break
+done
 if [ $SRC -ne 0 ]; then
   tail -5 "$(sub_log vmscp)"
   st_end $SRC FAIL "scp rc=$SRC"
@@ -45,7 +62,7 @@ if [ $SRC -ne 0 ]; then
   die "推卸载脚本失败" "通道瞬态窗或权限" "$(sub_log vmscp)" \
       "稍后重跑本步；不要为此重建通道"
 fi
-st_end 0 PASS "vm-remove-local.ps1 已就位"
+st_end 0 PASS "$PUSH_LIST 已就位"
 
 st_begin 2c "停服务 + 卸模块（vm-remove-local.ps1 -Apply）"
 PARGS="-Apply"; [ "$PURGE" = "1" ] && PARGS="$PARGS -PurgeWorkspace"
@@ -93,4 +110,37 @@ else
       "重跑 2c；仍不清则查 vm-remove.log 的 [WARN] 行"
 fi
 state_set VM_INSTALLED 0
+
+# ── 2e 运行时深清（仅 --purge-all）──
+# 补 vm-remove-local.ps1 刻意不碰的部分：node 运行时、codebuddy、VM 侧私钥、
+# npm 缓存、死 PATH、残留任务/防火墙。sshd 不在这里（vm-purge-sshd.ps1，由第 3 步
+# 的 SYSTEM 任务延迟执行——停 sshd 会杀掉正在跑它的会话）。
+if [ "$PURGE_ALL" = "1" ]; then
+  st_begin 2e "运行时深清（node / codebuddy / VM 私钥 / npm 缓存）"
+  PRL="$(sub_log vm-purge-runtime)"
+  KWD_ARG=""; [ "$KEEP_WD" = "1" ] && KWD_ARG=" -KeepWinVMDeploy"
+  bash "$SCRIPTDIR/ps-run.sh" -c "& .\\vm-purge-runtime.ps1 -Apply$KWD_ARG" > "$PRL" 2>&1; PRC=$?
+  grep -E 'MODE=|SEC_DELETE_|LEFT_DELETE_|CMD_|SSH_FILES_AFTER|KEPT_WINVMDEPLOY|PURGE_RUNTIME_DONE|\[WARN\]' "$PRL" | tail -22 || true
+  if [ $PRC -ne 0 ] || ! grep -q 'PURGE_RUNTIME_DONE' "$PRL" 2>/dev/null; then
+    tail -12 "$PRL"
+    st_end $PRC FAIL "rc=$PRC 且无 PURGE_RUNTIME_DONE"
+    die "运行时深清未完成" "文件占用（node 仍在跑）/ 权限 / 通道瞬态" "$PRL" \
+        "看 $PRL；确认 node 进程已退出后重跑 --only 2 --purge-all"
+  fi
+  # 可证伪终态：五个 CLI 必须全部消失，两个运行时目录必须不存在
+  _bad=""
+  for _k in CMD_NODE CMD_NPM CMD_CODEBUDDY CMD_AGENT_BROWSER CMD_AGENT_DESKTOP; do
+    grep -q "^${_k}=MISSING" "$PRL" 2>/dev/null || _bad="$_bad ${_k}#$(tr -d '\r' < "$PRL" | grep -oE "^${_k}=.*" | tail -1 | cut -d= -f2)"
+  done
+  grep -q '^NODEJS_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad NODEJS_DIR"
+  grep -q '^NVM_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad NVM_DIR"
+  [ "$KEEP_WD" = "1" ] || grep -q '^WINVMDEPLOY_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad WINVMDEPLOY_DIR"
+  if [ -n "$_bad" ]; then
+    st_end 1 FAIL "深清后仍残留:$_bad"
+    die "运行时深清不彻底" "仍残留:$_bad" "$PRL" \
+        "看 $PRL 的 [WARN] 行；占用类残留先结束进程再重跑"
+  fi
+  st_end 0 PASS "$(tr -d '\r' < "$PRL" | grep -E '^SEC_DELETE_(NODEJS|NVM)=' | tr '\n' ' ' | cut -c1-90)五个 CLI 全 MISSING"
+fi
+
 steps_report
