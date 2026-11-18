@@ -195,22 +195,23 @@ UEOF
   st_end 0 WAIT_USER "url=$URL"
   print_user_command "$URL" "$PUB"
 
-  # 可选原地等待（默认不等待：编排层把命令显形给用户后退出，用户粘完重跑即越过本步）
-  if [ "$WAIT_S" -gt 0 ]; then
-    st_begin "1d.$CH_ROUND" "等待用户粘贴并验证通道（≤${WAIT_S}s）"
-    waited=0; ready=0
-    while [ "$waited" -lt "$WAIT_S" ]; do
-      sleep 5; waited=$((waited + 5))
-      if channel_ready 5000; then ready=1; break; fi
-      [ $((waited % 60)) -eq 0 ] && echo "  … 已等 ${waited}s / ${WAIT_S}s（在 VM 里粘贴执行后会自动继续）"
-    done
-    if [ "$ready" = "1" ]; then
+  # ── 1d：用户粘贴 + 免密回验 ──
+  # 只在两种情况下进入（v2.4.0）：
+  #   ① CHANNEL_WAIT_S>0  —— 显式要求原地等用户粘贴；
+  #   ② AUTOKEY_VERIFY_AFTER_S2=1 —— 测试/查验时强制回验一次。
+  # 默认两者都不开 ⇒ 打印命令后 exit 2，让命令留在前台；用户粘完重跑 deploy，
+  # 1a 判到 READY 即整步越过（这本身就是最省的一次回验）。
+  if [ "$WAIT_S" -gt 0 ] || oneclick_verify_enabled; then
+    WIN_D="$WAIT_S"
+    [ "$WIN_D" -le 0 ] && WIN_D="${AUTOKEY_WAIT_S:-90}"
+    st_begin "1d.$CH_ROUND" "等待用户粘贴并回验免密通道（≤${WIN_D}s）"
+    if waited="$(wait_channel_ready "$WIN_D")"; then
       st_end 0 PASS "channel=READY after ${waited}s"
       state_set CHANNEL_READY 1
       state_set WINVM_VM_KEY "$KEY"
       steps_report; exit 0
     fi
-    st_end 2 WAIT_USER "等待超时 ${WAIT_S}s，通道仍未就绪"
+    st_end 2 WAIT_USER "等待超时 ${WIN_D}s，通道仍未就绪"
     echo "NEED_USER_ACTION=1（命令已打印；粘贴执行后重跑本脚本即继续）"
     exit 2
   fi

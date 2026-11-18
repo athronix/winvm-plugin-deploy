@@ -252,22 +252,28 @@ vmssh "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $ENC" >/dev
 st_end 0 PASS "已下发（sshd 重启导致本次会话断开属预期）"
 
 # ═══════════════════════════ S2 回验 ═══════════════════════════
-st_begin 1p.7 "S2 免密通道回验"
+st_begin 1p.7 "S2 免密通道回验（默认 SKIP）"
 leave_password_mode
-ready=0; waited=0
-while [ "$waited" -lt "${AUTOKEY_WAIT_S:-90}" ]; do
-  if channel_ready 6000; then ready=1; break; fi
-  sleep 5; waited=$((waited + 5))
-  [ $((waited % 15)) -eq 0 ] && echo "  … 等 sshd 恢复 ${waited}s / ${AUTOKEY_WAIT_S:-90}s"
-done
-if [ "$ready" = "1" ]; then
-  st_end 0 PASS "channel=READY（S2，用时 ${waited}s）"
-  state_set CHANNEL_READY 1
+# 默认 SKIP（v2.4.0，用户 2026-11-18 口径）：oneclick 收尾自带 [9/9] 本机回环复验，
+# 宿主侧再空等一轮 90s 在常态下纯属浪费。仅测试/查验时 AUTOKEY_VERIFY_AFTER_S2=1。
+# ⚠ 跳过时**不落 CHANNEL_READY=1**——没验过就不许写成"已就绪"；真正的判据交给
+#   deploy-4 的 4.0 通道门禁（≤60s 健康窗，新建连接实测）。
+if ! oneclick_verify_enabled; then
+  st_end 0 SKIP "默认跳过（oneclick 已做 [9/9] 回环复验；AUTOKEY_VERIFY_AFTER_S2=1 启用）"
   state_set WINVM_VM_KEY "$KEY"
-  echo "AUTOKEY_RESULT=PASS strategy=S2 waited=${waited}s"
+  echo "AUTOKEY_RESULT=PASS_UNVERIFIED strategy=S2"
+  echo "  S2 已下发但未在宿主侧回验；第 4 步 4.0 通道门禁会实测（≤60s 健康窗）。"
   steps_report
   exit 0
 fi
-st_end 2 WAIT_USER "S2 回验未通过（${AUTOKEY_WAIT_S:-90}s）"
-echo "AUTOKEY_RESULT=FAIL strategy=S2 → 回退 1c 人工命令（请在 VM 管理员 PowerShell 执行 oneclick）"
-exit 2
+waited="$(wait_channel_ready "${AUTOKEY_WAIT_S:-90}")" || {
+  st_end 2 WAIT_USER "S2 回验未通过（${AUTOKEY_WAIT_S:-90}s）"
+  echo "AUTOKEY_RESULT=FAIL strategy=S2 → 回退 1c 人工命令（请在 VM 管理员 PowerShell 执行 oneclick）"
+  exit 2
+}
+st_end 0 PASS "channel=READY（S2，用时 ${waited}s）"
+state_set CHANNEL_READY 1
+state_set WINVM_VM_KEY "$KEY"
+echo "AUTOKEY_RESULT=PASS strategy=S2 waited=${waited}s"
+steps_report
+exit 0

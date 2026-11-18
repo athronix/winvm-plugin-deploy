@@ -36,10 +36,15 @@ done
 st_end 0 PASS "channel=READY$([ "$waited" -gt 0 ] && echo "（等了 ${waited}s）")"
 
 # ── 4a 依赖补齐（node，幂等；全 SKIP 也要三次往返，故单独成段便于计时）──
-st_begin 4a "prepare-vm --ensure-node（VM 运行时依赖）"
+st_begin 4a "prepare-vm --ensure-deps（node + codebuddy + 两上游全局 CLI）"
 PL="$(sub_log prepare-vm)"
+# v2.4.0：依赖安装整体前移到 4a（DB-7），顺序 = node → codebuddy → agent-desktop → agent-browser。
+# 这样 4b 不再承担 npm 全局安装（少一段最不可控的时长），4c 直接对结果下判据。
+# SKIP_UPSTREAMS=1 时只装 node/codebuddy，两个上游由用户显式放弃（4c 记 SKIP）。
+DEPS_ARGS="--ensure-deps"
+[ "${SKIP_UPSTREAMS:-0}" = "1" ] && DEPS_ARGS="--ensure-deps --skip-upstream-deps"
 _run_prepare() {
-  ( cd "$PKG" && "$NODE" delivery/bootstrap.mjs prepare-vm --apply --ensure-node \
+  ( cd "$PKG" && "$NODE" delivery/bootstrap.mjs prepare-vm --apply $DEPS_ARGS \
       --vm-host "$VM_HOST" --vm-user "$VM_USER" --vm-ssh-port "$VM_SSH_PORT" ) > "$PL" 2>&1
 }
 _run_prepare; PRC=$?
@@ -50,7 +55,7 @@ if [ $PRC -ne 0 ] && grep -qE 'Connection lost before handshake|ready 超时|Tim
   sleep 15
   _run_prepare; PRC=$?
 fi
-grep -E 'SKIP|已就绪|ensure-node|node' "$PL" | tail -6
+grep -E 'DB-7|SKIP|已就绪|ensure|npm install -g' "$PL" | tail -8
 if [ $PRC -ne 0 ]; then
   tail -10 "$PL"
   st_end $PRC FAIL "prepare-vm rc=$PRC（VM 端可能缺 node）"
@@ -62,9 +67,11 @@ st_end 0 PASS "依赖就绪"
 # ── 4b VM 端安装 + 服务启动（BUILD 打 tar → scp → install-vm → VM-START）──
 st_begin 4b "setup --only-vm --skip-build（推包+装 VM 端+起服务）"
 SL="$(sub_log setup)"
-( cd "$PKG" && "$NODE" delivery/setup.mjs --apply --skip-build --only-vm > "$SL" 2>&1 ); SRC=$?
+# WINVM_UPSTREAMS_HANDLED=1：上游 CLI 已由 4a 的 DB-7 装好，install-vm 的 [4b/6] 不再重复装
+# （setup 会把它透传成 --skip-upstreams；两条来源语义相同，见 setup.mjs 注释）。
+( cd "$PKG" && WINVM_UPSTREAMS_HANDLED=1 "$NODE" delivery/setup.mjs --apply --skip-build --only-vm > "$SL" 2>&1 ); SRC=$?
 # 上游安装行（[4b/6] / 已安装 / ⚠ ... 安装失败）必须露出来：它是「可选依赖」，
-# 失败不阻断部署，但 4d 会立刻把它变成硬判据——日志里得能看见它在哪一步掉的。
+# 失败不阻断部署，但 4c 会立刻把它变成硬判据——日志里得能看见它在哪一步掉的。
 grep -E '部署全部完成|个步骤失败|降级 SKIP|VM_START|TUNNEL|QA-PROBE|\[4b/6\]|npm install -g|已安装：|安装失败' "$SL" | tail -10
 if [ $SRC -ne 0 ]; then
   tail -14 "$SL"
@@ -72,9 +79,22 @@ if [ $SRC -ne 0 ]; then
   die "VM 端安装失败" "相位名见日志（VM / VM-START / QA-PROBE）" "$SL" \
       "看 $SL 的失败相位；420s 未监听=僵尸 start，先行 schtasks /End + /Run"
 fi
+# ── dry-run 假绿闸（2026-11-18 真机踩到）──
+# 现象：包根只有 .env.example 时，它里面的 WINVM_DRY_RUN=1 是「兜底保险」，setup 会
+# **即便传了 --apply 也只规划**，rc=0 且耗时 0s ⇒ 本步报 PASS，实际一个字节都没推。
+# 后果：VM 上仍是上一版服务，4c 的 desktop_tools 读到旧白名单（实测 25→10），
+# 看起来像「上游白名单退化了」，真正原因是 4b 根本没执行。
+# 判据：setup 头部打印 [DRY-RUN 只规划] 而非 [APPLY 真执行]。
+if grep -q 'DRY-RUN 只规划' "$SL" 2>/dev/null; then
+  st_end 1 FAIL "setup 走了 dry-run（rc=0 但零动作）"
+  die "4b 未真正执行（dry-run 假绿）" "包根只有 .env.example 且其中 WINVM_DRY_RUN=1 兜底生效" "$SL" \
+      "把 $PKG/.env.example 复制成 .env 并把 WINVM_DRY_RUN 设为 0（该兜底刻意优先于 --apply，本步不越权覆盖）"
+fi
 st_end 0 PASS "setup rc=0"
 
-# ── 4c 七判据（服务在跑 + 端口在听 + health 通 + 旁证就位）──
+# ── 4c 七判据（服务在跑 + 端口在听 + 旁证两项 + health 通 + 两上游工具面）──
+# v2.4.0：原 4d 的 MCP 上游判据并入本步 —— 都跑在 VM 内一次载荷里，省一次宿主往返，
+# 也避免"4d 只在第 4 步跑、verify 单跑时没有复验面"的缺口（第 5 步同样内置这项）。
 # 铁律：vmcheck.ps1 是**纯报告器**（无退出码逻辑），rc=0 只说明「脚本跑完了」。
 # 判据必须由本步自己解析 JSON 并逐项断言，否则「拿不到判据也 PASS」＝假绿。
 st_begin 4c "vmcheck 七判据（逐项断言）"
@@ -94,20 +114,31 @@ if [ -z "$VJ" ]; then
   st_end 1 FAIL "vmcheck 未输出判据 JSON（无从断言）"
   die "VM 端体检无判据" "载荷输出被截断/格式异常" "$VL" "看 $VL"
 fi
-PYV="$(printf '%s' "$VJ" | "$PY" -c '
-import json,sys
+PYV="$(printf '%s' "$VJ" | SKIP_UPSTREAMS="${SKIP_UPSTREAMS:-0}" \
+  EXP_BROWSER_TOOLS="$UPSTREAM_EXP_BROWSER" EXP_DESKTOP_TOOLS="$UPSTREAM_EXP_DESKTOP" "$PY" -c '
+import json,sys,os
 d=json.load(sys.stdin)
 st=str(d.get("task_state","")).strip()
 cnt=int(d.get("listen_count") or 0)
 side=d.get("side_json") is True
 bdir=d.get("bridge_dir") is True
 hh=d.get("health_http")
+# v2.4.0：两个上游工具面的判据并入本步（原 4d），计数取自 vmcheck 在 VM 内真打的 tools/list
+skip=os.environ.get("SKIP_UPSTREAMS","0")=="1"
+eb=os.environ.get("EXP_BROWSER_TOOLS") or "33"
+ed=os.environ.get("EXP_DESKTOP_TOOLS") or "25"
+bt=str(d.get("browser_tools",""))
+dt=str(d.get("desktop_tools",""))
 bad=[]
 if st not in ("Running","正在运行"): bad.append("task_state=%s" % st)
 if cnt < 1: bad.append("listen_count=%d" % cnt)
 if not side: bad.append("side_json=false")
 if not bdir: bad.append("bridge_dir=false")
-line="task_state=%s listen_count=%d side_json=%s bridge_dir=%s health_http=%s" % (st,cnt,str(side).lower(),str(bdir).lower(),hh)
+if not skip:
+    if bt != eb: bad.append("browser_tools=%s!=%s" % (bt,eb))
+    if dt != ed: bad.append("desktop_tools=%s!=%s" % (dt,ed))
+line="task_state=%s listen_count=%d side_json=%s bridge_dir=%s health_http=%s browser=%s desktop=%s" % (
+    st,cnt,str(side).lower(),str(bdir).lower(),hh,bt,dt)
 print(("FAIL|" + "; ".join(bad)) if bad else ("OK|" + line))
 ')"
 case "$PYV" in
@@ -133,27 +164,5 @@ else
   fi
 fi
 
-# ── 4d MCP 上游工具面（agent-browser / agent-desktop）──
-# 这两个 stdio MCP server 由 install-vm 的 [4b/6] `npm i -g` 装到 VM，再由 vm-service
-# 懒启动反代成 `/mcp/browser`、`/mcp/desktop`。判据取**真实 tools/list 计数**：
-#   · `/health.upstreams[]` 是懒启动的观测值，服务刚起时恒 idle ⇒ 拿它断言必假红；
-#   · 「路由存在」也不等于「上游可用」——未安装时路由返回 502。
-# 本段同时验证懒启动通路（首次调用即拉起子进程，桌面类首次 8~12s 属正常）。
-# SKIP_UPSTREAMS=1 是显式逃生阀（对应 install-vm 的 --skip-upstreams）。
-st_begin 4d "MCP 上游工具面（真实 tools/list）"
-if [ "${SKIP_UPSTREAMS:-0}" = "1" ]; then
-  st_end 0 SKIP "SKIP_UPSTREAMS=1（明确不要这两个工具面）"
-else
-  UV="$(upstream_judge)"
-  echo "  $UV"
-  case "$UV" in
-    OK\ *) st_end 0 PASS "$(printf '%s' "$UV" | sed 's/^OK //')" ;;
-    *)     st_end 1 FAIL "$(printf '%s' "$UV" | sed 's/^FAIL //')"
-           die "MCP 上游工具面不可用" \
-               "agent-browser/agent-desktop 未装到 VM，或 vm-service 未挂载 /mcp/<id> 路由" \
-               "计数见上：ERR:http-502=上游未安装；ERR:http-404=路由缺失；ERR:rpc-* =上游启动失败" \
-               "重跑本步（4b 会补装 npm 上游）；不需要这两个工具面时用 SKIP_UPSTREAMS=1" ;;
-  esac
-fi
 state_set VM_INSTALLED 1
 steps_report

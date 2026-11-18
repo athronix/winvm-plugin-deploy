@@ -193,6 +193,27 @@ health_code() { # health_code [port] [max_time] → 恒为 3 字符（不通=000
   esac
 }
 
+# ── oneclick 之后的「宿主侧免密回验」开关（默认关闭，v2.4.0）──
+# 口径（用户 2026-11-18）：oneclick 自己已做 [9/9] 回环复验；宿主再空等一轮 90s，
+# 常态下纯属浪费。所以 1p.7（S2 后）与 1d（用户粘完 oneclick 后）**默认 SKIP**，
+# 仅测试/查验时 `AUTOKEY_VERIFY_AFTER_S2=1` 启用。
+# 注意：关闭时**不落 CHANNEL_READY=1**（没验过就不许写"已就绪"），
+# 后续 deploy-4 的 4.0 通道门禁（≤60s 健康窗）会实测——那里才是这条路的真判据。
+oneclick_verify_enabled() { # → 0=启用 / 1=跳过
+  [ "${AUTOKEY_VERIFY_AFTER_S2:-0}" = "1" ]
+}
+
+wait_channel_ready() { # wait_channel_ready <window_s> → 0=就绪 / 1=超时
+  # 纯轮询，不做任何状态写入；步骤表（st_begin/st_end）由调用方负责。
+  local win="${1:-90}" waited=0
+  while [ "$waited" -lt "$win" ]; do
+    channel_ready 6000 && { echo "$waited"; return 0; }
+    sleep 5; waited=$((waited + 5))
+    [ $((waited % 15)) -eq 0 ] && echo "  … 等通道恢复 ${waited}s / ${win}s" >&2
+  done
+  return 1
+}
+
 port_listening() { # port_listening <port> [host] → 本地/远端端口是否有 listener
   # 纯 bash /dev/tcp 探测：连接成功即有人 accept。不依赖 curl（curl 在"连上但无 HTTP
   # 应答"与"连接被拒"两种情况都可能给 000，分不开）。
@@ -247,7 +268,10 @@ print(len(tools))
 PYEOF
 }
 
-# 上游工具面判据（deploy 4d 与 verify 5e 共用同一口径，避免两处漂移）。
+# 上游工具面判据（deploy 第 5 步与独立 verify 共用同一口径，避免两处漂移）。
+# v2.4.0：原 4d / 5e 已并入 4c / 第 5 步 —— 第 4 步在 VM 内一次载荷里连带取 tools/list
+# （vmcheck.ps1 报 browser_tools/desktop_tools），第 5 步走本函数从宿主侧直打，
+# 两个观测面独立；期望值仍只在这里定义，不许在步脚本里各自硬写。
 # 期望值是**精确断言**并可用 env 覆盖：上游升级或白名单调整后计数会变，此时刻意报警，
 # 由运维显式改 EXP_* 或 env（同 EXP_TOTAL 的「项数即断言」风格）。
 UPSTREAM_EXP_BROWSER="${EXP_BROWSER_TOOLS:-33}"   # 33 个工具全量暴露

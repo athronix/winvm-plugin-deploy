@@ -43,43 +43,12 @@ fi
 st_begin 3a "通道状态（只判不建）"
 if channel_ready 6000; then CH=1; st_end 0 PASS "channel=READY → 走 SYSTEM post 动作"; else CH=0; st_end 0 SKIP "channel=DOWN → 走用户命令"; fi
 
-HOST_STATE="${WB_TUNNEL_STATE_DIR:-$HOME/.workbuddy/.state/winvm-tunnel}/host-state.json"
-
-# 宿主侧精确回滚：只删本技能建的钥 + 恢复 known_hosts（基线来自 deploy 第 1 步）
-host_rollback() {
-  st_begin 3c "宿主侧回滚（私钥 / known_hosts）"
-  local created="unknown" existed="unknown"
-  if [ -f "$HOST_STATE" ]; then
-    created="$("$NODE" -e 'try{process.stdout.write(String(require(process.argv[1]).keyCreatedBySkill))}catch{process.stdout.write("unknown")}' "$HOST_STATE" 2>/dev/null)"
-    existed="$("$NODE" -e 'try{process.stdout.write(String(require(process.argv[1]).knownHostsEntryExistedBefore))}catch{process.stdout.write("unknown")}' "$HOST_STATE" 2>/dev/null)"
-  fi
-  # unknown = 没有基线：绝不盲删（钥可能是用户自己放的），但必须显式告知而不是静默保留
-  case "$created" in
-    true)
-      if [ -f "$WINVM_VM_KEY" ]; then
-        "$NODE" -e 'const fs=require("fs");for(const s of ["","\.pub"]){try{fs.unlinkSync(process.argv[1]+s)}catch{}}' "$WINVM_VM_KEY" 2>/dev/null \
-          && echo "  已删本技能生成的私钥/公钥: $WINVM_VM_KEY" || warn "私钥删除失败（保留）"
-      fi ;;
-    unknown)
-      warn "无回滚基线（$HOST_STATE 缺失）→ 保守保留私钥 $WINVM_VM_KEY（确需删除请手工处理）" ;;
-    *)
-      echo "  私钥非本技能创建，保留: $WINVM_VM_KEY" ;;
-  esac
-  case "$existed" in
-    false)
-      if [ -f "$HOME/.ssh/known_hosts" ]; then
-        local tmp="$HOME/.ssh/known_hosts.wbnew.$$"
-        awk -v h="$VM_HOST" 'index($0,h)==0' "$HOME/.ssh/known_hosts" > "$tmp" 2>/dev/null \
-          && mv -f "$tmp" "$HOME/.ssh/known_hosts" && echo "  已清 known_hosts 中 $VM_HOST 的条目（部署前不存在）" \
-          || warn "known_hosts 清理失败（保留原文件）"
-      fi ;;
-    unknown)
-      warn "known_hosts 归属未知（无基线）→ 保留不动" ;;
-    *)
-      echo "  known_hosts 条目部署前已存在，保留" ;;
-  esac
-  st_end 0 PASS "host key state cleaned (created=$created known_before=$existed)"
-}
+# v2.4.0（用户 2026-11-18 裁定）：原 3c「宿主侧私钥/known_hosts 回滚」已删除。
+# 理由：① 私钥是可复用资产，删掉会让下次部署重新备钥（多一轮 1b）；
+#       ② 该步只在 no-baseline 时才"保守保留"，价值密度低，却占一个环节；
+#       ③ 真正的安全边界是「只删自己建的东西」，由 deploy 第 1 步的 host-state.json
+#          基线保证——不再主动删，就不存在误删风险。
+# 需要手工清私钥时：node -e 'fs.unlinkSync("<KEY>")'（宿主禁 rm）。
 
 if [ "$CH" = "1" ]; then
   st_begin 3b "VM SYSTEM post 动作（用 VM 上已存的 oneclick -Rollback）"
@@ -125,16 +94,11 @@ PS1
   tr -d '\r' < "$PL" | tail -4
   if [ $PRC -eq 0 ] && grep -q 'POST_ROLLBACK_SCHEDULED' "$PL" 2>/dev/null; then
     st_end 0 PASS "SYSTEM 任务已触发（VM 在本会话断开后自行完成 -Rollback）"
-    host_rollback
-    st_begin 3d "等通道消失（判据=免密登录不再可用）"
-    gone=0; i=0
-    while [ $i -lt 24 ]; do
-      i=$((i + 1)); sleep 5
-      channel_ready 5000 || { gone=1; break; }
-    done
-    if [ "$gone" = "1" ]; then st_end 0 PASS "通道已不可用（${i}0s 内）"; TUNNEL=REMOVED
-    else st_end 0 SKIP "通道仍可用（SYSTEM 任务可能排队中）"; TUNNEL=SCHEDULED; fi
-    echo "TUNNEL=$TUNNEL"
+    # v2.4.0：原 3d「等通道消失」已删。理由：拆通道是 SYSTEM 任务的异步结果，
+    # 宿主空等 6~27s 只影响"本次是否打印 REMOVED"，不改变任何终态；
+    # 真需要确认时重跑 deploy 第 1 步（1a 会实测），比在这里轮询更准。
+    TUNNEL=SCHEDULED
+    echo "TUNNEL=SCHEDULED（异步；如需确认，重跑 deploy 第 1 步看 1a 判据）"
     state_set CHANNEL_READY 0
     steps_report
     exit 0
@@ -153,7 +117,6 @@ $USER_CMD
 ══════════════════════════════════════════════════════════════════════════════════════
 （该脚本是 deploy 第 1 步下载并留在 VM 上的；它按 journal 逆序精确还原，可重复执行）
 EOF
-host_rollback
 st_end 0 WAIT_USER "TUNNEL_REMOVE_PENDING_USER"
 echo "TUNNEL=PENDING_USER"
 echo "NEED_USER_ACTION=1"

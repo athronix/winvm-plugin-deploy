@@ -25,11 +25,11 @@
 | | 4a prepare-vm | 20~65s（**全部 `[SKIP]` 也要 6 次远程往返**；实测 20/27/65s 三轮） | >90s = VM 侧慢或握手超时 |
 | | 4b setup --only-vm | **61~155s**（`[VM]` 96s + `[VM-START]` 44s + `[QA-PROBE]` 15s；每轮无条件重推 8MB 并重装，无内容短路） | >420s 未监听 = 僵尸 task |
 | | 4c vmcheck | 13~38s | 七判据任一不符 |
-| | **4d 上游工具面** | **3~12s**（首次触发懒启动 12s，已就绪 3s） | 判据必须是 `OK browser=33 desktop=25`；`ERR:http-502`=上游未装、`ERR:http-404`=服务是旧版 |
+| | 4c 内的上游工具面（v2.4.0 并入，不再单列环节） | 3~12s（首次触发懒启动 12s、已就绪 3s；已含在 4c 的 13~38s 里） | 判据必须是 `browser_tools=33 desktop_tools=25`；`ERR:http-502`=上游未装、`ERR:http-404`=服务是旧版 |
 | **5** | 探针 | **16~38s**（34 项，v1.9.2 起分级）；`PROBE_DEEP=1` 38 项更长 | 单项 >300s 查服务端闸 |
 | | 复用（stamp 新鲜同包） | ~0s | 报 `no-count`= 无法核验判 FAIL |
 | | 5d 终态矩阵 | 8~26s（实测 8/8/13/15s） | `ENV_WINDOW=1` = 环境瞬态窗 |
-| | **5e 上游工具面** | **3s** | 同 4d 口径；health=200 时失败=真缺陷 |
+| | 第 5 步内的上游工具面（v2.4.0 并入三探针段，不再单列环节） | 3s（与三探针同一个 `st_begin 5`，已计入第 5 步耗时） | 同 4c 口径；health=200 时失败=真缺陷 |
 
 **全链参考**：热跑（通道在/包缓存）实测 **126s / 135s / 274s / 413s** 四轮；探针冷跑再加 ~20s。
 其中第 4 步是唯一大头（占 75%~91%），第 1~3 步合计通常 <10s。
@@ -59,11 +59,9 @@
 | 1c | `NEED_USER_ACTION=1` + `脚本来源: <url>` + `公钥指纹: 256 SHA256:...` |
 | 2b | `[OK] 2b (2s) RESULT: PASS ...`（manifest 末行） |
 | 3c | `[OK] 3c (3s) health=200` |
-| 4c | `task_state=... listen_count=1 health_http=200` |
-| 4d | `OK browser=33 desktop=25`（`[OK] 4d (12s) browser=33 desktop=25`） |
-| 5 | `[OK] 5 (...) PROBES 34/34 SKIP=4 deep=0` |
+| 4c | `task_state=Running listen_count=1 side_json=true bridge_dir=true health_http=200 browser=33 desktop=25` |
+| 5 | `[OK] 5 (...) PROBES 34/34 SKIP=4 deep=0 | browser=33 desktop=25` |
 | 5d | `VM: task=Running listen=1 sshd=Running` + `health=200` + `connector skills=10` |
-| 5e | `OK browser=33 desktop=25` |
 | 部署收尾 | `DEPLOY=PASS` + `ALL_DONE=1` |
 | verify | `VERIFY=PASS` / `VERIFY=INCOMPLETE ENV_WINDOW=1` / `VERIFY=FAIL:<段>` |
 | 卸载收尾 | `UNDEPLOY=PASS host=clean vm=clean tunnel=no` |

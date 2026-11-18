@@ -76,10 +76,10 @@
 | setup 超 420s 未监听 | 服务「僵而不绑」：8K 工作集、不占端口 | `schtasks /End /tn WinVMBridge.Service` 后 `/Run` |
 | `task_state=Ready` 但服务其实在跑 / GUI 报 `SESSION_UNAVAILABLE` | schtasks 包装器退出后任务态回 Ready；实例落 Session 0 | 判据看 `listen_count=1` + `health_http=200`；GUI 需 `/End`+`/Run` 重触发到交互会话 |
 | 拆除后残留僵尸 node（8K、不绑端口、taskkill/Process.Kill/CIM 全免疫） | 老版本 VM-START 遗留 | 只能 VM 内 `shutdown /r /t 5 /f`（**唯一需要重启的场景，且由用户在 VM 内执行**），再重跑 |
-| **4d 报 `browser=ERR:http-502`** | `agent-browser` 未装到 VM（`[4b/6]` 的 `npm i -g` 失败，安装侧按「可选依赖」降级不阻断） | 重跑 `--only 4`（4b 会补装）；看 `install-vm-run.log` 的 npm 段；不需要该工具面则 `SKIP_UPSTREAMS=1` |
-| **4d 报 `browser=ERR:http-404`** | vm-service 是**旧版**（无 `/mcp/<id>` 路由）——最常见成因：`--only 4` 推了缓存里的旧 dist | 确认包根版本（2a 的 `版本 =`）与 VM 上 `C:\WinVMBridge` 的 `MANIFEST-deploy-*.txt`；用规范包重装（`VMDEPLOY_FORCE_FETCH=1`） |
-| **4d 报 `desktop=75!=25`** | 上游版本变了（白名单外工具数变），或有人改过 `DEFAULT_DESKTOP_TOOL_ALLOWLIST` | 按实际暴露数设 `EXP_DESKTOP_TOOLS`，**不要放宽成 `>=1`**（那就失去发现白名单漂移的能力） |
-| **4d 报 `ERR:rpc-*` / `ERR:URLError`** | 上游进程起不来（缺原生二进制、被杀软拦） | 看 VM 侧 `C:\WinVMBridge\logs` 与 4d 的 stderr tail；`/health.upstreams[].lastError` 有同样信息 |
+| **4c 报 `browser_tools=ERR:http-502`**（第 5 步同报 `browser=ERR:http-502`） | `agent-browser` 未装到 VM（4a 的 **DB-7** `npm i -g` 失败，安装侧按「可选依赖」降级不阻断） | 重跑 `--only 4`（4a 的 DB-7 会补装）；看 4a 日志的 `DB-7` 行；不需要该工具面则 `SKIP_UPSTREAMS=1` |
+| **4c 报 `browser_tools=ERR:http-404`**（第 5 步同报 `browser=ERR:http-404`） | vm-service 是**旧版**（无 `/mcp/<id>` 路由）——最常见成因：`--only 4` 推了缓存里的旧 dist | 确认包根版本（2a 的 `版本 =`）与 VM 上 `C:\WinVMBridge` 的 `MANIFEST-deploy-*.txt`；用规范包重装（`VMDEPLOY_FORCE_FETCH=1`） |
+| **4c 报 `desktop_tools=75!=25`**（第 5 步同报 `desktop=75!=25`） | 上游版本变了（白名单外工具数变），或有人改过 `DEFAULT_DESKTOP_TOOL_ALLOWLIST` | 按实际暴露数设 `EXP_DESKTOP_TOOLS`，**不要放宽成 `>=1`**（那就失去发现白名单漂移的能力） |
+| **4c / 第 5 步报 `ERR:rpc-*` / `ERR:URLError`** | 上游进程起不来（缺原生二进制、被杀软拦） | 看 VM 侧 `C:\WinVMBridge\logs` 与该步日志尾部；`/health.upstreams[].lastError` 有同样信息 |
 
 ## 第 5 步：verify
 
@@ -90,8 +90,8 @@
 | `no-count` / `meter-missing` | 探针日志里找不到 `x/y` 计数 ⇒ 无法核验 | 看对应 `logs/<probe>.log` 尾部；探针崩了就是真 FAIL |
 | 单项探针 > 300s | 服务端闸/网络 | 查该探针日志；`EXECUTION_TIMEOUT`（服务端）与 `timed out`（客户端）两形态别混 |
 | `C3 storage.disk.list` / `C4 app.inventory.list` 恰好 `durationMs≈30200` 后 FAIL | VM 刚开机/刚从挂起恢复时的**冷启**：首调 WMI / 注册表全扫超过服务端 30s 预算。热态实测仅 2.7s / 3.3s | **不是缺陷，别改判据**（否则会掩盖真慢）。等 2~3 分钟重跑 `--only 5` 即 20/20。判据：单独 `command <tool>` 复调 < 5s ⇒ 确认冷启 |
-| `VERIFY=FAIL:upstream`（5e） | 服务 health=200（说明服务活着）但上游工具面取不到计数 ⇒ 真缺陷，不是环境窗 | 同 4d 的 `ERR:http-502/404/rpc-*` 处置；`SKIP_UPSTREAMS=1` 可显式跳过 |
-| 5e 报 `⚠ 服务 health 非 200 ⇒ 归入通道瞬态窗` | 隧道/服务此刻不可用 | 该段记 `ENV_WINDOW`，整体给 `VERIFY=INCOMPLETE`（不判功能失败）；等健康窗只重跑 `verify.sh` |
+| `VERIFY=FAIL:upstream`（第 5 步上游判据） | 服务 health=200（说明服务活着）但上游工具面取不到计数 ⇒ 真缺陷，不是环境窗 | 同 4c 的 `ERR:http-502/404/rpc-*` 处置；`SKIP_UPSTREAMS=1` 可显式跳过 |
+| 第 5 步报 `⚠ 服务 health 非 200 ⇒ 归入通道瞬态窗` | 隧道/服务此刻不可用 | 该段记 `ENV_WINDOW`，整体给 `VERIFY=INCOMPLETE`（不判功能失败）；等健康窗只重跑 `verify.sh` |
 
 ## 卸载
 

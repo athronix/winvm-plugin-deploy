@@ -2,7 +2,7 @@
 # deploy-5-verify.sh · 复验（deploy 第 5 步；也是独立 verify 的唯一入口）
 #
 # 三探针（按 PROBE_DEEP 分级，34 项 / 38 项）+ 终态矩阵（fresh / mcp / health / skills / VM 三点）
-# + 上游工具面（5e：agent-browser / agent-desktop 的真实 tools/list 计数，与 deploy 4d 同口径）。
+# + 上游工具面（v2.4.0 起并入三探针段：browser=33 / desktop=25 与 34 项并列硬断言，原 5e 已删）。
 # 不建通道、不修通道、不重启 VM。通道瞬态窗 → VERIFY=INCOMPLETE rc=2（既不假绿也不误报功能失败）。
 #
 # 新鲜复用：deploy 刚在本进程跑完探针时，同包根 + 600s 内可只跑矩阵（省 ~100s）。
@@ -48,8 +48,35 @@ fi
 
 # ── 5a/5b/5c 三探针 ──
 PROBE_TOTAL=0; PROBE_PASS=0; PROBE_SKIP=0; PROBLEMS=""
+# ── 上游工具面（v2.4.0 并入本段，原 5e）──
+# 与 4c 同一口径：真实 tools/list 计数，三组数字并列硬断言
+#   探针 34 项（deep=38） · browser 33 工具 · desktop 25 工具（白名单）
+# 为什么不再单开 5e：verify 与 deploy-4 本就是同一次交付的两个观测面，分开会让
+# 「34/34 全绿但上游没装」这种半绿状态看起来像通过。
+# 做成函数是为了在**两个分支各自 st_begin 5 之后**调用一次 —— 放在 st_begin 之前
+# 会把这 2 次 tools/list 往返的耗时排除在第 5 步之外，steps_report 的时长口径就假了。
+UP_LINE=""
+upstream_probe() {
+  if [ "${SKIP_UPSTREAMS:-0}" = "1" ]; then
+    UP_LINE="browser=SKIP desktop=SKIP"
+    echo "  [upstream] SKIP（SKIP_UPSTREAMS=1，两个工具面明确不要）"
+    return 0
+  fi
+  # 判定口径只此一处：_common.sh 的 upstream_judge（与 4c 的 vmcheck 取值同一组期望值，
+  # 但这里是宿主侧直打 /mcp/<id> 的独立观测面 —— 两处都过才算真绿）。
+  local uj
+  uj="$(upstream_judge)"
+  case "$uj" in
+    OK\ *) UP_LINE="${uj#OK }"
+           echo "  [upstream] $UP_LINE（期望 browser=$UPSTREAM_EXP_BROWSER desktop=$UPSTREAM_EXP_DESKTOP）" ;;
+    *)     UP_LINE="$(printf '%s' "${uj#FAIL }" | sed 's/（.*//')"
+           echo "  [upstream] $uj"
+           PROBLEMS="$PROBLEMS upstream:${uj#FAIL }" ;;
+  esac
+}
 if [ $REUSE -eq 1 ]; then
   st_begin 5 "三探针（复用 deploy 刚跑的结果）"
+  upstream_probe
   echo "  复用理由: $RREASON（强制冷跑=VERIFY_FORCE_PROBE=1）"
   echo "  复用日志: $S_LOGD"
   for pr in mcp-probe a2a-probe example-probe; do
@@ -65,9 +92,10 @@ if [ $REUSE -eq 1 ]; then
     echo "  [$pr REUSED] ${PT:-no-meter} SKIP=${SK:-0}"
   done
   st_end "$([ -z "$PROBLEMS" ] && echo 0 || echo 1)" "$([ -z "$PROBLEMS" ] && echo PASS || echo FAIL)" \
-    "REUSED PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP" "${PROBLEMS:-none}"
+    "REUSED PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP | $UP_LINE" "${PROBLEMS:-none}"
 else
   st_begin 5 "三探针 ${PROBE_DEEP:+(deep=$PROBE_DEEP)}"
+  upstream_probe
   echo "  不复用探针结果，实跑三探针（理由：$RREASON；强制复用=调 PROBE_FRESH_BUDGET_S）"
   for pr in mcp-probe a2a-probe example-probe; do
     ( cd "$PKG" && "$PY" "qa/deploy-probes/$pr.py" > "$LOGD/$pr.log" 2>&1 ); RC=$?
@@ -89,7 +117,7 @@ else
   [ "$PROBE_TOTAL" != "$EXP_TOTAL" ] && PROBLEMS="$PROBLEMS total-$PROBE_TOTAL!=$EXP_TOTAL"
   [ "$PROBE_SKIP" != "$EXP_SKIP" ] && PROBLEMS="$PROBLEMS skip-$PROBE_SKIP!=$EXP_SKIP"
   st_end "$([ -z "$PROBLEMS" ] && echo 0 || echo 1)" "$([ -z "$PROBLEMS" ] && echo PASS || echo FAIL)" \
-    "PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP deep=$PROBE_DEEP" "${PROBLEMS:-none}"
+    "PROBES $PROBE_PASS/$PROBE_TOTAL SKIP=$PROBE_SKIP deep=$PROBE_DEEP | $UP_LINE" "${PROBLEMS:-none}"
 fi
 [ -z "$PROBLEMS" ] || FAILS="$FAILS probes"
 
@@ -134,28 +162,6 @@ st_end $VRC "$([ $VRC -eq 0 ] && echo PASS || echo FAIL)" \
   "matrix$( [ "$ENV_WINDOW" = "1" ] && echo ' +ENV_WINDOW')" \
   "$([ $VRC -eq 0 ] && echo none || echo "看 $LOGD")"
 [ $VRC -ne 0 ] && FAILS="$FAILS matrix"
-
-# ── 5e MCP 上游工具面（agent-browser / agent-desktop，与 4d 同一口径）──
-# 独立成段的理由：4d 只在 deploy 第 4 步跑，而 verify 可能被单独调用于排障；
-# 两个上游是本项目交付物的一部分，必须和 54 能力一样可复验。
-# 失败分流：health=200 仍失败=真缺陷；health 非 200=通道瞬态窗（记 ENV_WINDOW，不误报）。
-st_begin 5e "MCP 上游工具面（agent-browser / agent-desktop）"
-if [ "${SKIP_UPSTREAMS:-0}" = "1" ]; then
-  st_end 0 SKIP "SKIP_UPSTREAMS=1"
-else
-  UV="$(upstream_judge)"
-  echo "  $UV"
-  case "$UV" in
-    OK\ *) st_end 0 PASS "$(printf '%s' "$UV" | sed 's/^OK //')" ;;
-    *)     st_end 1 FAIL "$(printf '%s' "$UV" | sed 's/^FAIL //')"
-           if [ "$(health_code "${WINVM_TUNNEL_LOCAL_PORT:-18443}" 8)" = "200" ]; then
-             FAILS="$FAILS upstream"
-           else
-             echo "⚠ 服务 health 非 200 ⇒ 归入通道瞬态窗，不判功能失败" >&2
-             ENV_WINDOW=1
-           fi ;;
-  esac
-fi
 
 steps_report
 if [ -n "$FAILS" ]; then

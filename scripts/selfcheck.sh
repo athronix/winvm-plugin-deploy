@@ -125,11 +125,17 @@ def c_frontmatter(root):
 
 
 def c_inventory(root):
-    """SKILL.md 提到的每个脚本名都必须真实存在（防改名漏改文档/漏入包）。"""
+    """SKILL.md 提到的每个脚本名都必须真实存在（防改名漏改文档/漏入包）。
+
+    白名单只放**明确属于母项目**的探针（如 `qa/deploy-probes/vmcheck.ps1`）：
+    它们由 `ps-run.sh` 推到 VM 里执行，本来就不随技能分发。放行必须逐个列名，
+    不许改成"凡 qa/ 开头都放过"—— 那会把"技能脚本漏入包"一起放过。
+    """
     bad = []
+    MOTHER_ONLY = {'vmcheck.ps1'}
     txt = read(os.path.join(root, 'SKILL.md'))
     names = set(re.findall(r'`([A-Za-z0-9_\-]+\.(?:sh|ps1|mjs))`', txt))
-    for n in sorted(names):
+    for n in sorted(names - MOTHER_ONLY):
         cands = [os.path.join(root, 'scripts', n), os.path.join(root, 'scripts', 'legacy', n)]
         if not any(os.path.exists(c) for c in cands):
             bad.append('SKILL.md 引用了不存在的脚本: %s' % n)
@@ -183,6 +189,41 @@ def c_ssh_4steps(root):
         bad.append('ALLOW_FROM 默认 $VM_HOST（VM 自身 IP）→ 防火墙白名单把宿主挡死')
     if 'allow_arg' not in body:
         bad.append('1c 未把 -AllowFrom 做成可选（无 allow_arg 条件拼接）')
+
+    # ── v2.4.0：1p 成功即短路，1b/1c/1d 一个都不许跑（用户明确要求）──
+    # 判据不能只看「有 1p」：真正要锁的是 rc=0 → exit 0 落在 1b 段落**之前**。
+    i_1p = body.find('deploy-1p-autokey.sh')
+    # 锚点必须是代码行：注释已被 strip_comments 剥掉，「# ═══ 1b/1c/1d」那行读不到
+    i_1b = body.find('st_begin "1b.')
+    if i_1p < 0:
+        bad.append('deploy-1-ssh.sh 未调用 1p（口令引导形同虚设）')
+    elif i_1b < 0 or i_1b < i_1p:
+        bad.append('deploy-1 的 1b/1c/1d 迭代段不在 1p 之后（短路点无处可落）')
+    else:
+        seg = body[i_1p:i_1b]
+        if not re.search(r'\n\s*exit 0', seg):
+            bad.append('1p 返回 0 后没有短路 exit 0（会继续跑 1b/1c/1d 白烧一轮）')
+
+    # ── 1p.7 与 1d 回验默认 SKIP：为效率关掉，但查验时必须能一键打开 ──
+    p1 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1p-autokey.sh')))
+    if 'oneclick_verify_enabled' not in p1:
+        bad.append('1p.7 未接 oneclick_verify_enabled（回验无法默认关闭）')
+    # 开关本体（含缺省值）定义在 _common.sh，两处使用者共用 —— 默认值必须在那里是 0
+    cm0 = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    if 'AUTOKEY_VERIFY_AFTER_S2:-0' not in cm0:
+        bad.append('回验开关缺省不是关（_common.sh 的 AUTOKEY_VERIFY_AFTER_S2 缺省须为 0）')
+    if 'wait_channel_ready()' not in cm0:
+        bad.append('_common.sh 缺 wait_channel_ready()（1p.7 与 1d 会各自写一份轮询）')
+    if 'wait_channel_ready' not in p1:
+        bad.append('1p.7 未用 wait_channel_ready 等待通道恢复（固定 sleep 会假红）')
+    # 关闭时不许落 CHANNEL_READY=1：没验过的通道写"已就绪"，4.0 门禁就被骗过了
+    sk = re.search(r'if\s+!\s*oneclick_verify_enabled;\s*then(.*?)\nfi', p1, re.S)
+    if sk and 'CHANNEL_READY=1' in sk.group(1):
+        bad.append('1p.7 关闭回验时仍写 CHANNEL_READY=1（未验证的通道被标成就绪）')
+    if 'oneclick_verify_enabled' not in body:
+        bad.append('1d 未接 oneclick_verify_enabled（用户跑完 oneclick 后无从回验）')
+    if 'wait_channel_ready' not in body:
+        bad.append('1d 未用 wait_channel_ready 轮询（一次性探测会假红）')
     return bad
 
 
@@ -406,6 +447,20 @@ def c_rollback_path(root):
     if 'POST_ROLLBACK_SCHEDULED' not in fn:
         bad.append('3b 缺 SYSTEM 任务成功判据')
 
+    # ── v2.4.0：undeploy 只保留 3a/3b 两环节（3c 宿主侧回滚、3d 轮询均已删除）──
+    # 保留的理由写在脚本注释里：私钥是可复用资产、安全边界由 host-state.json 基线保证。
+    # 这里锁两件事：① 3c/3d 不许悄悄复活（用户明确要求去掉）；② 3b 的「下发 + 执行」
+    # 两段必须都在 —— 拆掉任一段，VM 侧 -Rollback 就永远不会被派生/执行。
+    for ghost in ('st_begin 3c', 'st_begin 3d', 'host_rollback'):
+        if ghost in u3:
+            bad.append('undeploy-3 出现 %s（v2.4.0 已删除，属回归）' % ghost)
+    for need, why in (('POST_ROLLBACK_SCHEDULED', '下发段'),
+                      ('-Rollback', 'VM 侧 -Rollback 执行段')):
+        if need not in u3:
+            bad.append('undeploy-3 的 3b 缺%s（%s）' % (need, why))
+    if 'TUNNEL=SCHEDULED' not in u3:
+        bad.append('undeploy-3 未声明 TUNNEL=SCHEDULED（异步拆通道的终态无判据）')
+
     d1 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh')))
     seg1a = re.search(r'st_begin 1a\b(.*?)\n\s*st_end', d1, re.S)
     seg1b = re.search(r'prepare_key\(\)\s*\{(.*?)\n\}', d1, re.S)
@@ -603,12 +658,32 @@ def c_pkg_version(root):
     return bad
 
 
+def c_step4_honesty(root):
+    """4b 必须识破 dry-run 假绿：`rc=0 + 零动作` 却报 PASS 是最危险的形态。
+
+    2026-11-18 真机实测：新包根只有 `.env.example`，其中的 `WINVM_DRY_RUN=1` 是刻意
+    优先于 `--apply` 的兜底保险 ⇒ setup 只打印计划、rc=0、耗时 0s，4b 当场报 PASS，
+    而 VM 上仍是上一版服务 ⇒ 4c 的 `desktop_tools` 读到旧白名单（25→10），现场极易
+    误判成「上游白名单退化」。判据必须在 4b 段内、且在 `st_end 0 PASS` 之前。
+    """
+    bad = []
+    d4 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-4-vm.sh')))
+    if 'DRY-RUN 只规划' not in d4:
+        bad.append('deploy-4 未识别 setup 的 dry-run（rc=0 零动作会直接 PASS）')
+    m = re.search(r'st_begin 4b\b(.*?)\nst_end 0 PASS "setup rc=0"', d4, re.S)
+    if not m:
+        bad.append('deploy-4 找不到 4b 段（到 setup rc=0 PASS 为止）')
+    elif 'DRY-RUN 只规划' not in m.group(1):
+        bad.append('4b 的 dry-run 判据没落在 PASS 之前（等于不拦）')
+    return bad
+
+
 def c_upstream_contract(root):
     """上游 MCP 工具面（agent-browser / agent-desktop）三段闭环必须齐全。
 
     这两个 stdio MCP server 是本项目交付物的一部分（装/卸/验三处都要有）：
-      · 装：install-vm 的 [4b/6] 全局 npm 安装（母项目侧，本技能只负责判据）；
-      · 验：deploy-4 的 4d 与 verify 的 5e 必须用**真实 tools/list 计数**，
+      · 装：4a 的 DB-7 全局 npm 安装（母项目侧，本技能只负责判据）；
+      · 验：4c 与第 5 步三探针段必须用**真实 tools/list 计数**，
         `/health.upstreams[]` 是懒启动观测值（刚起恒 idle）⇒ 拿它断言必假红；
       · 卸：vm-remove-local.ps1 必须真的卸全局 CLI，并且要自补 PATH
         （SSH 会话只拿到机器 PATH，C:\\nodejs 是用户 PATH 条目 ⇒ Get-Command npm 为空）。
@@ -631,12 +706,31 @@ def c_upstream_contract(root):
     if 'local py="${PY:-}"' not in seg:
         bad.append('upstream_tools 裸用 $PY（set -u 下步脚本单独跑会 unbound）')
 
+    # v2.4.0 结构：4d / 5e 已撤销，上游判据并入 4c 与第 5 步三探针段。
+    # 这里锁的是「并进去之后判据没丢、也没退化成常量」：
     d4 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-4-vm.sh')))
-    if 'st_begin 4d' not in d4 or 'upstream_judge' not in d4:
-        bad.append('deploy-4 缺 4d 上游工具面判据')
+    if 'st_begin 4d' in d4:
+        bad.append('deploy-4 仍有 4d（v2.4.0 已并入 4c，重复段落会让耗时归属失真）')
+    if 'st_begin 4c' not in d4:
+        bad.append('deploy-4 缺 4c（上游判据并进 4c 后必须有这一步）')
+    for need in ('browser_tools', 'desktop_tools', 'EXP_BROWSER_TOOLS', 'EXP_DESKTOP_TOOLS', 'SKIP_UPSTREAMS'):
+        if need not in d4:
+            bad.append('deploy-4 的 4c 缺 %s（上游判据退化成不判）' % need)
+    # 期望值必须从 _common.sh 取，不许在本步再硬写一份默认值（两处默认值=必然漂移）
+    if 'EXP_BROWSER_TOOLS="$UPSTREAM_EXP_BROWSER"' not in d4:
+        bad.append('deploy-4 未从 _common.sh 取期望值（EXP_BROWSER_TOOLS 未接 $UPSTREAM_EXP_BROWSER）')
     d5 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-5-verify.sh')))
-    if 'st_begin 5e' not in d5 or 'upstream_judge' not in d5:
-        bad.append('deploy-5 缺 5e 上游工具面判据（verify 单独调用时无复验面）')
+    if 'st_begin 5e' in d5:
+        bad.append('deploy-5 仍有 5e（v2.4.0 已并入三探针段）')
+    if 'upstream_judge' not in d5:
+        bad.append('deploy-5 未调 upstream_judge（verify 单独调用时无上游复验面）')
+    if d5.count('$UP_LINE') < 2:
+        bad.append('deploy-5 的 st_end 未带上游数字（复用/冷跑两个分支都要并列可读）')
+    # 判据必须落在每个 st_begin 5 之后：放前面会把两次 tools/list 往返耗时排除在
+    # 第 5 步之外，steps_report 的时长口径就失真（2026-11-18 结构调整时踩到）。
+    for m in re.finditer(r'st_begin 5 ', d5):
+        if 'upstream_probe' not in d5[m.end():m.end() + 400]:
+            bad.append('deploy-5 的 st_begin 5 之后未调 upstream_probe（耗时不计入本步）')
 
     un2 = strip_comments(read(os.path.join(root, 'scripts', 'undeploy-2-vm.sh')))
     if '-KeepUpstreams' not in un2:
@@ -766,7 +860,7 @@ CHECKS = [
     ('tunnel-signal', c_tunnel_signal), ('multi-source', c_multi_source),
     ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
     ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
-    ('upstream-contract', c_upstream_contract),
+    ('upstream-contract', c_upstream_contract), ('step4-honesty', c_step4_honesty),
     ('password-bootstrap', c_password_bootstrap),
 ]
 
@@ -891,6 +985,39 @@ MUTATIONS = [
     ('M29 提权面退化为只用用户级', 'scripts/deploy-1p-autokey.sh',
      "AK_ADMIN='C:/ProgramData/ssh/administrators_authorized_keys'",
      "AK_ADMIN=\"C:/Users/${VM_USER}/.ssh/authorized_keys\""),
+    # v2.4.0 结构：4d / 5e 撤销后必须真的不再复活。复活的直接后果是同一件事跑两遍、
+    # 且 verify 单跑时又只剩一个观测面（用户明确要求"不用单独起 4d/5e"）。
+    ('M30 5e 环节复活', 'scripts/deploy-5-verify.sh',
+     'upstream_probe() {', 'st_begin 5e "上游工具面"\nupstream_probe() {'),
+    # 把上游探测挪到 st_begin 5 之前：两次 tools/list 往返（各 60s 超时窗）耗时不计入
+    # 第 5 步 ⇒ steps_report 报的时长小于真实耗时，流程图里的"评估时长"随之失真。
+    ('M31 上游探测移出第 5 步', 'scripts/deploy-5-verify.sh',
+     '  st_begin 5 "三探针 ${PROBE_DEEP:+(deep=$PROBE_DEEP)}"\n  upstream_probe',
+     '  upstream_probe\n  st_begin 5 "三探针 ${PROBE_DEEP:+(deep=$PROBE_DEEP)}"'),
+    # 4c 的期望值退回本步硬写默认值：_common.sh 改一处、这里不跟 ⇒ 两处默认值漂移，
+    # 上游白名单一调整就出现"4c 绿 5 红"的自相矛盾。
+    ('M32 4c 期望值退回硬写', 'scripts/deploy-4-vm.sh',
+     'EXP_BROWSER_TOOLS="$UPSTREAM_EXP_BROWSER" EXP_DESKTOP_TOOLS="$UPSTREAM_EXP_DESKTOP"',
+     'EXP_BROWSER_TOOLS="${EXP_BROWSER_TOOLS:-33}" EXP_DESKTOP_TOOLS="${EXP_DESKTOP_TOOLS:-25}"'),
+    # 1p 成功后不短路：白白再跑一轮 1b 备钥 + 1c 打印命令 + 1d 等待，用户看到
+    # 「通道已建好却还被要求粘命令」的矛盾输出（用户第 ① 条要求的正是这个短路）。
+    ('M33 1p 成功不短路', 'scripts/deploy-1-ssh.sh',
+     '    exit 0   # 1p 内部已 steps_report + 落 CHANNEL_READY',
+     '    : # 短路被撤'),
+    # 1d 丢掉回验开关：用户跑完 oneclick 后即使 AUTOKEY_VERIFY_AFTER_S2=1 也不回验，
+    # 「查验模式」形同虚设（第 ③ 条要求的正是这个可开关的回验）。
+    ('M34 1d 回验开关失效', 'scripts/deploy-1-ssh.sh',
+     'if [ "$WAIT_S" -gt 0 ] || oneclick_verify_enabled; then',
+     'if [ "$WAIT_S" -gt 0 ]; then'),
+    # 4b 放过 dry-run：rc=0 零动作冒充 PASS，VM 上跑旧版却报「装完了」。
+    ('M36 4b 放过 dry-run 假绿', 'scripts/deploy-4-vm.sh',
+     'if grep -q \'DRY-RUN 只规划\' "$SL" 2>/dev/null; then', 'if false; then'),
+    # undeploy 3c 复活：宿主侧回滚会主动删私钥（可复用资产），且与 3b 的 VM 侧回滚
+    # 抢同一份 host-state.json 基线（用户第 ⑨ 条要求去掉）。
+    # 注入点用带缩进的赋值行锚定：裸 `TUNNEL=SCHEDULED` 在下一行 echo 里还有一次（count=2）。
+    ('M35 undeploy 3c 复活', 'scripts/undeploy-3-ssh.sh',
+     '    TUNNEL=SCHEDULED\n',
+     '    st_begin 3c "宿主侧回滚"\n    TUNNEL=SCHEDULED\n'),
 ]
 
 
