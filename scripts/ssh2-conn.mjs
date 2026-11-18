@@ -59,18 +59,41 @@ export function buildConnectOptions(env = process.env) {
     throw new Error('VM_SSH_PORT 非法: ' + String(env.VM_SSH_PORT));
   }
   const keyPath = env.WINVM_VM_KEY || join(homedir(), '.ssh', 'id_ed25519');
-  if (!existsSync(keyPath)) throw new Error('私钥文件不存在: ' + keyPath);
   /** @type {object} */
   const options = {
     host,
     port,
     username: env.VM_USER || 'User',
-    privateKey: keyPath, // 纯函数只登记 path（可测、不读盘）；建连前由 resolvePrivateKeyForConnect 转 Buffer
     readyTimeout: Number(env.VM_SSH_READY_TIMEOUT_MS || 15000),
     keepaliveInterval: 8000,
   };
+  /**
+   * 认证形态（v2.2.0 新增纯口令面）：
+   *   - 默认（key/auto）：私钥必需；WINVM_SSH_PASSWORD 作为**私钥口令**或二次认证附带。
+   *   - WINVM_SSH_AUTH=password：**只要口令**，不要求私钥存在。用于「免密通道尚未建立、
+   *     但已知 VM 账户口令」的引导场景（deploy 第 1 步 1p：密码登录 → 自动装公钥）。
+   *     这条路径故意不复用 OpenSSH 二进制（二进制对 VM 有相位性挂起，密码段同样会挂）。
+   */
+  const authMode = String(env.WINVM_SSH_AUTH || '').toLowerCase();
+  const password = env.WINVM_SSH_PASSWORD || '';
+  if (authMode === 'password') {
+    // 「无密码登录」场景（用户 2026-11-18 明确纳入准入面）：WINVM_SSH_PASSWORD 显式置空
+    // 且 WINVM_SSH_PASSWORD_EMPTY=1 时必须**照传空口令**——空串与「未提供」在 bash 里同为
+    // `-z` 为真，不用独立标记就无法区分，会把空口令误判成「未给口令」而不尝试。
+    // 空口令是合法 SSH 认证尝试：Windows sshd 出厂 PermitEmptyPasswords no 会直接拒，
+    // 这是确定性失败（快速、无副作用），由调用方决定是否继续降级。
+    const emptyIntent = String(env.WINVM_SSH_PASSWORD_EMPTY || '') === '1';
+    if (!password && !emptyIntent) throw new Error('WINVM_SSH_AUTH=password 但 WINVM_SSH_PASSWORD 为空（空口令须显式 WINVM_SSH_PASSWORD_EMPTY=1）');
+    options.password = password;
+    // 空口令时只跑「password」一种方法即可；非空时允许 keyboard-interactive 兜底
+    // （部分 Windows 配置把密码认证代理给 kb-int 服务）。
+    if (!emptyIntent) options.tryKeyboard = true;
+    return options;
+  }
+  if (!existsSync(keyPath)) throw new Error('私钥文件不存在: ' + keyPath);
+  options.privateKey = keyPath; // 纯函数只登记 path（可测、不读盘）；建连前由 resolvePrivateKeyForConnect 转 Buffer
   // 密码附带：仅当 WINVM_SSH_PASSWORD 在场（私钥口令/兜底认证），绝不记录内容。
-  if (env.WINVM_SSH_PASSWORD) options.password = env.WINVM_SSH_PASSWORD;
+  if (password) options.password = password;
   return options;
 }
 

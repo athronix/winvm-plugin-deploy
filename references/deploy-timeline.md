@@ -19,6 +19,7 @@
 | 细步骤 | 实测 | 难点 / 风险点 | 优化方案（已落地） | 完善效果 |
 |---|---|---|---|---|
 | 1a 判断通道 | 🔬 **1s**（READY）<br>🔬 **15s**（DOWN） | ① WEDGE 时 sshd 握手挂起，判据像"网络不通"；② 长连健康 ≠ 新建连接可用 | 判据统一为**新建连接实测**（`ssh2-conn.mjs ping`）；后端默认 `auto` | 🔬 READY 1s / DOWN 15s；不再依赖 health 长连口径 |
+| 1p 凭据建通道（v2.3.0） | 🔬 **7s**（凭据不可用 → 退 2 回人工）<br>🔬 **S1 直写约 3~5s**（口令/空口令任一可登录）<br>🔬 **S2 oneclick 25~40s**（仅 S1 回验不通时才走） | ① 口令/空口令认证段不能用 OpenSSH 二进制（相位挂起），必须走 ssh2 纯口令面；② 管理员账户的 sshd 读的是 `%ProgramData%\ssh\administrators_authorized_keys`（`Match Group administrators` 分支），写用户级 `.ssh` 会被**忽略**；③ 空口令被 Windows 出厂两道策略挡住（`PermitEmptyPasswords no` + `LimitBlankPasswordUse=1`） | 准入只看「能登录」（口令 **或** 空口令，空串与未提供用 `WINVM_SSH_PASSWORD_EMPTY=1` 区分）；登录后 `net session` 判身份选授权文件（管理员→ProgramData，否则→用户级），**ACL 用 SID 避免中文组名**，**不重启 sshd** ⇒ 不断连；S1 回验不通才跑 oneclick；**任何一步不满足就退 2 回人工 1c**（零行为倒退） | 🔬 空口令尝试 → 7s 降级并打印放开配方；错误口令 → 7s 降级；S1 载荷真机 `ALREADY + ACL_OK` 幂等；ACL 收紧后 key 认证仍 READY（2s） |
 | 1b 备密钥 | 🔬 0s | 密钥被覆盖后无法回滚；「通道本来活着」的机器从不写基线 | 1a READY 与 1b 两条路**都写** `host-state.json` 基线 | 🔬 `baseline` 恒存在，undeploy 可精确删钥 |
 | 1c 打印用户命令 | 🔬 3s（双源探测） | ① 单源 404 → 用户卡死；② 经 Git Bash 粘贴双引号被吞；③ 多行被折叠致语法崩；④ **`irm\|iex` 模式下 BOM / string[] 会让脚本一行都没跑就满屏红字** | 双源回退（**只从技能仓**：Gitee raw → GitHub raw）+ 全单引号单行 `;` + 备选命令内联 `[string]::Join([char]10,@($s))` 归一化 | 🔬 两源 HEAD 全 200、sha256 与源一致；VM 内 `PARSE_OK`；**irm 备选已真机跑通**（见 §四 轮次 2） |
 | 1d 用户粘贴 | 🔬 **23s**（脚本内 9 阶段）<br>（前值 1065s / 31s） | 人工耗时不可控；粘错一次要回 1b 换钥 | 命令零双引号单行化 + 双源回退 + **MSI 缓存** | 🔬 `selfstage=existing`，`[9/9]` 全绿，阶段 2 仅 8s |
@@ -67,7 +68,7 @@
 | 4a prepare-vm | 🔬 **27s**（轮次 1 为 20s / v2.0.2 为 45s） | node 缺失、防火墙未建、登录态（DB-4 需 VM 内交互一次） | `--ensure-node` 分项打 `[SKIP]` | 🔬 `DB-2/3/6` 全 `[SKIP]`，27s |
 | **4b setup（推包+装+起服务）** | 🔬 **61s**（轮次 1 为 62s，v2.0.2 首跑 168s / 稳态 124s） | 全链最大项；服务装完后 socket 可能假死（网络抖动/挂起），表现为宿主 `curl 52` | `--only-vm --skip-build`；假死时重跑本步即修 | 🔬 61s，**物理下限** |
 | 4c vmcheck 七判据 | 🔬 **14s**（v2.0.2 69s→54s；全量重装轮 38s） | `vmcheck.ps1` 是纯报告器（无退出码）⇒ 只看 rc 等于"跑完就算过" | 自解析 JSON 逐项断言 + health 双口径 | 🔬 14s 真断言（**比旧版快 40s 且不再是假绿**） |
-| 4d 上游工具面 | 🔬 **12s**（首轮，含懒启动）/ 3s（已就绪） | `/health.upstreams` 是懒启动观测值（刚起恒 `idle`），拿它断言会把"没被调过"误判成"装坏了" | 真打 `POST /mcp/<id>` 的 `tools/list` 计数；期望值 33/10 可 env 覆盖 | 🔬 `browser=33 desktop=10`，顺带验证懒启动通路 |
+| 4d 上游工具面 | 🔬 **12s**（首轮，含懒启动）/ 3s（已就绪） | `/health.upstreams` 是懒启动观测值（刚起恒 `idle`），拿它断言会把"没被调过"误判成"装坏了" | 真打 `POST /mcp/<id>` 的 `tools/list` 计数；期望值 33/25 可 env 覆盖 | 🔬 `browser=33 desktop=25`，顺带验证懒启动通路 |
 
 ### 第 5 步：verify（`deploy-5-verify.sh`）
 
@@ -75,7 +76,7 @@
 |---|---|---|---|---|
 | 5 三探针 | 🔬 **16s**（冷跑 34 项）<br>1s（stamp 复用） | 项数漂移（38↔34）让汇总判据失去意义；静默少测=最危险假绿 | 探针分级：默认 34（`PROBE_DEEP=1` 跑 38）；SKIP 必须打印并计入；取不到真实计数即 FAIL | 🔬 `34/34 SKIP=4`，16s（v2.0.2 为 38s） |
 | 5d 终态矩阵 | 🔬 **8s**（v2.0.2 为 26s） | 缓存与仓库构建物漂移会让人误以为"装的是新代码" | 逐文件 SHA256 `fresh` 对账 + disabledTools + connector skills（现要求 ≥10）+ VM 三态 | 🔬 8s 一次给齐五维 |
-| 5e 上游工具面 | 🔬 **3s** | 4d 只在第 4 步跑；verify 单独调用于排障时就没有复验面 | 与 4d 同一 `upstream_judge`；失败按 health 分流（200=真缺陷，非 200=ENV_WINDOW） | 🔬 `browser=33 desktop=10` |
+| 5e 上游工具面 | 🔬 **3s** | 4d 只在第 4 步跑；verify 单独调用于排障时就没有复验面 | 与 4d 同一 `upstream_judge`；失败按 health 分流（200=真缺陷，非 200=ENV_WINDOW） | 🔬 `browser=33 desktop=25` |
 
 **deploy 总账**：轮次 1/2 全链 🔬 **126s / 135s** = 1a 1 + 2 步 3 + 3 步 2 + 4 步 102 + 5 步 24 + 收尾；
 轮次 3 为 **274s**（4 步 251s），归因见 §四。
@@ -206,3 +207,99 @@
 - **复验**：`undeploy.sh --only 1` → `卸载器未清的条目已兜底移除: winvm-browser,winvm-desktop` → `UNDEPLOY=PASS`（5s）。
 
 **本轮耗时偏高的归因（不算回归）**：① 从零重装（`C:\WinVMBridge` 被上一轮卸载删空）⇒ `[VM]` 相位走全新解压，165.6s；② 上游 CLI 首次安装 47.9s；③ `4a` 76s / `4c` 38s 属历史波动带（20~76s / 13~38s）。可再压的两处仍是母项目 backlog：`4b` 内容短路（省 100~140s）、`4a` 只读探测合并往返。
+
+## 七、V1.4.32 耗时拆解与优化（2026-11-18）
+
+### 7.1 先把「慢在哪」量出来（V1.4.31 那轮 413s 的真实账）
+
+`4b` 的 226s 不是黑箱，远端 `install-vm.mjs` 自己有 `[t+Xs]` 打点（日志在
+`C:\WinVMBridge\dev-and-qa\logs\<date>\install-vm-run.log`）：
+
+| 时间窗 | 内容 | 耗时 | 性质 |
+|---|---|---|---|
+| t+0 → t+8.2s | 依赖解析 + 12 个 workspace 软链 + 运行配置生成 | 8.2s | 必要 |
+| t+8.2 → t+8.8s | 共享 Skills 发布 7 个 + 链接 7 个 | 0.6s | 必要 |
+| t+8.8 → **t+56.7s** | **`[4b/6]` 上游 CLI：`npm i -g agent-browser`（17s）+ `agent-desktop`（12s）** | **47.9s** | **可优化**：两次 npm 启动/元数据往返 ≈ 9s 纯浪费 |
+| t+56.7 → t+75.3s | 计划任务注册（停旧实例 → 杀端口进程 → 建 XML → 注册 → 写启动器） | 18.6s | 必要 |
+| t+75.3 → **t+111.0s** | **`[6/6] 自检`（ps-bridge 冷启 + 6 个模块探针）** | **35.6s** | 与 4c/4d 部分重叠，本轮**保留**（它是唯一验「模块加载」的环节） |
+| t+111.0 → **t+131.5s** | 管理命令部署 + `[7a]` 写用户 PATH | **20.2s** | **可优化**：PATH 走了 3 次 PowerShell（Get / Set / 广播），每次冷启 5~8s |
+
+`[VM]` 的 165.6s = 远端 131.5s + 宿主侧 ~34s（BUILD 打 tar 8MB → scp → PS 冷启 → 进度等待）。
+
+其余两段：
+
+- `[VM-START]` **42.6s** = 结束旧实例 + 端口反查强杀 + 命令行签名清扫 + `schtasks /run` + 轮询到端口监听。
+  轮询是必需语义（「服务真的在听」才能过），但**服务冷启本身**（ps-bridge 装载 + provider 预热）
+  占大头；缩短轮询间隔只能省掉「发现延迟」，量级 3~5s，收益不抵改动风险 ⇒ **本轮不改**。
+- `[QA-PROBE]` **18.3s** = 2 个探针文件逐个 scp（每次新建连接 + 落盘）。
+  合并成一次上传可省 ~8s，但探针是「缺失仅 WARN」的旁路，**留待下轮**。
+
+`4a` 的 76s 是另一种模式：**7 条独立 ssh 往返**（`net session` / `sc query sshd` /
+`sc qc sshd` / `netsh ×2` / `node -v` / `<cli> --version` + 1 条 EncodedCommand）。
+每条都要「新建连接 + 一次 PowerShell 冷启」（Defender 逐进程扫描 5~8s）⇒ 7~8 × 8s ≈ 60s，
+加上 apply .ps1 载荷，正好 76s。**只读探测花 76s 完全不合理**。
+
+### 7.2 本轮落地的三项（都有真机/单测证据）
+
+| 项 | 改法 | 预期收益 | 风险控制 |
+|---|---|---|---|
+| **4a 合并探测** | `buildPrepareProbePs()` 一次 EncodedCommand 采集 9 个事实（admin/sshd×3/防火墙×2/node/cli/配置目录），输出单行 JSON | **-35~45s** | 解析失败自动**退回原 7 条逐条**；另加 75s 硬超时（ssh2 挂起时 promise 可能永不 resolve，而 node 无 pending handle 会**静默 exit 0** —— 这是最危险的假绿） |
+| **上游 npm 合并** | `npm i -g agent-browser agent-desktop`（一次调用）+ `--prefer-offline`；合并失败再逐个重试 | **-8~10s** | 单包失败仍不阻断部署（可选依赖语义不变） |
+| **PATH 单次 PowerShell** | 读 → 幂等判断 → 写注册表 → 广播 WM_SETTINGCHANGE 全在一个 PS 进程内；大小写敏感比较（`-ceq`）对齐原 JS 语义 | **-13~15s** | 任一步异常（老 PS / here-string 被策略拦）→ **退回原三步实现**，行为逐字不变 |
+
+合计预期 **-55~70s**（413s → ~345s）。未做的两项（QA-PROBE 合并、VM-START 轮询细化）已记入
+「已知可优化」，收益各 3~8s，优先级低于「4b 内容未变则短路」（后者预计 -100~140s，需先给
+`MANIFEST-deploy-*.txt` 补 `total-sha256` 字段）。
+
+### 7.3 第二轮加码：把「合并探测」内部再削 10s（真机分步计时）
+
+第一轮只做了「7 发 → 1 发」，但**单发内部**还有大块浪费。VM 内挂 `Stopwatch` 分步量（口径：
+`procAgeMs` = PowerShell 进程创建到脚本首行，即冷启成本）：
+
+| 子步骤 | 实测 | 处置 |
+|---|---|---|
+| PowerShell 冷启（`procAgeMs`） | **6.6~7.7s** | **不可省**——一次探测只允许一次进程启动，这是地板 |
+| `Import-Module NetSecurity` | **5.77s** | **删除**：只为了 `Get-NetFirewallRule`，改走注册表后不需要该模块 |
+| `Get-NetFirewallRule -DisplayName` ×2 | **3.13s + 3.66s = 6.79s** | 改为**注册表直读** `HKLM\...\FirewallPolicy\FirewallRules`：**243ms**（44×） |
+| `Get-CimInstance Win32_Service` | **2.15s** | 改用 `Get-Service` 的 `.StartType`（PS 5.1+ 自带）：**93ms** |
+| `& node -v` / `Get-Command` / `Test-Path` | 0.42 / 0.11 / 0.08s | 保留（已是最廉价形态） |
+
+注册表口径的额外收益：value 的 pipe 串直接带 `Active=TRUE|Dir=In|Action=Allow|LPort=22`，
+因此判据从「规则存在」升级为「**规则存在且真的生效**」——`Get-NetFirewallRule` 只看存在性，
+规则被禁用（`Enabled=False`）时会误报 OK。日志随之三态化：`OK` / `INACTIVE`（存在但废弃）/ `MISSING`。
+兜底：注册表读不出（键缺失/权限）→ 自动回落 `Get-NetFirewallRule -DisplayName`（慢但正确）。
+
+**真机结果**：4a 只读探测 **27.5s → 17.2s**；4a 全段（`--apply --ensure-node`）**63.2s**（原 76s）；
+且 `DB-2 Firewall => [SKIP] rules exist`（此前判据假红会**每轮多跑一遍幂等 DO**）。
+
+同时修掉三个真 bug（都是「看起来正常、实则判据错」的类型）：
+
+1. **`WinVM-SSH-undefined`**：`resolveConfig` 的字段叫 `vmSshPort`，探测构造器解构的是 `sshPort`
+   ⇒ 规则名恒为 `WinVM-SSH-undefined` ⇒ 防火墙判据**恒定假红**。修法：`normalizePorts()` 同时
+   接受两种形状，端口非法**直接抛**（宁可早崩也不许静默假红）。
+2. **`/^auto$/i` 判 `StartType='Automatic'` 为假**：改 `Get-Service` 后返回值从 `Auto` 变成
+   `Automatic`，旧正则失配 ⇒ `sshd` 自启判据恒红。修法：`/^auto/i`。
+3. **ssh2 裸崩进程**：持久 `error` 监听原本挂在 `await` **之后**，而连接失败时 `await` 直接抛，
+   那两行**永远执行不到** ⇒ 认证失败后的 `ECONNRESET` 落在「`once('error')` 已被首错消耗」的
+   Client 上 ⇒ EventEmitter 裸 throw。真机表现：`prepare-vm` 2.1s 带栈退出。修法：监听移到
+   `connect()` 之前。
+4. **直调路径找不到 VM 私钥**：`resolveVmKeyPath()` 的候选链只有 `id_ed25519/id_ecdsa/id_rsa`，
+   而本项目的 VM 钥叫 `id_ed25519_winvm`（技能层由 `_common.sh` 注入 `WINVM_VM_KEY`，绕过即失效）
+   ⇒ 拿到 GitHub 那把钥去连 VM ⇒ `All configured authentication methods failed` ⇒ auto 后端回落
+   二进制。修法：`id_ed25519_winvm` **排到候选链首位**。
+
+### 7.4 第二轮真机总账（`deploy.sh --only 4`，2026-11-18 11:24）
+
+| 步 | 耗时 | 分解 |
+|---|---|---|
+| 4.0 通道门禁 | 2s | `channel_ready` 一次 |
+| **4a** prepare-vm | **60s** | 只读探测 17.2s + apply 载荷 ~43s |
+| **4b** 装 VM 端 | **218s** | **[VM] 155.7s + [VM-START] 47.3s + [QA-PROBE] 14.8s** |
+| 4c vmcheck 七判据 | 34s | 一次 .ps1 载荷 |
+| 4d 上游工具面 | 8s | 真实 `tools/list`：**browser=33 desktop=25** |
+| **WALL** | **323s** | `DEPLOY=PASS` |
+
+`4b` 仍是最大头，且它的 155.7s 里最值钱的一块是「**内容没变也全量重装**」：每轮无条件
+tar 8MB → scp → `install-vm` → 重启服务。下一步的正确改法是在 `MANIFEST-deploy-*.txt` 补
+`total-sha256`（源文件内容哈希，与 tar 时间戳无关），VM 侧比对一致即短路——预计 **-100~140s**，
+比继续抠 4a 的几秒更有价值。

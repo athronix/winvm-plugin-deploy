@@ -138,7 +138,25 @@ if channel_ready 5000; then
   steps_report
   exit 0
 fi
-st_end 0 SKIP "channel=DOWN → 进入 1b 备钥"
+st_end 0 SKIP "channel=DOWN → 先试 1p 口令引导，未果再进 1b 备钥"
+
+# ── 1p：口令自动建通道（免「人工粘一条管理员命令」）──
+# 准入判据只有一条：**能登录**——「用户名+口令」或「用户名+空口令」任一即可
+# （用户 2026-11-18 B1 明确口径）。登录后提权落公钥的路径由 1p 自己设计：
+#   S1 按身份直写授权文件（管理员 → administrators_authorized_keys；否则 → 用户级 .ssh），
+#      不重启 sshd ⇒ 不断连、约 2~4s；
+#   S2 S1 回验不通才跑 oneclick（修 sshd 配置 + 重启 sshd）；
+#   S3 仍不通 ⇒ rc=2，本脚本继续原 1b~1d 人工路径（零行为倒退）。
+if [ "${SKIP_PASSWORD_BOOTSTRAP:-0}" = "1" ]; then
+  echo "[1p] SKIP_PASSWORD_BOOTSTRAP=1 → 跳过口令引导"
+else
+  bash "$SCRIPTDIR/deploy-1p-autokey.sh"; PRC=$?
+  if [ $PRC -eq 0 ]; then
+    exit 0   # 1p 内部已 steps_report + 落 CHANNEL_READY
+  fi
+  echo "[1p] 凭据引导未完成（rc=$PRC）→ 回退 1b 备钥 + 1c 人工命令"
+fi
+
 CH_ROUND=0
 # ═══════════════ 1b/1c/1d 迭代（验证失败回 1b 换钥） ═══════════════
 while [ "$CH_ROUND" -lt "$ROUNDS" ]; do

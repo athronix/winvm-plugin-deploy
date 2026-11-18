@@ -23,6 +23,14 @@
 **通道判定只用新建连接实测**（`ssh2-conn.mjs ping`）。`health=200` 是**长连**健康，不等于新建可用——
 两者分叉正是 WEDGE 的指纹。
 
+| **1p 提示 `PASSWORD_AUTH_UNAVAILABLE`（`auth=empty-password`）** | 该账户**无密码**，但 Windows 出厂两道策略挡住了空口令网络登录：sshd `PermitEmptyPasswords no` + 本地策略 `LimitBlankPasswordUse=1` | 这是确定性的策略拒绝，不是脚本缺陷。要放开（需管理员、且降低安全性）：① `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' LimitBlankPasswordUse 0`；② sshd_config 设 `PermitEmptyPasswords yes` 后 `Restart-Service sshd`。**否则走 1c**：VM 内以管理员跑一次 oneclick 即可，之后免密 READY 就不再走本路径 |
+| **1p 提示 `ADMIN_NO` 但仍 PASS** | 登录账户不在 Administrators 组 | 这不是失败：`Match Group administrators` 不命中时 sshd 读的是**用户级** `~\.ssh\authorized_keys`，而它本来就不需要管理员权限 ⇒ **免密登录照样能建成**。但后续需要管理员能力的步骤（防火墙/服务/Defender）仍会要人工提权 |
+| **1p 的 S1 明明写了公钥、key 回验仍不通** | sshd_config 把 `AuthorizedKeysFile` 指到了别处，或 `PubkeyAuthentication no`，或 ACL 策略拦 | 脚本会自动降级 S2（在口令会话里跑 oneclick 修配置 + 重启 sshd）再回验一次；S2 也不通才退 2。手工排查：VM 内 `Get-Content C:\ProgramData\ssh\sshd_config | Select-String 'AuthorizedKeysFile|Pubkey'` |
+| **1p 报 `timeout: exec _askpass_env: No such file or directory`** | 老版 `vm-conn.sh` 把 `timeout` 包在 shell 函数外层（`_ssh_t _askpass_env ssh`）| v2.2.0 已修为 `_askpass_env _ssh_t ssh`；若在旧技能包上遇到，直接手工 `ssh` 建通道后重跑（免密 READY 就不再走口令路径） |
+| **`prepare-vm` 报 `fwSsh:MISSING` 但规则确实在** | v1.4.31 及更早：① 探测脚本把 `WinVM-SSH-<undefined>` 当规则名（`cfg.vmSshPort` vs `sshPort` 字段错位）；② 降级路径用 `netsh ... name=`，而规则的 **Name 是 GUID**、`WinVM-SSH-22` 只是 DisplayName | v1.4.32 已修（`normalizePorts` + 注册表直读 `Name=` 字段）。判据现在是三态 `OK/INACTIVE/MISSING`，`INACTIVE` 表示规则存在但被禁用/方向反/阻断 |
+| **直调 `node delivery/bootstrap.mjs ...` 报 `All configured authentication methods failed`** | 绕过技能层 `_common.sh` ⇒ 没注入 `WINVM_VM_KEY`，默认候选链拿到了另一把钥（如 GitHub 钥） | v1.4.32 已把 `id_ed25519_winvm` 排到候选链首位；临时绕法：`WINVM_VM_KEY=$HOME/.ssh/id_ed25519_winvm node delivery/bootstrap.mjs ...` |
+| **1p 报 `timeout: exec _askpass_env: No such file or directory`** | 老版 `vm-conn.sh` 把 `timeout` 包在 shell 函数外层（`_ssh_t _askpass_env ssh`）| v2.2.0 已修为 `_askpass_env _ssh_t ssh`；若在旧技能包上遇到，直接手工 `ssh` 建通道后重跑（免密 READY 就不再走口令路径） |
+
 ## 第 2 步：取包 + 装 host 端
 
 | 现象 | 根因 | 处置 |
@@ -70,7 +78,7 @@
 | 拆除后残留僵尸 node（8K、不绑端口、taskkill/Process.Kill/CIM 全免疫） | 老版本 VM-START 遗留 | 只能 VM 内 `shutdown /r /t 5 /f`（**唯一需要重启的场景，且由用户在 VM 内执行**），再重跑 |
 | **4d 报 `browser=ERR:http-502`** | `agent-browser` 未装到 VM（`[4b/6]` 的 `npm i -g` 失败，安装侧按「可选依赖」降级不阻断） | 重跑 `--only 4`（4b 会补装）；看 `install-vm-run.log` 的 npm 段；不需要该工具面则 `SKIP_UPSTREAMS=1` |
 | **4d 报 `browser=ERR:http-404`** | vm-service 是**旧版**（无 `/mcp/<id>` 路由）——最常见成因：`--only 4` 推了缓存里的旧 dist | 确认包根版本（2a 的 `版本 =`）与 VM 上 `C:\WinVMBridge` 的 `MANIFEST-deploy-*.txt`；用规范包重装（`VMDEPLOY_FORCE_FETCH=1`） |
-| **4d 报 `desktop=75!=10`** | 上游版本变了（白名单外工具数变），或有人改过 `DEFAULT_DESKTOP_TOOL_ALLOWLIST` | 按实际暴露数设 `EXP_DESKTOP_TOOLS`，**不要放宽成 `>=1`**（那就失去发现白名单漂移的能力） |
+| **4d 报 `desktop=75!=25`** | 上游版本变了（白名单外工具数变），或有人改过 `DEFAULT_DESKTOP_TOOL_ALLOWLIST` | 按实际暴露数设 `EXP_DESKTOP_TOOLS`，**不要放宽成 `>=1`**（那就失去发现白名单漂移的能力） |
 | **4d 报 `ERR:rpc-*` / `ERR:URLError`** | 上游进程起不来（缺原生二进制、被杀软拦） | 看 VM 侧 `C:\WinVMBridge\logs` 与 4d 的 stderr tail；`/health.upstreams[].lastError` 有同样信息 |
 
 ## 第 5 步：verify

@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
-version: 2.1.0
+version: 2.3.0
 agent_created: true
 ---
 
@@ -14,7 +14,7 @@ agent_created: true
 
 | # | 做什么 | 脚本 | 依赖 |
 |---|---|---|---|
-| **1** | 建 host↔VM 免密 ssh 通道（1a 判 → 1b 备钥 → 1c 给用户一条命令 → 1d 验证，失败回 1b 换钥重来） | `deploy-1-ssh.sh` | — |
+| **1** | 建 host↔VM 免密 ssh 通道（1a 判 READY 则整步 SKIP → **1p 凭据自动建通道**：只要「用户名+口令」或「用户名+空口令」任一能登录就全自动，否则跳过 → 1b 备钥 → 1c 给用户一条命令 → 1d 验证，失败回 1b 换钥重来） | `deploy-1-ssh.sh` + `deploy-1p-autokey.sh` | — |
 | **2** | 取发布包（sha256 + 隔离解压）+ 装 host 端插件与依赖 | `deploy-2-host.sh` | — |
 | **3** | 起 `winvm-tunnel` service 并验证隧道（本地端口在监听 + daemon 存活；`/health` 属第 5 步端到端） | `deploy-3-tunnel.sh` | 1 + 2 |
 | **4** | 装 VM 端（含 node 依赖 + 全局 npm 上游 `agent-browser`/`agent-desktop`）+ 起 mcp/a2a service + 七判据 + 4d 上游工具面 | `deploy-4-vm.sh` | 1 + 2 |
@@ -95,12 +95,12 @@ VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计�
 
 除 54 项结构性能力外，VM 端还跑两个**第三方 stdio MCP server**，由 `vm-service` 反向代理成
 `POST /mcp/browser`、`POST /mcp/desktop`，宿主侧对应 `connector:winvm-browser`（33 工具）与
-`connector:winvm-desktop`（75 工具，默认只暴露 10）。四者**共用同一条隧道**，只差路径。
+`connector:winvm-desktop`（75 工具，默认只暴露 25）。四者**共用同一条隧道**，只差路径。
 
 | 环节 | 在哪 | 判据 |
 |---|---|---|
 | **装** | `deploy-4` 的 4b → 母项目 `delivery/install-vm` 的 `[4b/6]`：`npm i -g agent-browser agent-desktop`（**幂等**：`Get-Command` 已存在即跳过） | 装不上**不阻断**安装（可选依赖），立刻由 4d 变硬判据 |
-| **验** | `deploy-4` 的 **4d** + `deploy-5` 的 **5e**，共用 `_common.sh` 的 `upstream_judge` | **真实 `tools/list` 计数**：browser=`33`、desktop=`10`（白名单数）。可用 `EXP_BROWSER_TOOLS` / `EXP_DESKTOP_TOOLS` 覆盖 |
+| **验** | `deploy-4` 的 **4d** + `deploy-5` 的 **5e**，共用 `_common.sh` 的 `upstream_judge` | **真实 `tools/list` 计数**：browser=`33`、desktop=`25`（白名单数）。可用 `EXP_BROWSER_TOOLS` / `EXP_DESKTOP_TOOLS` 覆盖 |
 | **卸** | `undeploy-2` 的 2c → `vm-remove-local.ps1` 段 8：杀孤儿上游进程 → `npm uninstall -g` | `UPSTREAM_LEFT=NONE`；`--keep-upstreams` 保留 |
 
 **为什么判据不看 `/health.upstreams[]`**：那是**懒启动**的观测值——服务刚起来时上游还没被调用过，
@@ -141,6 +141,7 @@ VM_HOST=... bash scripts/undeploy.sh --dry-run                  # 只打印计�
 |---|---|
 | `deploy.sh` / `undeploy.sh` | 两个任务的总入口（编排 + 并行 + 汇总） |
 | `deploy-1-ssh.sh` | 免密通道：判 / 备钥 / 给命令 / 验证（1a~1d，失败回 1b，最多 3 轮） |
+| `deploy-1p-autokey.sh` | 凭据自动建通道（1p.1~1p.7）：ssh2「口令 / 空口令」登录 → `net session` 判身份 → **S1 直写授权文件**（管理员→`ProgramData\ssh\administrators_authorized_keys`，否则→用户级 `.ssh\authorized_keys`；ACL 用 SID，**不重启 sshd**）→ 立即回验 key → 不通才 **S2** 跑 oneclick（修配置+重启 sshd）→ 仍不通 **S3** 退 2 回人工 1c |
 | `deploy-2-host.sh` | 取包 + MANIFEST 对账 + host 端插件与 skills |
 | `deploy-3-tunnel.sh` | 对齐 `vm-conn.json` 的 identityFile + 起隧道 + 隧道判据（端口监听 + daemon 存活） |
 | `deploy-4-vm.sh` | VM 依赖 + 推包装服务（含 npm 上游）+ 七判据 + 4d 上游工具面（真实 tools/list） |
@@ -176,7 +177,7 @@ bash scripts/selfcheck.sh --mutate        # 变异自证：往副本注缺陷，
 | 第 4 步 setup 超 420s 未监听 | 服务僵死：`schtasks /End /tn WinVMBridge.Service` 后 `/Run` |
 | 4d / 5e 报 `browser=ERR:http-502` | VM 上没装 `agent-browser`（4b 的 npm 失败被降级）：重跑第 4 步；或 `SKIP_UPSTREAMS=1` 明确跳过 |
 | 4d / 5e 报 `browser=ERR:http-404` | vm-service 是旧版（没有 `/mcp/<id>` 路由）：换规范包重装（`--only 4` 可能推旧 dist，见 `references/troubleshooting.md`） |
-| 4d / 5e 报 `desktop=N!=10` 但上游正常 | 白名单被改过（`DEFAULT_DESKTOP_TOOL_ALLOWLIST`）：按新值设 `EXP_DESKTOP_TOOLS`，别放宽断言 |
+| 4d / 5e 报 `desktop=N!=25` 但上游正常 | 白名单被改过（`DEFAULT_DESKTOP_TOOL_ALLOWLIST`）：按新值设 `EXP_DESKTOP_TOOLS`，别放宽断言 |
 | 卸载后 `UPSTREAM_LEFT=agent-desktop` | `npm uninstall -g` 失败（npm 不在 PATH / 文件占用）：看 `vm-remove.log` 的 `[WARN]` 行；手工 `npm uninstall -g`。不需要卸就加 `--keep-upstreams` |
 | verify 报 `ENV_WINDOW=1` | 通道瞬态窗，环境问题非功能失败。等健康窗只重跑 `verify.sh` |
 | 探针报 `total-33!=34` / `skip-N!=4` | 探针项数被改动 → 同步改 `deploy-5-verify.sh` 的 `EXP_TOTAL/EXP_SKIP`（刻意告警，别放宽） |

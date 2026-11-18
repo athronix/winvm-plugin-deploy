@@ -86,7 +86,7 @@ _ssh_common=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChec
 _ssh_bin_one() {
   case "${VM_CHANNEL:-key}" in
     key) _ssh_t ssh -o BatchMode=yes "${_ssh_common[@]}" -p "$VM_SSH_PORT" "${VM_USER}@${VM_HOST}" "$@" ;;
-    password) _ssh_t _askpass_env ssh -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
+    password) _askpass_env _ssh_t ssh -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
                 -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 "${_ssh_common[@]}" \
                 -p "$VM_SSH_PORT" "${VM_USER}@${VM_HOST}" "$@" ;;
     *) return 2 ;;
@@ -95,7 +95,7 @@ _ssh_bin_one() {
 _scp_bin_one() {
   case "${VM_CHANNEL:-key}" in
     key) _ssh_t scp -o BatchMode=yes -o ConnectTimeout=10 "${_ssh_common[@]}" -P "$VM_SSH_PORT" "$@" ;;
-    password) _ssh_t _askpass_env scp -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
+    password) _askpass_env _ssh_t scp -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
                 -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
                 -P "$VM_SSH_PORT" "$@" ;;
     *) return 2 ;;
@@ -119,7 +119,7 @@ vmssh() {
   for i in $(seq 1 "${VM_SSH_TRIES:-3}"); do
     case "${VM_CHANNEL:-key}" in
       key) _ssh_t ssh -o BatchMode=yes "${_ssh_common[@]}" -p "$VM_SSH_PORT" "${VM_USER}@${VM_HOST}" "$@" && return 0 ;;
-      password) _ssh_t _askpass_env ssh -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
+      password) _askpass_env _ssh_t ssh -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
                   -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 "${_ssh_common[@]}" \
                   -p "$VM_SSH_PORT" "${VM_USER}@${VM_HOST}" "$@" && return 0 ;;
       *) echo "VM_CHANNEL 未定：先 vm_channel_probe" >&2; return 2 ;;
@@ -173,7 +173,7 @@ vmscp() {
   for i in 1 2 3; do
     case "${VM_CHANNEL:-key}" in
       key) _ssh_t scp -o BatchMode=yes -o ConnectTimeout=10 "${_ssh_common[@]}" -P "$VM_SSH_PORT" "$@" && return 0 ;;
-      password) _ssh_t _askpass_env scp -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
+      password) _askpass_env _ssh_t scp -F /dev/null -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no \
                   -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
                   -P "$VM_SSH_PORT" "$@" && return 0 ;;
       *) [ "$VM_SSH_BACKEND" = ssh2 ] || { echo "VM_CHANNEL 未定：先 vm_channel_probe" >&2; return 2; } ;;
@@ -183,10 +183,14 @@ vmscp() {
 }
 _askpass_env() {
   local ap="${HOME}/wbtmp/askpass.sh"
+  mkdir -p "$(dirname "$ap")" 2>/dev/null || true
   if [ ! -x "$ap" ]; then
     printf '#!/bin/sh\nprintf "%%s\\n" "$WINVM_SSH_PASSWORD"\n' > "$ap" && chmod 700 "$ap"
   fi
-  WINVM_SSH_PASSWORD="$WINVM_SSH_PASSWORD" DISPLAY=:0 SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force "$@"
+  # 子 shell + export：`VAR=... shell_func` 的环境前缀对函数不可靠；且 timeout 必须在**内层**
+  # 才生效——`timeout _askpass_env ssh` 会报 "timeout: exec _askpass_env: No such file or directory"
+  # （timeout 只能 exec 外部程序，不能 exec shell 函数）。
+  ( export WINVM_SSH_PASSWORD DISPLAY=:0 SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force; "$@" )
 }
 vm_channel_probe() {
   [ -n "$VM_HOST" ] || { echo "VM_HOST 未设（问用户）" >&2; return 2; }
@@ -226,10 +230,21 @@ vm_channel_probe() {
   done
   if [ -n "${WINVM_SSH_PASSWORD:-}" ]; then
     for i in 1 2 3; do
-      _ssh_t _askpass_env ssh -F /dev/null -o UserKnownHostsFile=/dev/null \
+      _askpass_env _ssh_t ssh -F /dev/null -o UserKnownHostsFile=/dev/null \
         -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \
         "${_ssh_common[@]}" -p "$VM_SSH_PORT" "${VM_USER}@${VM_HOST}" whoami >/dev/null 2>&1 && \
-        { export VM_CHANNEL=password; echo "VM_CHANNEL=password（第 ${i} 试命中；建议事后建免密）"; return 0; }
+        { export VM_CHANNEL=password
+          # v2.2.0：口令命中后把 ssh2 后端也切到纯口令（WINVM_SSH_AUTH=password）。
+          # 理由=二进制对 VM 有相位性挂起，口令认证段同样会挂；ssh2 才是稳定面。
+          # 只在实际 ping 通过时才切，避免「切了但不可用」导致每次多一次失败往返。
+          if [ -n "${_ssh2n:-}" ] && [ -f "$SSH2_CONN_SH" ] && \
+             WINVM_SSH_AUTH=password "$_ssh2n" "$SSH2_CONN_SH" ping >/dev/null 2>&1; then
+            export WINVM_SSH_AUTH=password
+            echo "VM_CHANNEL=password（第 ${i} 试命中；ssh2 口令面可用；建议事后建免密）"
+          else
+            echo "VM_CHANNEL=password（第 ${i} 试命中；仅二进制口令面；建议事后建免密）"
+          fi
+          return 0; }
       [ $i -lt 5 ] && sleep 15
     done
   fi

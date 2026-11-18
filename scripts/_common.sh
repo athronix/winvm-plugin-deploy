@@ -171,9 +171,13 @@ steps_report() {
 # ssh2-conn.mjs 只认环境变量（无 --flags），故此处显式注入。
 channel_ready() { # channel_ready [ready_timeout_ms]
   local t="${1:-6000}"
+  # WINVM_SSH_AUTH 透传：1p（密码建通道）阶段 export WINVM_SSH_AUTH=password 后，
+  # 本判据改按密码认证探测；其余阶段为空 ⇒ ssh2-conn 走原 key 分支（零行为变化）。
   ( cd "$SCRIPTDIR" && \
     VM_HOST="$VM_HOST" VM_USER="$VM_USER" VM_SSH_PORT="$VM_SSH_PORT" \
     WINVM_VM_KEY="$WINVM_VM_KEY" WINVM_SSH_READY_TIMEOUT_MS="$t" \
+    WINVM_SSH_AUTH="${WINVM_SSH_AUTH:-}" WINVM_SSH_PASSWORD="${WINVM_SSH_PASSWORD:-}" \
+    WINVM_SSH_PASSWORD_EMPTY="${WINVM_SSH_PASSWORD_EMPTY:-}" \
     "$NODE" ssh2-conn.mjs ping ) >/dev/null 2>&1
 }
 
@@ -247,7 +251,7 @@ PYEOF
 # 期望值是**精确断言**并可用 env 覆盖：上游升级或白名单调整后计数会变，此时刻意报警，
 # 由运维显式改 EXP_* 或 env（同 EXP_TOTAL 的「项数即断言」风格）。
 UPSTREAM_EXP_BROWSER="${EXP_BROWSER_TOOLS:-33}"   # 33 个工具全量暴露
-UPSTREAM_EXP_DESKTOP="${EXP_DESKTOP_TOOLS:-10}"   # 服务端白名单默认 10
+UPSTREAM_EXP_DESKTOP="${EXP_DESKTOP_TOOLS:-25}"   # 服务端白名单默认 25（v2.2.0 由 10 调宽）
 upstream_judge() { # → 打印 "OK <browser=N desktop=M>" 或 "FAIL <原因>"
   local b d bad=""
   b="$(upstream_tools browser)"; d="$(upstream_tools desktop)"

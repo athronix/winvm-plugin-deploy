@@ -660,6 +660,101 @@ def c_upstream_contract(root):
     return bad
 
 
+def c_password_bootstrap(root):
+    """口令自动建通道（1p）必须真的接进第 1 步，且不破坏原有免密短路。
+
+    背景（用户 2026-11-18 B1）：1a 判免密不通时，若已知 VM 账户口令，就该自动登录装公钥，
+    而不是每台新机都让用户手工粘一条管理员 PowerShell。三条硬约束：
+      · 必须走 ssh2 纯口令面 —— OpenSSH 二进制对 VM 有相位性挂起，口令认证段同样会挂；
+      · 必须先验管理员 —— 非管理员写不了 administrators_authorized_keys（Windows OpenSSH
+        对管理员账户直接给完整令牌，所以不需要 UAC 弹窗）；
+      · 口令绝不落盘/进日志，回验时必须切回 key 认证（不能拿口令通道自证免密）。
+    """
+    bad = []
+    p1p = os.path.join(root, 'scripts', 'deploy-1p-autokey.sh')
+    if not os.path.exists(p1p):
+        return ['缺 scripts/deploy-1p-autokey.sh（口令引导无法落地）']
+    t = strip_comments(read(p1p))
+    for need in ('WINVM_SSH_AUTH=password', 'net session', '-EncodedCommand',
+                 '-PublicKey', 'leave_password_mode', 'SKIP_PASSWORD_BOOTSTRAP',
+                 'WINVM_PASSWORD_FILE', 'channel_ready'):
+        if need not in t:
+            bad.append('deploy-1p-autokey.sh 缺 %s' % need)
+    for step in ('1p.1', '1p.2', '1p.3', '1p.4', '1p.5'):
+        if step not in t:
+            bad.append('deploy-1p-autokey.sh 缺子步骤 %s' % step)
+    # 口令不得被写盘/echo（纪律：只在 env / tty / 用户自建文件里）。
+    # 逐行判定并先剔除合法的 stderr 静音（`2>/dev/null` / `2>&1`），否则 `unset ... 2>/dev/null`
+    # 会被当成"重定向写口令"——这类假阳性会让门禁自己逼着人放宽断言。
+    for ln in t.split('\n'):
+        if 'WINVM_SSH_PASSWORD' not in ln:
+            continue
+        probe = ln.replace('2>/dev/null', '').replace('2>&1', '')
+        # echo 只抓「变量插值」（$WINVM_SSH_PASSWORD），提示文案里写变量名不算泄露
+        if re.search(r'[^0-9]>\s*[^&]', probe) or re.search(r'\becho\b[^\n]*\$\{?WINVM_SSH_PASSWORD', probe):
+            bad.append('deploy-1p-autokey.sh 疑似把口令写盘/echo：%s' % ln.strip()[:80])
+            break
+    if 'exit 2' not in t:
+        bad.append('deploy-1p-autokey.sh 缺「不可用即退 2」的降级语义（会把第 1 步拖成硬失败）')
+
+    # 空口令意图必须在**两处**都能置起（tty 直接回车 / WINVM_SSH_ALLOW_EMPTY），
+    # 少一处就有一条「无密码账户」的用户走不到自动建通道。
+    if len(re.findall(r'WINVM_SSH_PASSWORD_EMPTY=1', t)) < 2:
+        bad.append('「无密码登录」准入面不全（tty 回车与 WINVM_SSH_ALLOW_EMPTY 两处都须置空口令意图）')
+    # ── 提权面：登录后按身份选授权文件（管理员 → ProgramData；否则 → 用户级），且不重启 sshd ──
+    # 注意断言必须打在**赋值**上：`administrators_authorized_keys` 也出现在子步骤标题文字里，
+    # 只判「字符串在不在」会被标题满足 ⇒ 真把 AK_ADMIN 改成用户级也照样绿（M29 曾因此漏检）。
+    for need in ('*S-1-5-32-544', '*S-1-5-18', 'icacls', 'ADMIN_NO'):
+        if need not in t:
+            bad.append('deploy-1p-autokey.sh 缺「登录后提权落公钥」要素：%s' % need)
+    if not re.search(r"AK_ADMIN=['\"][^'\"]*ProgramData[^'\"]*administrators_authorized_keys", t):
+        bad.append('管理员分支未指向 ProgramData\\ssh\\administrators_authorized_keys（写用户级 = 白写，回验必挂）')
+    if not re.search(r"AK_USER=['\"][^'\"]*\.ssh[^'\"]*authorized_keys", t):
+        bad.append('非管理员分支未指向用户级 ~/.ssh/authorized_keys')
+    if 'Net-FirewallRule' in t:
+        bad.append('deploy-1p-autokey.sh 混入无关内容（疑似改错文件）')
+    # S1 直写必须真写到文件（Append/Write 任一），否则「回验通过」无从谈起
+    if '[IO.File]::AppendAllText' not in t and '[IO.File]::WriteAllText' not in t:
+        bad.append('S1 直写分支没有真正落盘公钥（无 AppendAllText/WriteAllText）')
+    # S1 → S2 → S3 三级必须齐（少了任一级都会在异形 VM 上直接退化成人工）
+    for step in ('1p.6', '1p.7', 'S2'):
+        if step not in t:
+            bad.append('deploy-1p-autokey.sh 缺降级级次 %s（S2 兜底缺失 ⇒ 只能人工）' % step)
+
+    d1 = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh')))
+    if 'deploy-1p-autokey.sh' not in d1:
+        bad.append('deploy-1 未接入 1p（口令引导形同虚设）')
+    if 'if channel_ready 5000; then' not in d1 or 'exit 0' not in d1:
+        bad.append('deploy-1 的 1a 未在 READY 时短路整个第 1 步')
+    # 1p 必须在 1b 之前：先去问口令，再谈备钥
+    if d1.find('deploy-1p-autokey.sh') > d1.find('CH_ROUND=0'):
+        bad.append('deploy-1 的 1p 位置在 1b 之后（顺序反了：应先试口令再备钥）')
+
+    vc = strip_comments(read(os.path.join(root, 'scripts', 'vm-conn.sh')))
+    if '_ssh_t _askpass_env ' in vc:
+        bad.append('vm-conn.sh 出现 `_ssh_t _askpass_env`（timeout 不能 exec shell 函数 ⇒ 口令路径必死）')
+    if len(re.findall(r'_askpass_env _ssh_t ', vc)) < 5:
+        bad.append('vm-conn.sh 口令路径未统一改成 `_askpass_env _ssh_t <cmd>`')
+    if '( export WINVM_SSH_PASSWORD' not in vc:
+        bad.append('vm-conn.sh 的 askpass 未用子 shell export（环境前缀对函数不可靠）')
+
+    cm = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+    if 'WINVM_SSH_AUTH="${WINVM_SSH_AUTH:-}"' not in cm:
+        bad.append('channel_ready 未透传 WINVM_SSH_AUTH（1p 阶段的回验会退化成 key 探测）')
+    if 'WINVM_SSH_PASSWORD_EMPTY="${WINVM_SSH_PASSWORD_EMPTY:-}"' not in cm:
+        bad.append('channel_ready 未透传 WINVM_SSH_PASSWORD_EMPTY（空口令探测必失败）')
+
+    sc = strip_comments(read(os.path.join(root, 'scripts', 'ssh2-conn.mjs')))
+    if "authMode === 'password'" not in sc:
+        bad.append('ssh2-conn.mjs 缺纯口令认证分支')
+    if '私钥文件不存在' not in sc:
+        bad.append('ssh2-conn.mjs 缺钥默认报错语义被删（老路径诊断丢失）')
+    # 空口令：bash 里「空串」与「未提供」同为 -z 为真，不显式标记就无法尝试无密码登录
+    if 'WINVM_SSH_PASSWORD_EMPTY' not in sc:
+        bad.append('ssh2-conn.mjs 缺「显式空口令」标记（无密码登录永远尝试不到）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -672,6 +767,7 @@ CHECKS = [
     ('backend-default', c_backend_default), ('output-hygiene', c_output_hygiene),
     ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
     ('upstream-contract', c_upstream_contract),
+    ('password-bootstrap', c_password_bootstrap),
 ]
 
 
@@ -777,6 +873,24 @@ MUTATIONS = [
     # 命名空间兜底退化成精确单键：旧包卸载新包仍会留下 winvm-browser/winvm-desktop 死条目。
     ('M25 mcp 兜底退化为单键', 'scripts/undeploy-1-host.sh',
      'filter((k) => /^winvm($|-)/.test(k))', "filter((k) => k === 'winvm')"),
+    # 口令引导退化成"从不调用"：1a 失败后直接落回人工粘贴，用户体感零变化。
+    ('M26 口令引导未接入', 'scripts/deploy-1-ssh.sh',
+     'bash "$SCRIPTDIR/deploy-1p-autokey.sh"; PRC=$?', ': ; PRC=2'),
+    # 口令路径退回二进制 askpass 顺序：timeout 无法 exec shell 函数 ⇒ 每次必报
+    # "No such file or directory"，而错误信息会被误读成"VM 没装 ssh"。
+    ('M27 askpass 顺序写反', 'scripts/vm-conn.sh',
+     '\n    password) _askpass_env _ssh_t ssh -F /dev/null',
+     '\n    password) _ssh_t _askpass_env ssh -F /dev/null'),
+    # 「无密码登录」准入面被删：tty 直接回车不再置空口令意图 ⇒ 空串被当成「未提供口令」，
+    # 无密码账户永远走不到自动建通道，只能靠人工（用户 2026-11-18 明确要求覆盖的 case）。
+    ('M28 空口令准入面丢失', 'scripts/deploy-1p-autokey.sh',
+     '    WINVM_SSH_PASSWORD=""; WINVM_SSH_PASSWORD_EMPTY=1',
+     '    WINVM_SSH_PASSWORD=""'),
+    # 登录后提权面退化成「只写用户级文件」：管理员账户的 Match Group administrators
+    # 分支读的是 ProgramData 那份，写用户级等于白写 ⇒ 回验必挂 ⇒ 白跑一轮。
+    ('M29 提权面退化为只用用户级', 'scripts/deploy-1p-autokey.sh',
+     "AK_ADMIN='C:/ProgramData/ssh/administrators_authorized_keys'",
+     "AK_ADMIN=\"C:/Users/${VM_USER}/.ssh/authorized_keys\""),
 ]
 
 
