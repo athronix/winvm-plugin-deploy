@@ -179,6 +179,31 @@ if (-not $NoSelfStage) {
   } catch { }
 }
 
+# ---------------------------------------------------------------------
+#  BOM 归一化（落盘副本专用）：两条执行路径的编码要求是相反地向的
+#  ---------------------------------------------------------------------
+#  源文件（技能仓 / raw 下载源）必须 **UTF-8 无 BOM**：
+#    irm|iex 下 [scriptblock]::Create(<文本>) 会把 BOM 留在字符串首字符，
+#    param 块因此脱离参数区 ⇒ 「意外的属性 CmdletBinding」，整条引导命令挂掉。
+#  落盘副本必须 **UTF-8 with BOM**：
+#    powershell -File 在 Windows PowerShell 5.1 上**不认 UTF-8 声明**，
+#    对无 BOM 文件按系统 ANSI（中文环境 CP936）解码 ⇒ 中文注释/文案变乱码
+#    ⇒ 乱码里的 ? 打断引号配对 ⇒ ParserError，脚本一行都没有执行。
+#    2026-11-18 实测报错：unexpected token '锛?'（oneclick:74），整链卡死。
+#  结论：落盘后立刻把副本重写成带 BOM —— 之后任何 -File 调用（-Rollback、
+#  SYSTEM 计划任务、用户手工命令）都能正常解析，而源文件仍保持无 BOM。
+if ($script:SelfStaged -and (Test-Path -LiteralPath $script:SelfPathFinal)) {
+  try {
+    $wbBomBytes = [IO.File]::ReadAllBytes($script:SelfPathFinal)
+    $wbHasBom = ($wbBomBytes.Length -ge 3 -and $wbBomBytes[0] -eq 0xEF -and $wbBomBytes[1] -eq 0xBB -and $wbBomBytes[2] -eq 0xBF)
+    if (-not $wbHasBom) {
+      $wbBomText = [Text.Encoding]::UTF8.GetString($wbBomBytes)
+      [IO.File]::WriteAllText($script:SelfPathFinal, $wbBomText, (New-Object Text.UTF8Encoding($true)))
+      $script:SelfBomFixed = $true
+    }
+  } catch { }
+}
+
 # 公钥来源：-PublicKey 优先；为空或仍是模板占位符时从 -PublicKeyFile 读。
 if (([string]::IsNullOrWhiteSpace($PublicKey) -or $PublicKey -eq '__PUBKEY__') -and $PublicKeyFile) {
   try { if (Test-Path -LiteralPath $PublicKeyFile) { $PublicKey = ([IO.File]::ReadAllText($PublicKeyFile)).Trim() } } catch { }

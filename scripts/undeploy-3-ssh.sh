@@ -36,7 +36,12 @@ case "$REMOVE" in yes|no) ;; *) echo "--remove-ssh-tunnel 只接受 yes|no（当
 
 resolve_env; need_node
 VM_SCRIPT_WIN='C:\ProgramData\WinVMDeploy\winvm-sshd-oneclick.ps1'
-USER_CMD="powershell -NoProfile -ExecutionPolicy Bypass -File $VM_SCRIPT_WIN -Rollback"
+# BOM 归一化片段（可重复粘贴）：oneclick 源文件是 UTF-8 **无 BOM**（irm|iex / scriptblock 的硬要求），
+# 而 powershell -File 在 PS 5.1 上对无 BOM 文件按系统 ANSI(CP936) 解码 ⇒ 中文注释变乱码
+# ⇒ 乱码里的 ? 打断引号配对 ⇒ ParserError「unexpected token」，脚本一行未执行。
+# 所以凡是要用 -File 跑它（-Rollback / 重建），先把副本重写成 UTF-8 with BOM。
+BOM_FIX="\$b=[IO.File]::ReadAllBytes('$VM_SCRIPT_WIN'); if (-not (\$b.Length -ge 3 -and \$b[0] -eq 0xEF)) { [IO.File]::WriteAllText('$VM_SCRIPT_WIN',[Text.Encoding]::UTF8.GetString(\$b),(New-Object Text.UTF8Encoding(\$true))) }"
+USER_CMD="$BOM_FIX; powershell -NoProfile -ExecutionPolicy Bypass -File $VM_SCRIPT_WIN -Rollback"
 
 # ── 保留通道（默认）──
 if [ "$REMOVE" = "no" ]; then
@@ -89,6 +94,17 @@ if (-not (Test-Path $rb)) {
   }
   if (-not $ok) { Write-Output 'DOWNLOAD_FAILED: all sources'; exit 4 }
   Write-Output 'DOWNLOADED'
+}
+# PS 5.1 decodes a BOM-less UTF-8 file with the system ANSI codepage, so any
+# non-ASCII comment turns into mojibake and breaks quoting => ParserError before
+# a single line runs. The source file must stay BOM-less (irm|iex requirement),
+# therefore the staged copy is normalized right before powershell -File sees it.
+if (Test-Path $rb) {
+  $b = [IO.File]::ReadAllBytes($rb)
+  if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
+    [IO.File]::WriteAllText($rb, [Text.Encoding]::UTF8.GetString($b), (New-Object Text.UTF8Encoding($true)))
+    Write-Output 'BOM_NORMALIZED'
+  }
 }
 if ($purgeB64 -ne 'NONE') {
   # --purge-all: the same deferred SYSTEM task must also delete sshd itself.
@@ -156,7 +172,7 @@ if [ "$PURGE_SSHD" = "1" ]; then
   cat <<EOF
 
 ════════════════ 彻底卸载：在 VM 管理员 PowerShell 里执行这一整条 ════════════════
-\$ErrorActionPreference='Continue'; \$d='C:\\ProgramData\\WinVMDeploy'; New-Item -ItemType Directory -Force -Path \$d|Out-Null; \$p=Join-Path \$d 'vm-purge-sshd.ps1'; [IO.File]::WriteAllBytes(\$p,[Convert]::FromBase64String('$PB64U')); Unblock-File \$p; \$rb=Join-Path \$d 'winvm-sshd-oneclick.ps1'; if (Test-Path \$rb) { powershell -NoProfile -ExecutionPolicy Bypass -File \$rb -Rollback }; powershell -NoProfile -ExecutionPolicy Bypass -File \$p -Apply
+\$ErrorActionPreference='Continue'; \$d='C:\\ProgramData\\WinVMDeploy'; New-Item -ItemType Directory -Force -Path \$d|Out-Null; \$p=Join-Path \$d 'vm-purge-sshd.ps1'; [IO.File]::WriteAllBytes(\$p,[Convert]::FromBase64String('$PB64U')); Unblock-File \$p; \$rb=Join-Path \$d 'winvm-sshd-oneclick.ps1'; if (Test-Path \$rb) { \$b=[IO.File]::ReadAllBytes(\$rb); if (-not (\$b.Length -ge 3 -and \$b[0] -eq 0xEF)) { [IO.File]::WriteAllText(\$rb,[Text.Encoding]::UTF8.GetString(\$b),(New-Object Text.UTF8Encoding(\$true))) }; powershell -NoProfile -ExecutionPolicy Bypass -File \$rb -Rollback }; powershell -NoProfile -ExecutionPolicy Bypass -File \$p -Apply
 ══════════════════════════════════════════════════════════════════════════════════
 （一条命令三段：写出 sshd 清理脚本 → 若 oneclick 脚本仍在则 -Rollback → 停/删 sshd、
   卸 OpenSSH MSI、删 C:\\ProgramData\\ssh 的两处 authorized_keys、删 WinVMDeploy。

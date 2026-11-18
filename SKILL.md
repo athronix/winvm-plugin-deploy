@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）；--purge-all 一键回到裸机（②追加 2e 运行时深清 node/codebuddy/私钥，③的同一 SYSTEM 任务里卸 sshd MSI 与两处 authorized_keys）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
-version: 2.5.0
+version: 2.5.1
 agent_created: true
 ---
 
@@ -36,8 +36,16 @@ VM_HOST=... SKIP_UPSTREAMS=1 bash scripts/deploy.sh            # 不装/不验�
 从零部署时第 1 步会打印**一整行**命令，用户在 VM 的**管理员 PowerShell** 粘贴执行即可（约 1~3 分钟，含装 OpenSSH）：
 
 ```powershell
-$ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path $d|Out-Null;iwr -UseBasicParsing -Uri '<远端直链>' -OutFile "$d\winvm-sshd-oneclick.ps1";Unblock-File "$d\winvm-sshd-oneclick.ps1";powershell -NoProfile -ExecutionPolicy Bypass -File "$d\winvm-sshd-oneclick.ps1" -PublicKey '<公钥>' -User 'User' -Port 22
+$ErrorActionPreference='Stop';$d=Join-Path $env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path $d|Out-Null;$f="$d\winvm-sshd-oneclick.ps1";iwr -UseBasicParsing -Uri '<远端直链>' -OutFile $f;Unblock-File $f;$t=[IO.File]::ReadAllText($f,[Text.Encoding]::UTF8);[IO.File]::WriteAllText($f,$t,(New-Object Text.UTF8Encoding($true)));powershell -NoProfile -ExecutionPolicy Bypass -File $f -PublicKey '<公钥>' -User 'User' -Port 22
 ```
+
+- **那句中段 `ReadAllText`→`WriteAllText(...UTF8Encoding($true))` 是必需的一步，别省**：
+  `winvm-sshd-oneclick.ps1` 在仓库里必须是 **UTF-8 无 BOM**（`irm|iex` / `[scriptblock]::Create`
+  会把 BOM 当首字符，`param` 块脱离参数区直接报「意外的属性 CmdletBinding」）；
+  但 `powershell -File` 在 Windows PowerShell 5.1 上**不认 UTF-8 声明**，对无 BOM 文件按系统
+  ANSI（中文环境 CP936）解码 ⇒ 中文注释/文案变乱码 ⇒ 乱码里的 `?` 打断引号配对 ⇒ `ParserError`，
+  **脚本一行都不会执行**（2026-11-18 真机：`unexpected token '锛?'` 于 oneclick:74）。
+  所以「源文件无 BOM，落盘副本转 BOM」是硬契约，两条执行路径各拿自己能解析的字节。
 
 - 命令由 `deploy-1-ssh.sh` 现拼（公钥、端口都已填好），**不需要用户改任何东西**。
 - `-AllowFrom` **默认不带**：它在 VM 侧落成防火墙白名单（只放行该来源），默认传错值会直接把宿主挡死（实测症状=连接超时）。要收紧来源才加 `VM_ALLOW_FROM=<宿主源IP>`（如 `172.16.100.1`）。
@@ -174,6 +182,7 @@ bash scripts/selfcheck.sh --mutate        # 变异自证：往副本注缺陷，
 | 现象 | 处置 |
 |---|---|
 | 第 1 步打印命令后退出 2 | 正常：去 VM 粘那条命令，回来重跑 deploy |
+| VM 上粘完命令满屏红字 `Unexpected token` / `Missing expression after ','`，且报错行内容是乱码（如 `妯″紡`、`锛?`） | **编码问题，不是下载损坏**：`powershell -File` 在 PS 5.1 上按系统 ANSI(CP936) 解码无 BOM 的 UTF-8 文件 ⇒ 中文注释变乱码 ⇒ 打断引号配对 ⇒ ParserError，脚本一行未执行。粘之前必须先转 BOM：`$t=[IO.File]::ReadAllText($f,[Text.Encoding]::UTF8);[IO.File]::WriteAllText($f,$t,(New-Object Text.UTF8Encoding($true)))`。v2.5.1 起命令内已含这一步 |
 | 第 1 步报「全部候选源宿主侧不可达」 | 该 tag 的 release 没带 `winvm-sshd-oneclick.ps1`，且 GitHub raw 也拉不到 → 看逐源 `[200]/[---]` 输出；发新版，或 `SSHD_SCRIPT_URL` 指定直链 |
 | 通道 READY 但隧道报 `All configured authentication methods failed` | `vm-conn.json` 的 `identityFile` 指向了未被授权的钥。`deploy-3` 会自动对齐；症状仍在就看第 3 步 3a 输出 |
 | 第 3 步 health ≠ 200 | 看 `~/.workbuddy/winvm/tunnel.log`；确认 VM 端 18443 在听（第 4 步 4c 会查）。**不要重启 VM** |

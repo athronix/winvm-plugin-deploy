@@ -241,7 +241,7 @@ if [ ! -f "$PS1_LOCAL" ]; then
     echo "AUTOKEY_RESULT=NEED_USER → 回退 1c 人工"
     exit 2
   fi
-  PS_LINE="\$ErrorActionPreference='Stop'; \$d=Join-Path \$env:ProgramData 'WinVMDeploy'; New-Item -ItemType Directory -Force -Path \$d|Out-Null; \$f=Join-Path \$d 'winvm-sshd-oneclick.ps1'; Invoke-WebRequest -UseBasicParsing -Uri '$SRC' -OutFile \$f -TimeoutSec 45; Unblock-File \$f; & \$f -PublicKey '$PUB' -User '$VM_USER' -Port $VM_SSH_PORT"
+  PS_LINE="\$ErrorActionPreference='Stop'; \$d=Join-Path \$env:ProgramData 'WinVMDeploy'; New-Item -ItemType Directory -Force -Path \$d|Out-Null; \$f=Join-Path \$d 'winvm-sshd-oneclick.ps1'; Invoke-WebRequest -UseBasicParsing -Uri '$SRC' -OutFile \$f -TimeoutSec 45; Unblock-File \$f; \$t=[IO.File]::ReadAllText(\$f,[Text.Encoding]::UTF8); [IO.File]::WriteAllText(\$f,\$t,(New-Object Text.UTF8Encoding(\$true))); & \$f -PublicKey '$PUB' -User '$VM_USER' -Port $VM_SSH_PORT"
 else
   # shellcheck disable=SC2086
   vmscp "$PS1_LOCAL" "$PS1_REMOTE" 2>&1 | tail -2

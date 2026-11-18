@@ -940,6 +940,54 @@ def c_purge_all(root):
     return bad
 
 
+def c_bom_contract(root):
+    """编码契约：**源文件无 BOM，交给 -File 的副本必须有 BOM**。
+
+    2026-11-18 真机 P0（从零安装的第一条命令就挂）：oneclick 源文件是 UTF-8 无 BOM
+    （irm|iex / [scriptblock]::Create 的硬要求，见 c_oneclick），而 powershell -File
+    在 Windows PowerShell 5.1 上**不认 UTF-8 声明**，对无 BOM 文件按系统 ANSI
+    （中文 CP936）解码 ⇒ 中文注释/文案变乱码 ⇒ 乱码里的 ? 打断引号配对 ⇒ ParserError：
+        Missing expression after ','.        At ...winvm-sshd-oneclick.ps1:70
+        Unexpected token '锛?' in expression At ...winvm-sshd-oneclick.ps1:74
+    症状是「满屏红字、脚本一行都没执行」，极易误判成下载损坏或 VM 环境问题。
+    修法必须是双向的：源保持无 BOM，落盘副本一律重写成 UTF-8 with BOM。
+    凡是把 oneclick 递给 -File 的入口（1c 主命令 / 1p 兜底 / 3b 用户命令 / 3b SYSTEM
+    任务）都必须在同一条命令内闭合「下载 → 归一化 → 执行」，缺一处就有一整条路径必挂。
+    """
+    bad = []
+    bom_re = re.compile(r'UTF8Encoding\(\\?\$true\)')
+
+    one = read(os.path.join(root, 'scripts', 'winvm-sshd-oneclick.ps1'))
+    if 'SelfPathFinal' not in one:
+        bad.append('oneclick 缺 SelfPathFinal（落盘副本路径无从定位）')
+    if not bom_re.search(one):
+        bad.append('oneclick 落盘后未做 BOM 归一化（-Rollback 在 PS5.1 上必挂）')
+
+    d1 = read(os.path.join(root, 'scripts', 'deploy-1-ssh.sh'))
+    main_lines = [l for l in d1.split('\n') if '-File \\$f' in l]
+    if not main_lines:
+        bad.append('1c 主命令未用 -File $f 调 oneclick（锚点失配，检查生成逻辑）')
+    elif not any(bom_re.search(l) for l in main_lines):
+        bad.append('1c 主命令缺 BOM 归一化（从零部署第一条命令就 ParserError）')
+
+    p1 = read(os.path.join(root, 'scripts', 'deploy-1p-autokey.sh'))
+    p_lines = [l for l in p1.split('\n') if '& \\$f' in l]
+    if not p_lines:
+        bad.append('1p 兜底命令未用 & $f 调 oneclick（锚点失配）')
+    elif not any(bom_re.search(l) for l in p_lines):
+        bad.append('1p 兜底命令缺 BOM 归一化')
+
+    u3 = read(os.path.join(root, 'scripts', 'undeploy-3-ssh.sh'))
+    fix_lines = [l for l in u3.split('\n') if l.startswith('BOM_FIX=')]
+    if not fix_lines:
+        bad.append('3b 的用户命令缺 BOM_FIX 片段（-Rollback 会 ParserError）')
+    elif not any(bom_re.search(l) for l in fix_lines):
+        bad.append('3b 的 BOM_FIX 未真正重编码（写死成别的编码等于没修）')
+    if 'BOM_NORMALIZED' not in u3:
+        bad.append('3b SYSTEM 任务未回执 BOM_NORMALIZED（归一化是否生效无从判断）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -953,6 +1001,7 @@ CHECKS = [
     ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
     ('upstream-contract', c_upstream_contract), ('step4-honesty', c_step4_honesty),
     ('password-bootstrap', c_password_bootstrap), ('purge-all', c_purge_all),
+    ('bom-contract', c_bom_contract),
 ]
 
 
@@ -1129,6 +1178,18 @@ MUTATIONS = [
     ('M41 2e 内联卸 sshd', 'scripts/undeploy-2-vm.sh',
      'KWD_ARG=""; [ "$KEEP_WD" = "1" ] && KWD_ARG=" -KeepWinVMDeploy"',
      'KWD_ARG=""; [ "$KEEP_WD" = "1" ] && KWD_ARG=" -KeepWinVMDeploy"\n  bash "$SCRIPTDIR/ps-run.sh" -c "& .\\vm-purge-sshd.ps1 -Apply" >/dev/null 2>&1'),
+    # 落盘不做 BOM 归一化 ⇒ 副本仍是无 BOM UTF-8，PS5.1 的 -File 按 ANSI 解码必 ParserError。
+    ('M43 落盘不做 BOM 归一化', 'scripts/winvm-sshd-oneclick.ps1',
+     '      [IO.File]::WriteAllText($script:SelfPathFinal, $wbBomText, (New-Object Text.UTF8Encoding($true)))',
+     '      $null = $wbBomText'),
+    # 1c 主命令省掉归一化 ⇒ 从零部署的第一条命令就满屏红字，脚本一行未执行。
+    ('M44 1c 主命令省掉归一化', 'scripts/deploy-1-ssh.sh',
+     r'\$t=[IO.File]::ReadAllText(\$f,[Text.Encoding]::UTF8);[IO.File]::WriteAllText(\$f,\$t,(New-Object Text.UTF8Encoding(\$true)));',
+     ''),
+    # 3b 的 BOM_FIX 退化成空操作 ⇒ 用户粘的 -Rollback 直接 ParserError，通道再也拆不掉。
+    ('M45 3b BOM_FIX 退化', 'scripts/undeploy-3-ssh.sh',
+     r'''BOM_FIX="\$b=[IO.File]::ReadAllBytes('$VM_SCRIPT_WIN'); if (-not (\$b.Length -ge 3 -and \$b[0] -eq 0xEF)) { [IO.File]::WriteAllText('$VM_SCRIPT_WIN',[Text.Encoding]::UTF8.GetString(\$b),(New-Object Text.UTF8Encoding(\$true))) }"''',
+     'BOM_FIX="\\$b=$null"'),
 ]
 
 

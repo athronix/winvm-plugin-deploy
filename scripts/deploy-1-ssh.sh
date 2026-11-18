@@ -103,13 +103,17 @@ print_user_command() {
   local srcs; srcs="$(sshd_script_srcs_ps 4)"
   [ -n "$srcs" ] || srcs="'$url'"
   # irm 备选命令与 -File 路径共用同一候选数组：VM 出口网络与宿主不同，单源失败率高。
+  # BOM 归一化（2026-11-18 真机缺陷）：oneclick 源文件是 UTF-8 **无 BOM**（irm|iex 硬要求），
+  # 而 powershell -File 在 PS 5.1 上对无 BOM 文件按系统 ANSI(CP936) 解码 ⇒ 中文注释变乱码
+  # ⇒ 乱码里的 ? 打断引号配对 ⇒ ParserError「unexpected token」，脚本一行未执行。
+  # 故下载后立刻把副本重写成 UTF-8 with BOM：-File 认 BOM 按 UTF-8 解码，源文件不受影响。
   local raw_main="https://raw.githubusercontent.com/athronix/winvm-plugin-deploy/main/scripts/winvm-sshd-oneclick.ps1"
   cat <<EOF
 
 ════════════════════ user 只需要做这一件事 ════════════════════
 把下面【一整行】复制到 VM 的【管理员 PowerShell】里回车（约 1~3 分钟，含装 OpenSSH）
 
-\$ErrorActionPreference='Stop';\$d=Join-Path \$env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path \$d|Out-Null;\$f=Join-Path \$d 'winvm-sshd-oneclick.ps1';\$src=@($srcs);\$ok=\$false;foreach(\$x in \$src){try{Invoke-WebRequest -UseBasicParsing -Uri \$x -OutFile \$f -TimeoutSec 45;\$ok=\$true;break}catch{Write-Host ('src-fail: '+\$x)}};if(-not \$ok){throw 'DOWNLOAD_ALL_FAILED'};Unblock-File \$f;powershell -NoProfile -ExecutionPolicy Bypass -File \$f -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT$allow_arg
+\$ErrorActionPreference='Stop';\$d=Join-Path \$env:ProgramData 'WinVMDeploy';New-Item -ItemType Directory -Force -Path \$d|Out-Null;\$f=Join-Path \$d 'winvm-sshd-oneclick.ps1';\$src=@($srcs);\$ok=\$false;foreach(\$x in \$src){try{Invoke-WebRequest -UseBasicParsing -Uri \$x -OutFile \$f -TimeoutSec 45;\$ok=\$true;break}catch{Write-Host ('src-fail: '+\$x)}};if(-not \$ok){throw 'DOWNLOAD_ALL_FAILED'};Unblock-File \$f;\$t=[IO.File]::ReadAllText(\$f,[Text.Encoding]::UTF8);[IO.File]::WriteAllText(\$f,\$t,(New-Object Text.UTF8Encoding(\$true)));powershell -NoProfile -ExecutionPolicy Bypass -File \$f -PublicKey '$pub' -User '$VM_USER' -Port $VM_SSH_PORT$allow_arg
 
 脚本会自己存到 VM 的 C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1
 （卸载通道时直接：powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\WinVMDeploy\\winvm-sshd-oneclick.ps1 -Rollback）
