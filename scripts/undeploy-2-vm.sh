@@ -134,13 +134,16 @@ if [ "$PURGE_ALL" = "1" ]; then
   done
   grep -q '^NODEJS_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad NODEJS_DIR"
   grep -q '^NVM_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad NVM_DIR"
+  # 三处运行时都算：C:\nodejs、nvm 根、%LOCALAPPDATA%\nodejs（zip 装的用户级副本）。
+  # 2026-11-18 真机只清前两处 ⇒ 后两处残留，Get-Command node/npm 仍能解析。
+  grep -q '^LOCAL_NODEJS_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad LOCAL_NODEJS_DIR"
   [ "$KEEP_WD" = "1" ] || grep -q '^WINVMDEPLOY_DIR=False' "$PRL" 2>/dev/null || _bad="$_bad WINVMDEPLOY_DIR"
   if [ -n "$_bad" ]; then
     st_end 1 FAIL "深清后仍残留:$_bad"
     die "运行时深清不彻底" "仍残留:$_bad" "$PRL" \
         "看 $PRL 的 [WARN] 行；占用类残留先结束进程再重跑"
   fi
-  st_end 0 PASS "$(tr -d '\r' < "$PRL" | grep -E '^SEC_DELETE_(NODEJS|NVM)=' | tr '\n' ' ' | cut -c1-90)五个 CLI 全 MISSING"
+  st_end 0 PASS "$(tr -d '\r' < "$PRL" | grep -E '^SEC_DELETE_(NODEJS|NVM|LOCAL_NODEJS)=' | tr '\n' ' ' | cut -c1-110)五个 CLI 全 MISSING"
 fi
 
 steps_report

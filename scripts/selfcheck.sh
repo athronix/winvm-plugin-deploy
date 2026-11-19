@@ -988,6 +988,56 @@ def c_bom_contract(root):
     return bad
 
 
+def c_purge_completeness(root):
+    """2e 必须清「三处」node 运行时，且必须能在文件被僵尸进程占住时完成清理。
+
+    2026-11-18/19 真机连续两次 FAIL，是两个**不同**的缺陷叠在一起：
+      P10 清单不全 —— 跑过 nvm-windows 的机器有三个 store，脚本只列了两个：
+            C:\\nodejs / %LOCALAPPDATA%\\Author Software\\nvm / **%LOCALAPPDATA%\\nodejs**
+            漏第三个 ⇒ Get-Command node/npm 仍能解析 ⇒ 五个 CLI 断言必挂。
+      P11 僵尸句柄 —— `codebuddy mcp remove agent-desktop`（部署脚本自己拉起的）
+            成了僵尸：Get-Process 说 HasExited=True，父 cmd.exe(session 0) 不关句柄，
+            Terminate 返回 rc=2、taskkill 说「没有运行实例」⇒ 映射中的 node.exe 镜像
+            重启前永不消失 ⇒ 只靠 Remove-Item/rmdir 的话 --purge-all 会永久 FAIL。
+    这两个必须分别有断言，否则修好一个就以为全好了（本轮实际走了 3 个来回）。
+    """
+    bad = []
+    ps = read(os.path.join(root, 'scripts', 'vm-purge-runtime.ps1'))
+    # P10：三处 store 都要有删除动作与断言键
+    if 'DELETE_LOCAL_NODEJS' not in ps:
+        bad.append('2e 未删 %LOCALAPPDATA%\\nodejs（第三个 node store，用户级 zip 安装）')
+    if ps.count("Rep 'LOCAL_NODEJS_DIR'") < 2:
+        bad.append("2e 未在 PRE/POST 都断言 LOCAL_NODEJS_DIR（清没清无从判断）")
+    # P11：僵尸占用的兜底路径。
+    # 断言必须锚定 **调用点** 而不是函数名 —— M47 第一版就是这么 MISS 的：
+    # 删掉 RmTree 末尾那行调用，`EvictLocked` 的函数定义还在文件里，子串匹配照样命中。
+    if 'EvictLocked' not in ps:
+        bad.append('2e 缺 EvictLocked（僵尸持有的镜像删不掉时 --purge-all 永久 FAIL）')
+    if not re.search(r'if \(Test-Path \$p\) \{[^\n]*EvictLocked \$p \$label', ps):
+        bad.append('RmTree 未在最后一轮回调 EvictLocked（函数在但从不调用 = 兜底形同虚设）')
+    if 'PendingFileRenameOperations' not in ps:
+        bad.append('EvictLocked 未登记 PendingFileRenameOperations（死镜像没有开机自清路径）')
+    if 'WinVMStale' not in ps:
+        bad.append('EvictLocked 的 park 目录未落在待删树之外（挪进树里等于没挪）')
+    # 绝不能一刀切杀所有 node.exe：VM 上跑着 WorkBuddy 客户端（实测误杀过 4 个扩展进程）。
+    # 必须 strip_comments：本函数的 docstring 与脚本注释里引用了同一串反例，
+    # 直接子串匹配会被自己的注释判成违规（门禁自伤，M40 的老坑）。
+    ps_code = strip_comments(ps)
+    if re.search(r'taskkill\.?exe?\s+/F\s+/IM\s+node\.exe', ps_code) or '/IM node.exe' in ps_code:
+        bad.append('2e 用 taskkill /IM node.exe 一刀切（会误杀 VM 上的 WorkBuddy 客户端）')
+    if 'RuntimeRoots' not in ps:
+        bad.append('KillNodeHolders 未按待删运行时根过滤（缺少作用域，等于一刀切）')
+    # 杀不掉必须留痕：静默失败正是 P11 折磨三个来回的原因
+    for k in ('KILLED_HOLDERS', 'PARKED_'):
+        if k not in ps:
+            bad.append('2e 未回执 %s（占用/挪走都无声，故障无法复盘）' % k)
+
+    u2 = read(os.path.join(root, 'scripts', 'undeploy-2-vm.sh'))
+    if 'LOCAL_NODEJS_DIR' not in u2:
+        bad.append('undeploy-2 的 2e 终态判据未含 LOCAL_NODEJS_DIR')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -1001,7 +1051,7 @@ CHECKS = [
     ('iex-safe', c_iex_safe), ('pkg-version', c_pkg_version),
     ('upstream-contract', c_upstream_contract), ('step4-honesty', c_step4_honesty),
     ('password-bootstrap', c_password_bootstrap), ('purge-all', c_purge_all),
-    ('bom-contract', c_bom_contract),
+    ('bom-contract', c_bom_contract), ('purge-completeness', c_purge_completeness),
 ]
 
 
@@ -1190,6 +1240,17 @@ MUTATIONS = [
     ('M45 3b BOM_FIX 退化', 'scripts/undeploy-3-ssh.sh',
      r'''BOM_FIX="\$b=[IO.File]::ReadAllBytes('$VM_SCRIPT_WIN'); if (-not (\$b.Length -ge 3 -and \$b[0] -eq 0xEF)) { [IO.File]::WriteAllText('$VM_SCRIPT_WIN',[Text.Encoding]::UTF8.GetString(\$b),(New-Object Text.UTF8Encoding(\$true))) }"''',
      'BOM_FIX="\\$b=$null"'),
+    # 第三个 node store 漏出清单 ⇒ 清完仍能 Get-Command node/npm（P10 原样回归）。
+    ('M46 漏第三个 node store', 'scripts/vm-purge-runtime.ps1',
+     "RmTree $LocalNodeDir 'DELETE_LOCAL_NODEJS'", ':'),
+    # 去掉僵尸兜底 ⇒ 死镜像占着句柄时 --purge-all 永久 FAIL（P11 原样回归）。
+    ('M47 去掉僵尸兜底', 'scripts/vm-purge-runtime.ps1',
+     "if (Test-Path $p) { Write-Output '[WARN] still present after holders killed -> evict locked files'; EvictLocked $p $label }",
+     ''),
+    # 一刀切杀 node.exe ⇒ 误杀 VM 上 WorkBuddy 客户端的扩展服务器（实测 4 个）。
+    ('M48 一刀切杀所有 node', 'scripts/vm-purge-runtime.ps1',
+     '$procs = @(Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue)',
+     '$procs = @(Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue)\n  $null = cmd /c \'taskkill /F /IM node.exe /T 2>nul\''),
 ]
 
 
