@@ -1038,6 +1038,89 @@ def c_purge_completeness(root):
     return bad
 
 
+def c_deps_gap(root):
+    """4a 必须把「依赖缺件」当失败，且 node 兜底必须能扛住占用/残留（P12/P13）。
+
+    2026-11-19 从零部署真机：`[DB-3][MANUAL] zip install FAILED: 不能解析远程名称` 之后
+    紧跟 `[OK] 4a (59s) 依赖就绪` —— rc=0 的假绿。故障推迟到 4b，以 VM_START_FAILED 的
+    面目出现。根因：prepare-vm 的 .ps1 在 DB-3/DB-7 失败时只 Write-Output "[MANUAL] ..."，
+    **不 exit 1**（设计上「一个依赖失败不阻断其他」），所以 bootstrap.mjs 正常退出。
+    教训：**判据要锚定「结果」，不能锚定「退出码」**。
+    """
+    bad = []
+    d4 = read(os.path.join(root, 'scripts', 'deploy-4-vm.sh'))
+    # P12：必须有扫日志文本的判据，且 gate 要真的走到 st_end FAIL
+    if '_deps_gap()' not in d4:
+        bad.append('4a 缺 _deps_gap（rc=0 但日志报 [MANUAL] 时会假绿成 [OK] 依赖就绪）')
+    for pat in ('\\[DB-3\\]\\[MANUAL\\]', '\\[DB-7\\]\\[MANUAL\\]'):
+        if pat not in d4:
+            bad.append('_deps_gap 未覆盖 %s（这类行 = 依赖没装上，必须判失败）' % pat)
+    if not re.search(r'if _deps_gap "\$PL"; then[\s\S]{0,220}?st_end 1 FAIL', d4):
+        bad.append('_deps_gap 命中后未落 st_end 1 FAIL（扫到了但不判死 = 仍然是假绿）')
+    # P13：瞬时失败必须真有一次重试（不重试 = 镜像抖一下就整链失败）。
+    # 断言要锚定「判据 + 动作」的耦合结构，不能只查注释/文案里出现过的字眼 ——
+    # M50 第一版就是这么 MISS 的：改掉 elif 的条件后，`镜像下载失败` 那串还在
+    # 注入行/注释里，子串匹配照样命中。
+    if not re.search(r'elif \[ \$PRC -eq 0 \] && _deps_gap "\$PL"; then\s*\n\s*_retry_once ', d4):
+        bad.append('4a 未对「镜像下载瞬时失败」做有界重试（_deps_gap 命中后没接 _retry_once）')
+    if not re.search(r'_deps_gap\(\) \{\s*grep -qE', d4):
+        bad.append('_deps_gap 不是一个 grep 判据（只在注释里提过 = 形同虚设）')
+    # 兜底脚本独立成文件，且必须活在 4a 的失败路径上
+    fb_path = os.path.join(root, 'scripts', 'node-zip-fallback.ps1')
+    if not os.path.exists(fb_path):
+        bad.append('缺 scripts/node-zip-fallback.ps1（node 兜底没有可验证的载体）')
+    else:
+        fbs = read(fb_path)
+        # 载荷纪律：ps-run.sh 会拒非 ASCII；-File 在 PS5.1 上按 ANSI 解码
+        try:
+            raw = open(fb_path, 'rb').read()
+            if any(b > 127 for b in raw):
+                bad.append('node-zip-fallback.ps1 含非 ASCII（ps-run.sh 会拒，日志也不可读）')
+            if raw[:3] == b'\xef\xbb\xbf':
+                bad.append('node-zip-fallback.ps1 带 BOM（-File 下 BOM 会吞首行，见 P9）')
+        except Exception:
+            pass
+        # 占位符必须唯一：注释里再出现一次会让单发 replace 吃掉注释、留下 404 URL
+        # （2026-11-19 实测：URL 变 __NODE_ZIP_VER__ → 404 三次）
+        if fbs.count('__NODE_ZIP_VER__') != 1:
+            bad.append('node-zip-fallback.ps1 的 __NODE_ZIP_VER__ 出现 %d 次（必须恰好 1 次，且只在赋值行）'
+                       % fbs.count('__NODE_ZIP_VER__'))
+        if not re.search(r"^\$ver = '__NODE_ZIP_VER__'$", fbs, re.M):
+            bad.append('占位符不在 $ver 赋值行上（放注释里替换会落空）')
+        if 'GIVEUP version placeholder not substituted' not in fbs:
+            bad.append('兜底未校验占位符是否被替换（未替换会静默拉 404 URL）')
+        # 下载重试
+        if not re.search(r'\$i -le 3', fbs) or 'download FAIL attempt=' not in fbs:
+            bad.append('兜底下载没有 3 次重试（镜像瞬时抖动会直接整链失败）')
+        # 临时文件名必须带 pid：固定名撞上次残留 = 必然复现的「假下载失败」
+        if "'node-fb-' + $PID" not in fbs:
+            bad.append('兜底 $tmp 未带 $PID（固定名撞残留占用，实测连下载都失败）')
+        if "'-stage-' + $PID" not in fbs:
+            bad.append('兜底 staging 目录未带 $PID')
+        # 绝不能 rmtree $dst：活动 node.exe 在 $dst 里时删除必失败（Restart Manager 实测
+        # PID 就是 WinVM 服务自己）⇒ 必须 Copy-over
+        fb_code = strip_comments(fbs)
+        if re.search(r'Remove-Item\s+\$dst\b', fb_code):
+            bad.append('兜底 Remove-Item $dst（活动 node.exe 占用时必失败，不该删目标目录）')
+        # 逐文件复制而非整树 Copy-Item：实测 Copy-Item -Recurse 在 node.exe 被映射时
+        # 直接 IOException 中断整个脚本（覆盖映射中的镜像与删除同样被拒）。
+        if 'Copy-Item -LiteralPath $f.FullName' not in fb_code:
+            bad.append('兜底未做逐文件复制（整树 Copy-Item 遇锁定镜像会中断整个兜底）')
+        # 反向断言：整树复制必须**不在**（只在逐文件循环里复制）。
+        if re.search(r'Copy-Item -Path \(Join-Path \$srcRoot \'\*\'\)', fb_code) or \
+           re.search(r"Copy-Item.*-Destination \$dst -Recurse", fb_code):
+            bad.append('兜底残留整树 Copy-Item（node.exe 被映射时必 IOException，逐文件才是对的做法）')
+        if 'copied=' not in fb_code or 'SKIPPED(locked)' not in fb_code:
+            bad.append('兜底未回执 copied/skipped 计数（锁定的文件必须可见，否则无从判断为何失败）')
+        # 锁定的是 node.exe 且不可用时，必须给出可执行的动作而不是原始异常栈
+        if 'RESCUE_NEEDS_IDLE' not in fb_code:
+            bad.append('兜底在 node.exe 被映射时未给出 RESCUE_NEEDS_IDLE 动作（等于抛裸异常）')
+        # PATH 必须拼 Machine+User：SSH 会话只继承 Machine 段
+        if "GetEnvironmentVariable('Path', 'Machine')" not in fb_code:
+            bad.append('兜底未把 Machine;User 拼进 PATH（SSH 会话只拿 Machine 段会恒判缺失）')
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -1052,6 +1135,7 @@ CHECKS = [
     ('upstream-contract', c_upstream_contract), ('step4-honesty', c_step4_honesty),
     ('password-bootstrap', c_password_bootstrap), ('purge-all', c_purge_all),
     ('bom-contract', c_bom_contract), ('purge-completeness', c_purge_completeness),
+    ('deps-gap', c_deps_gap),
 ]
 
 
@@ -1251,6 +1335,28 @@ MUTATIONS = [
     ('M48 一刀切杀所有 node', 'scripts/vm-purge-runtime.ps1',
      '$procs = @(Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue)',
      '$procs = @(Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue)\n  $null = cmd /c \'taskkill /F /IM node.exe /T 2>nul\''),
+    # 4a 只看 rc ⇒ 「node 没装上」被报成 [OK] 依赖就绪（P12 原样回归：2026-11-19 真机
+    # [DB-7][MANUAL] node missing 后面紧跟 [OK] 4a (59s) 依赖就绪）。
+    ('M49 4a 只看 rc 假绿', 'scripts/deploy-4-vm.sh',
+     'if _deps_gap "$PL"; then', 'if false; then'),
+    # 镜像瞬时失败不重试 ⇒ 抖一下就整链失败（P13：同一条 URL 手工能下，DB-3 一次即放弃）。
+    ('M50 去掉镜像重试', 'scripts/deploy-4-vm.sh',
+     'elif [ $PRC -eq 0 ] && _deps_gap "$PL"; then\n  _retry_once "依赖安装瞬态（镜像下载失败）"',
+     'elif false; then\n  _retry_once "依赖安装瞬态（镜像下载失败）"'),
+    # 兜底改成 rmtree $dst ⇒ 活动 node.exe 占用时必失败（Restart Manager 实测占用者
+    # 就是 WinVM 服务自己），兜底形同虚设。
+    ('M51 兜底 rmtree 目标目录', 'scripts/node-zip-fallback.ps1',
+     "New-Item -ItemType Directory -Path $dst -Force | Out-Null",
+     "Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue\nNew-Item -ItemType Directory -Path $dst -Force | Out-Null"),
+    # 兜底退回整树 Copy-Item ⇒ 遇锁定镜像直接 IOException 中断（实测，覆盖也不行）。
+    ('M53 兜底退回整树复制', 'scripts/node-zip-fallback.ps1',
+     "  try { Copy-Item -LiteralPath $f.FullName -Destination $tgt -Force -ErrorAction Stop; $copied++ }",
+     "  Copy-Item -Path (Join-Path $srcRoot '*') -Destination $dst -Recurse -Force\n  try { Copy-Item -LiteralPath $f.FullName -Destination $tgt -Force -ErrorAction Stop; $copied++ }"),
+    # 兜底临时文件名退回固定名 ⇒ 撞上次残留占用，连下载都失败（实测 attempt=1 OK 后
+    # attempt=1..3 全 FAIL 同一句「正由另一进程使用」）。
+    ('M52 兜底临时名不带 pid', 'scripts/node-zip-fallback.ps1',
+     "$tmp = Join-Path $env:TEMP ('node-fb-' + $PID + '.zip')",
+     "$tmp = Join-Path $env:TEMP 'node-fallback.zip'"),
 ]
 
 

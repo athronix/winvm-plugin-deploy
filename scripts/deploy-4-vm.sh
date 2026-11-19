@@ -47,20 +47,62 @@ _run_prepare() {
   ( cd "$PKG" && "$NODE" delivery/bootstrap.mjs prepare-vm --apply $DEPS_ARGS \
       --vm-host "$VM_HOST" --vm-user "$VM_USER" --vm-ssh-port "$VM_SSH_PORT" ) > "$PL" 2>&1
 }
+# 依赖缺口判据（P12）：prepare-vm 的 .ps1 在 DB-3/DB-7 失败时只 Write-Output "[MANUAL] ..."，
+# **不返回非零 rc** ⇒ 只看 rc 会把「node 没装上」报成 [OK] 依赖就绪（2026-11-19 真机假绿：
+# [DB-7][MANUAL] node missing 后面紧跟 [OK] 4a (59s) 依赖就绪，故障被推迟到 4b 才以
+# VM_START_FAILED 的面目出现，归因成本极高）。必须扫日志文本，把「缺件」当失败。
+_deps_gap() { grep -qE '\[DB-3\]\[MANUAL\]|\[DB-7\]\[MANUAL\]|zip install FAILED|zip install ran but node still not on PATH' "$1" 2>/dev/null; }
+
 _run_prepare; PRC=$?
-# 建连类瞬态（握手超时/连接丢失）给一次有界重试：幂等只读动作，重试安全。
-if [ $PRC -ne 0 ] && grep -qE 'Connection lost before handshake|ready 超时|Timed out while waiting' "$PL" 2>/dev/null; then
+# 两类瞬态各给一次有界重试（幂等动作，重试安全）：
+#   ① 建连类（握手超时/连接丢失）
+#   ② 依赖安装类（镜像下载瞬时失败——2026-11-19 实测：同一条 cdn.npmmirror.com URL
+#      第一次报「不能解析远程名称」、第二次 37.6MB 完整下载成功；DNS/代理/443 均正常）
+_retry_once() {
   cp -f "$PL" "${PL%.log}.attempt1.log" 2>/dev/null || true
-  echo "  [4a] 建连瞬态 → 等 15s 重试一次（幂等，不改任何东西）"
+  echo "  [4a] $1 → 等 15s 重试一次（幂等，不改任何东西）"
   sleep 15
   _run_prepare; PRC=$?
+}
+if [ $PRC -ne 0 ] && grep -qE 'Connection lost before handshake|ready 超时|Timed out while waiting' "$PL" 2>/dev/null; then
+  _retry_once "建连瞬态"
+elif [ $PRC -eq 0 ] && _deps_gap "$PL"; then
+  _retry_once "依赖安装瞬态（镜像下载失败）"
 fi
-grep -E 'DB-7|SKIP|已就绪|ensure|npm install -g' "$PL" | tail -8
+# 重试后仍缺件 ⇒ 兜底直接装 node（绕开 prepare-vm 的 winget 前缀与它那次失败的下载）。
+# 兜底只补 node：DB-7 三个 CLI 依赖 npm，node 一到位它们能在下一轮幂等补齐。
+# 兜底脚本独立成文件（scripts/node-zip-fallback.ps1）而非 heredoc：① 纯 ASCII 可被
+#   ps-run.sh 的载荷纪律检查；② 能单独真机验证；③ 门禁能静态断言它的关键约束。
+if [ $PRC -eq 0 ] && _deps_gap "$PL"; then
+  echo "  [4a] 依赖仍缺 → 兜底装 node（scripts/node-zip-fallback.ps1）"
+  NODE_ZIP_VER="$(sed -n "s/^export const NODE_ZIP_VER = '\([^']*\)'.*/\1/p" "$PKG/delivery/prepare-vm.mjs" 2>/dev/null | head -1)"
+  [ -n "${NODE_ZIP_VER:-}" ] || NODE_ZIP_VER=24.21.0
+  FB="$VMDEPLOY_RUN_DIR/node-zip-fallback.$NODE_ZIP_VER.ps1"
+  sed "s/__NODE_ZIP_VER__/$NODE_ZIP_VER/g" "$SCRIPTDIR/node-zip-fallback.ps1" > "$FB"
+  if VM_PS_TIMEOUT="${VM_PS_TIMEOUT:-600}" bash "$SCRIPTDIR/ps-run.sh" "$FB" \
+       > "$VMDEPLOY_RUN_DIR/node-zip-fallback.log" 2>&1; then
+    grep -E '^\[FB\]' "$VMDEPLOY_RUN_DIR/node-zip-fallback.log" | tail -4
+    echo "  [4a] node 兜底成功 → 再跑一次 prepare-vm 让 DB-7 补齐三个 CLI"
+    _run_prepare; PRC=$?
+  else
+    grep -E '^\[FB\]' "$VMDEPLOY_RUN_DIR/node-zip-fallback.log" | tail -8
+    tail -4 "$VMDEPLOY_RUN_DIR/node-zip-fallback.log"
+  fi
+fi
+grep -E 'DB-7|SKIP|已就绪|ensure|npm install -g|\[MANUAL\]' "$PL" | tail -8
 if [ $PRC -ne 0 ]; then
   tail -10 "$PL"
   st_end $PRC FAIL "prepare-vm rc=$PRC（VM 端可能缺 node）"
   die "VM 依赖补齐失败" "node 安装或路径探测失败" "$PL" \
       "看 $PL；VM 内 node 走 nvm-windows，切换版本会让全局 CLI 消失"
+fi
+if _deps_gap "$PL"; then
+  tail -14 "$PL"
+  st_end 1 FAIL "依赖缺件（rc=0 但日志报 MANUAL）"
+  die "VM 依赖未补齐（rc=0 的假绿）" \
+      "prepare-vm 的 DB-3/DB-7 失败只打印 [MANUAL]，ps1 不返非零" \
+      "$PL 中的 [MANUAL] 行" \
+      "按 [MANUAL] 提示手工装 node >= 18 后重跑 --only 4；镜像瞬时失败可重跑（已内建一次重试+兜底）"
 fi
 st_end 0 PASS "依赖就绪"
 
