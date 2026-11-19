@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）；--purge-all 一键回到裸机（②追加 2e 运行时深清 node/codebuddy/私钥，③的同一 SYSTEM 任务里卸 sshd MSI 与两处 authorized_keys）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
-version: 2.5.3
+version: 2.5.4
 agent_created: true
 ---
 
@@ -194,6 +194,8 @@ bash scripts/selfcheck.sh --mutate        # 变异自证：往副本注缺陷，
 | `[DB-3] zip install FAILED: 不能解析远程名称` | **多半是镜像瞬时抖动，不是 DNS**：先在同一台 VM 上手工 `Invoke-WebRequest` 同一条 URL 验证（实测同 URL 第二次 37.6MB 完整下载）。v2.5.3 起 4a 内建一次重试 + 独立兜底，直接重跑 `--only 4` 即可；别去改 DNS/代理 |
 | 4a 兜底报 `RESCUE_NEEDS_IDLE` | `node.exe` 正被进程映射（实测就是 WinVM 服务自己），映射中的镜像**既不能删也不能覆盖**。动作：`schtasks /end /tn WinVMBridge.Service` + 杀掉占用的 node pid，再重跑 4a；**不要为清一个文件重启 VM** |
 | `npm warn install-scripts ... not yet covered by allowScripts` | **无害，postinstall 实际已执行**（实测 `agent-browser/skill-data` 27 文件在位）。npm 11 把提示提级成 warn。要消音：`npm config set allow-scripts=agent-browser,agent-desktop --location=user` |
+| 4a 日志先打「`.ps1` 已推送 …」，紧接着 `-File 方式参数实际参数 winvm-setup-….ps1 不存在`（rc=4294770688） | **母项目 V1.4.34 之前的老包才会遇到**：旧 `runRemotePs1` 用**裸文件名**推送，靠「sftp 落盘目录 == ssh 登录 cwd」这条假前提；put 与 exec 是两次独立建连、各自选后端，链路抖过一次就分裂（实测同一台机 11:53 成功、12:04 失败）。V1.4.34 起统一改为 `${VM_DEPLOY_DIR}/<name>` **绝对路径**，日志会打印完整路径。若仍见裸名 ⇒ 包是旧的，换规范包重装 |
+| DB-7 显示 `desktop:MISSING browser:MISSING`，但 4c/第 5 步明明读到 `browser=33 desktop=25` | **母项目 V1.4.34 之前的老包假红**：`state` 漏映射 `cliDesktop`/`cliBrowser`（探测端叫 `browserCli`/`desktopCli`），日志与计划表恒读 `undefined`。**安装行为本来是对的**（DB-7 的 ps1 自己 `Get-Command` 重探），所以别去手工装 CLI。V1.4.34 起修好，正常会显示 `desktop:OK browser:OK` 且计划表 `[SKIP] all present` |
 | 卸载后 `UPSTREAM_LEFT=agent-desktop` | `npm uninstall -g` 失败（npm 不在 PATH / 文件占用）：看 `vm-remove.log` 的 `[WARN]` 行；手工 `npm uninstall -g`。不需要卸就加 `--keep-upstreams` |
 | verify 报 `ENV_WINDOW=1` | 通道瞬态窗，环境问题非功能失败。等健康窗只重跑 `verify.sh` |
 | 探针报 `total-33!=34` / `skip-N!=4` | 探针项数被改动 → 同步改 `deploy-5-verify.sh` 的 `EXP_TOTAL/EXP_SKIP`（刻意告警，别放宽） |
