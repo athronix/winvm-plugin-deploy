@@ -39,7 +39,7 @@ MUTATE=0
 mkdir -p "$SELFCHECK_WORK" 2>/dev/null || true
 
 "$PY" - "$_here/.." "$MUTATE" "$SELFCHECK_WORK" "$SKILL_SELFCHECK_OUT" <<'PYEOF'
-import os, re, sys, io, shutil, subprocess
+import os, re, sys, io, glob, shutil, subprocess
 
 ROOT = os.path.abspath(sys.argv[1])
 MUTATE = sys.argv[2] == '1'
@@ -1121,6 +1121,173 @@ def c_deps_gap(root):
     return bad
 
 
+def c_pkg_tag_priority(root):
+    """显式 TAG 必须压过状态文件记忆，否则 rc=0 一路跑在错误基准上（P17）。
+
+    2026-11-19 从零部署真机：`RELEASE_TAG=V1.4.34 bash deploy-2-host.sh` 打出
+    「包根 = .../overall-root/overall / 版本 = V1.4.32」，**rc=0 不报错**。
+    根因是 `resolve_pkg_root` 的优先级为 `env PKG_ROOT > pkg-root.txt > _pick_pkg_root`，
+    状态文件（上次留下的旧包根）排在 tag 探测之前 ⇒ 显式 tag 被完全绕过。
+
+    这条为什么必须做成**行为级**断言（真的 source 一份 pkg-root.sh 去跑），
+    而不是查源码字符串：字符串匹配只能证明「代码里有 strict 这个词」，
+    证明不了「给了 tag 就不会静默返回旧层」。P17 的失败形态本身就是 rc=0，
+    源码里怎么看都对 —— 只有跑一遍才能抓到。
+
+    同时锁两件事，防止「修主案引入旁案」：
+      ① 不给 tag 时状态文件仍要生效（否则把性能优化一起砍了，每次部署都现探/重解）；
+      ② env PKG_ROOT 仍最高（用户显式环境变量是最后的手动兜底）。
+    """
+    bad = []
+    pr = os.path.join(root, 'scripts', 'pkg-root.sh')
+    if not os.path.exists(pr):
+        return ['缺 scripts/pkg-root.sh']
+    src = read(pr)
+    # 先做两条便宜的结构断言（给出比「行为跑挂了」更精确的定位）
+    if 'pkg_root_tag_mismatch_error' not in src:
+        bad.append('pkg-root.sh 缺 pkg_root_tag_mismatch_error（tag 不匹配时调用方无从给出可操作提示）')
+    if '_pick_pkg_root "$tag" strict' not in src:
+        bad.append('resolve_pkg_root 未对显式 tag 走 strict（非 strict 会静默命中旧层）')
+
+    bash = shutil.which('bash') or '/bin/bash'
+    NODE = os.environ.get('NODE') or 'node'
+
+    def _mk(base, ver, state_to=None):
+        layer = os.path.join(base, 'overall-root', 'overall')
+        os.makedirs(os.path.join(layer, 'delivery'), exist_ok=True)
+        with io.open(os.path.join(layer, 'MANIFEST.txt'), 'w', encoding='utf-8') as f:
+            f.write('version: %s\n' % ver)
+        with io.open(os.path.join(layer, 'delivery', 'setup.mjs'), 'w', encoding='utf-8') as f:
+            f.write('x')
+        if state_to:
+            with io.open(os.path.join(base, 'pkg-root.txt'), 'w', encoding='utf-8') as f:
+                f.write(layer + '\n')
+        return layer
+
+    def _run(base, tag):
+        """返回 (rc, PKG_RESOLVED, PKG_SOURCE)。"""
+        script = (
+            '. "%s"\n'
+            'if resolve_pkg_root %s; then echo "RC=0"; echo "PKG=$PKG_RESOLVED"; echo "SRC=$PKG_SOURCE"; '
+            'else echo "RC=1"; fi\n' % (pr, tag)
+        )
+        env = dict(os.environ, DEPLOY_ROOT=base, PKG_ROOT_STATE_FILE=os.path.join(base, 'pkg-root.txt'))
+        env.pop('PKG_ROOT', None)   # 别让宿主环境的 PKG_ROOT 污染断言
+        r = subprocess.run([bash, '-c', script], capture_output=True, text=True, env=env)
+        out = r.stdout or ''
+        rc = '0' if 'RC=0' in out else '1'
+        pkg = next((l[4:] for l in out.splitlines() if l.startswith('PKG=')), '')
+        src_ = next((l[4:] for l in out.splitlines() if l.startswith('SRC=')), '')
+        return rc, pkg, src_, (r.stderr or '')
+
+    # ⚠ 沙箱纪律（2026-11-19 实测踩到）：**本断言一律不做删除**。
+    # 鸿蒙沙箱的安全删除护栏是按「单回合进程内 unlink 数」计的，shutil.rmtree 一次
+    # 51 个文件就撞阈值 50 ⇒ 抛 SAFE_DELETE_BULK_CONFIRM_REQUIRED，表现为
+    # 「门禁 rc=1 但一行 FAIL 都没打」，极易误读成断言失效（memory 里记过同一个坑）。
+    # 对策：只用**唯一目录名**（WORK 本身每次运行都是新的 selfcheck-<ts>），原地新建即可。
+    def case(name, tag, build):
+        base = os.path.join(WORK, 'p17-' + name)
+        os.makedirs(base, exist_ok=True)
+        build(base)
+        return _run(base, tag)
+
+    # ① 主案：tag=V1.4.34，盘上只有 V1.4.32，状态文件指向它 ⇒ 必须 rc=1
+    rc, pkg, src_, err = case('mismatch', 'V1.4.34', lambda b: _mk(b, 'V1.4.32', state_to=True))
+    if rc != '1':
+        bad.append('P17 主案未修复：tag=V1.4.34 盘上只有 V1.4.32 却 rc=0（命中 %s，source=%s）' % (pkg, src_))
+    elif pkg:
+        bad.append('P17 主案 rc=1 但仍残留 PKG_RESOLVED=%s（调用方可能误用）' % pkg)
+
+    # ② 反向断言：tag 有对应层时必须命中该层（不许把功能一起关掉）
+    rc, pkg, src_, err = case('hit', 'V1.4.34', lambda b: _mk(b, 'V1.4.34'))
+    if rc != '0' or 'tag(' not in src_:
+        bad.append('显式 tag 有对应层却未命中（rc=%s source=%s）—— 修 P17 时把正常路径改坏了' % (rc, src_))
+
+    # ③ 不给 tag：状态文件仍生效（性能优化不许被误伤）
+    rc, pkg, src_, err = case('state', '', lambda b: _mk(b, 'V1.4.32', state_to=True))
+    if rc != '0' or not src_.startswith('state'):
+        bad.append('不给 tag 时状态文件未生效（rc=%s source=%s）—— 会把「免重解」优化一起砍掉' % (rc, src_))
+
+    # ④ env PKG_ROOT 仍最高（即使同时给了 tag）
+    def _envcase(b):
+        _mk(b, 'V1.4.32')
+        cust = os.path.join(b, 'custom')
+        os.makedirs(os.path.join(cust, 'delivery'), exist_ok=True)
+        with io.open(os.path.join(cust, 'MANIFEST.txt'), 'w', encoding='utf-8') as f:
+            f.write('version: V1.4.34\n')
+        with io.open(os.path.join(cust, 'delivery', 'setup.mjs'), 'w', encoding='utf-8') as f:
+            f.write('x')
+    base = os.path.join(WORK, 'p17-env')
+    os.makedirs(base, exist_ok=True)   # 不删：见上方沙箱纪律（rmtree 撞 SAFE_DELETE 阈值）
+    _envcase(base)
+    script = '. "%s"\nPKG_ROOT="%s/custom" resolve_pkg_root V1.4.34; echo "SRC=$PKG_SOURCE"\n' % (pr, base)
+    env = dict(os.environ, DEPLOY_ROOT=base)
+    r = subprocess.run([bash, '-c', script], capture_output=True, text=True, env=env)
+    if 'SRC=env PKG_ROOT' not in (r.stdout or ''):
+        bad.append('env PKG_ROOT 不再最高优先（用户手动兜底失效）')
+
+    # ⑤ cache 快路径必须 strict：非 strict 时「zip 在、sha 对、层是旧版」也会命中。
+    # ⚠ 这里必须**逐调用点**断言，不能只查 `_pick_pkg_root "$TAG" strict` 这个子串 ——
+    # download-verify 里有两处调用（cache 快路径 HIT= / 解包后选根 PKG=），
+    # 子串断言在「只把其中一处退回非 strict」时会假绿（M56 第一版就是这么 MISS 的）。
+    dv = read(os.path.join(root, 'scripts', 'download-verify.sh'))
+    if not re.search(r'HIT="\$\(_pick_pkg_root "\$TAG" strict\)"', dv):
+        bad.append('cache 快路径未传 strict（P17 主案入口：zip/sha 都对但层是旧版时会命中旧层）')
+    if re.search(r'HIT="\$\(_pick_pkg_root "\$TAG"\)"', dv):
+        bad.append('cache 快路径退回非 strict（版本不符也判命中，等于 P17 原样回归）')
+    if not re.search(r'PKG="\$\(_pick_pkg_root "\$TAG" strict\)"', dv):
+        bad.append('解包后选根未传 strict（解出来的版本不对时会滑过去）')
+    return bad
+
+
+def c_rc_honesty(root):
+    """失败路径上打出的 rc 必须是真的 rc（P18）。
+
+    2026-11-19 真机：`RELEASE_TAG=V1.4.99`（不存在的版本）→ 2a 正确 FAIL，
+    但日志打的是 `download-verify rc=0`。原因是把被取反的取反写法当判据：
+    用 `if ! cmd` 的 then 分支里取 `$?`，而 `$?` 在 `!` 之后**恒为 0**
+    （取反本身就是一次求值）⇒ 真正的退出码永久丢失。
+
+    ⚠ 本段说明文字**不许**写成可被本断言匹配的代码形态：注释里放一个 `if !`
+    加 `$?` 的示例，断言会抓到自身（第一版就是自伤，表现为「门禁说 rc-honesty 失败，
+    而失败位置是 selfcheck.sh 的注释行」）。示例一律用文字描述，不落成真语法。
+
+    为什么这条值得单独设门禁：它专打「**最该看清的那一行**」。
+    失败现场里「rc=0 却说失败」会让人先去怀疑脚本逻辑，而真凶往往是
+    rc=1（网络/tag 不存在）或 rc=2（sha256 不一致 = 事故，绝不重试）。
+    判据纪律：**诊断信息本身必须可信，否则等于没有证据。**
+    """
+    bad = []
+    for p in sorted(glob.glob(os.path.join(root, 'scripts', '*.sh'))):
+        rel = os.path.relpath(p, root)
+        lines = read(p).splitlines()
+        for i, l in enumerate(lines):
+            if l.lstrip().startswith('#'):
+                continue
+            # 本文件自己是断言实现，说明文字里必然出现该模式；整文件跳过，避免自伤。
+            # （不是「豁免真代码」：selfcheck.sh 不参与任何部署/卸载行为。）
+            if rel == os.path.join('scripts', 'selfcheck.sh'):
+                break
+            if not re.search(r'\bif\s+!', l):
+                continue
+            # 把「if !」到 then 之间可能跨行的情况一起纳入窗口；再看 then 之后
+            # 到 else/fi 之前有没有 $?。
+            # ⚠ 只用单行正则（要求 then 在行尾）会漏掉 `then DVRC=$?; fi` 这种写法，
+            # 第一版就是那样 MISS 的 —— 注入后语法合法、断言却看不见（假绿）。
+            window = '\n'.join(lines[i:i + 4])
+            m = re.search(r'\bthen\b', window)
+            if not m:
+                continue
+            after = window[m.end():]
+            stop = re.search(r'\bfi\b|\belse\b', after)
+            seg = after[:stop.start()] if stop else after
+            seg = '\n'.join(x for x in seg.splitlines() if not x.lstrip().startswith('#'))
+            if '$?' in seg:
+                bad.append('%s:%d `if !` 块内用 $?（恒为 0，真退出码丢失）: %s'
+                           % (rel, i + 1, l.strip()[:70]))
+    return bad
+
+
 CHECKS = [
     ('syntax', c_syntax), ('control', c_control), ('frontmatter', c_frontmatter),
     ('inventory', c_inventory), ('no-grep-c', c_no_grep_c), ('tsv-contract', c_tsv_contract),
@@ -1135,7 +1302,8 @@ CHECKS = [
     ('upstream-contract', c_upstream_contract), ('step4-honesty', c_step4_honesty),
     ('password-bootstrap', c_password_bootstrap), ('purge-all', c_purge_all),
     ('bom-contract', c_bom_contract), ('purge-completeness', c_purge_completeness),
-    ('deps-gap', c_deps_gap),
+    ('deps-gap', c_deps_gap), ('pkg-tag-priority', c_pkg_tag_priority),
+    ('rc-honesty', c_rc_honesty),
 ]
 
 
@@ -1221,7 +1389,7 @@ MUTATIONS = [
     # 注入点必须唯一：1c 现在有两条命令（-File 主路径 + irm 备选）都含 $src=@($srcs)，
     # 用更长的串锚定主路径，否则变异因 count=2 而 MISS（门禁自伤）。
     ('M15 命令内联空候选数组', 'scripts/deploy-1-ssh.sh',
-     '$src=@($srcs);\$ok=\$false;foreach(\$x in \$src)', '$src=@();\$ok=\$false;foreach(\$x in \$src)'),
+     r'$src=@($srcs);\$ok=\$false;foreach(\$x in \$src)', r'$src=@();\$ok=\$false;foreach(\$x in \$src)'),
     # 后端默认退化成 key：鸿蒙宿主机上每步都误报 NO_CHANNEL（rc=124 相位挂）。
     ('M16 后端默认退化为 key', 'scripts/vm-conn.sh',
      'VM_SSH_BACKEND="${VM_SSH_BACKEND:-auto}"', 'VM_SSH_BACKEND="${VM_SSH_BACKEND:-key}"'),
@@ -1357,6 +1525,24 @@ MUTATIONS = [
     ('M52 兜底临时名不带 pid', 'scripts/node-zip-fallback.ps1',
      "$tmp = Join-Path $env:TEMP ('node-fb-' + $PID + '.zip')",
      "$tmp = Join-Path $env:TEMP 'node-fallback.zip'"),
+    # P17 原样回归：把显式 tag 分支关掉 ⇒ 状态文件（旧包根）重新压过显式参数，
+    # `RELEASE_TAG=V1.4.34` 静默拿到 V1.4.32 且 rc=0（2026-11-19 真机，本报告最危险的一条）。
+    ('M54 显式 tag 让位状态文件', 'scripts/pkg-root.sh',
+     '  if [ -n "$tag" ]; then\n    if p="$(_pick_pkg_root "$tag" strict)"; then PKG_RESOLVED="$p"; PKG_SOURCE="tag($tag)"; return 0; fi',
+     '  if false; then\n    if p="$(_pick_pkg_root "$tag" strict)"; then PKG_RESOLVED="$p"; PKG_SOURCE="tag($tag)"; return 0; fi'),
+    # tag 分支退化为非 strict ⇒ 只要盘上有任一合法层就算命中（版本不符也过），
+    # 这正是 P17 主案的形态：命中旧层 → 写进状态文件 → 下游全在错基准上判 PASS。
+    ('M55 tag 匹配退化为非 strict', 'scripts/pkg-root.sh',
+     'if p="$(_pick_pkg_root "$tag" strict)"; then PKG_RESOLVED="$p"; PKG_SOURCE="tag($tag)"; return 0; fi',
+     'if p="$(_pick_pkg_root "$tag")"; then PKG_RESOLVED="$p"; PKG_SOURCE="tag($tag)"; return 0; fi'),
+    # cache 快路径去掉 strict ⇒ 「zip 在、sha 对、层是旧版」也判缓存命中，直接跳过重解。
+    ('M56 缓存快路径去掉 strict', 'scripts/download-verify.sh',
+     'HIT="$(_pick_pkg_root "$TAG" strict)"', 'HIT="$(_pick_pkg_root "$TAG")"'),
+    # P18 原样回归：把「先捕获 rc 再判」退回 `if ! ...; then` + `rc=$?` ⇒ 失败行恒打 rc=0。
+    # 注意注入点用整块替换：只改 rc=$? 会留下 DVRC 变量没人赋值，断言仍绿（假绿）。
+    ('M57 失败行 rc 恒为 0', 'scripts/deploy-2-host.sh',
+     'DVRC=0\nbash "$SCRIPTDIR/download-verify.sh" ${RELEASE_TAG:+--tag "$RELEASE_TAG"} > "$DV" 2>&1 || DVRC=$?',
+     'DVRC=0\nif ! bash "$SCRIPTDIR/download-verify.sh" ${RELEASE_TAG:+--tag "$RELEASE_TAG"} > "$DV" 2>&1; then DVRC=$?; fi'),
 ]
 
 

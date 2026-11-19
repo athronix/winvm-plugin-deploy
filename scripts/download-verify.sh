@@ -26,8 +26,13 @@ mkdir -p "$DEPLOY_ROOT/pkg" "$DEPLOY_ROOT/overall-root"
 # run18 P-1 幂等快路径：同 TAG 包已完整在场（zip sha 相符 + 某层 MANIFEST 声明==TAG）
 # ⇒ 免重下重解（否则每次 deploy 都隔离+重解 500MB）；VMDEPLOY_FORCE_FETCH=1 强制刷新。
 # run19 R-1：_pick_root 局部函数删除，改用 pkg-root.sh 的 _pick_pkg_root（单一事实源）。
+# P17（2026-11-19 真机）：这里**必须传 strict**。旧代码用非 strict，判据退化成
+# 「zip 在 + sha 对 + 盘上有任一合法层」——而「有合法层」和「有**这一版**的层」是两件事。
+# 实测形态：RELEASE_TAG=V1.4.34，zip 与 sha 都对，但 overall-root 里解出来的还是 V1.4.32
+# ⇒ 非 strict 命中旧层、打印「缓存命中」、把旧层写进状态文件 ⇒ 全程 rc=0 跑错版本（P17 主案）。
+# strict 后：版本不符 ⇒ 不走缓存 ⇒ 落到下面的隔离+重解，自然得到正确层。
 if [ "${VMDEPLOY_FORCE_FETCH:-0}" != "1" ] && [ -f "$DEPLOY_ROOT/pkg/$ZIP" ] && \
-   ( cd "$DEPLOY_ROOT/pkg" && sha256sum -c "$ZIP.sha256" >/dev/null 2>&1 ) && HIT="$(_pick_pkg_root "$TAG")"; then
+   ( cd "$DEPLOY_ROOT/pkg" && sha256sum -c "$ZIP.sha256" >/dev/null 2>&1 ) && HIT="$(_pick_pkg_root "$TAG" strict)"; then
   echo "[cache] tag=$TAG 本地包根完整（$HIT），跳过下载/解包（VMDEPLOY_FORCE_FETCH=1 可强制）"
   if [ "$HIT" != "$DEPLOY_ROOT/overall-root" ] && [ -f "$DEPLOY_ROOT/overall-root/.env" ] && [ ! -f "$HIT/.env" ]; then
     cp "$DEPLOY_ROOT/overall-root/.env" "$HIT/.env" && echo "[pkg-root] 外层 .env 已下传到缓存包根"
@@ -75,16 +80,25 @@ unzip -q -o "$DEPLOY_ROOT/pkg/$ZIP" -d "$DEPLOY_ROOT/overall-root" || { echo "UN
 # 旧「last-wins」会选中陈旧层）。改按 **MANIFEST version==TAG** 匹配选根：新鲜解包层胜出；
 # 双层都声明该版本才允许任取（同层同内容）；都不匹配回退任一合法层并显式告警。
 # run19 R-1：选根= pkg-root.sh 共享函数（单一事实源，勿复制两份）。
-PKG="$(_pick_pkg_root "$TAG")" || true
-[ -n "$PKG" ] || { echo "PKG_ROOT_NOT_FOUND（D5 判定失败：MANIFEST.txt+delivery 双缺）" >&2; exit 1; }
+# P17：这里本来就带 TAG，改 strict —— 刚解出来的层若版本不等于 TAG，说明 zip 与 tag 不匹配，
+# 属事故，必须当场停下，不能让「解包成功但版本不对」滑过去（下游会以错误基准判 PASS）。
+PKG="$(_pick_pkg_root "$TAG" strict)" || true
+[ -n "$PKG" ] || {
+  echo "PKG_ROOT_NOT_FOUND（解包后仍无声明 $TAG 的合法层：zip 内容与 tag 不一致？）" >&2
+  echo "  ZIP=$DEPLOY_ROOT/pkg/$ZIP  解包目标=$DEPLOY_ROOT/overall-root" >&2
+  exit 1
+}
 # run18 P-1：.env 用户配置面随「选中根」传导——.env 永不入 MANIFEST（分发面零 .env），
 # 用户手填位=overall-root 外层根；当选定包根是内层（overall/ 前缀 zip）时上提复制，
 # 保 prepare-vm/setup 的 $PKG/.env 读取位一致（X-6 凭据回注依赖此位）。
 if [ "$PKG" != "$DEPLOY_ROOT/overall-root" ] && [ -f "$DEPLOY_ROOT/overall-root/.env" ] && [ ! -f "$PKG/.env" ]; then
   cp "$DEPLOY_ROOT/overall-root/.env" "$PKG/.env" && echo "[pkg-root] 外层 .env 已下传到选中包根"
 fi
-RV_SEL="$(_pkg_layer_version "$PKG")"
-[ "$RV_SEL" = "$TAG" ] || echo "⚠ 选中包根 $PKG 声明版本=$RV_SEL ≠ 下载 TAG=$TAG（陈旧层风险，核对 unzip 布局）" >&2
+# P17：原来这里是「⚠ 声明版本 ≠ TAG（陈旧层风险）」的软告警 —— 但既然选根已是 strict，
+# 这行**永远不可能触发**，留着只会让下一个人以为「有保护」。改成正向确认行：
+# 日志里明确写出「选中的层声明了哪个版本」，这正是 P17 现场最缺的那一条证据
+# （当时日志只有「包根 = ...」和「版本 = V1.4.32」，两者矛盾却无人对账）。
+echo "[pkg-root] 选中 $(_pkg_layer_version "$PKG") @ $PKG（TAG=$TAG，版本已真匹配）"
 if [ -n "${PY:-}" ]; then
   ( cd "$PKG" && "$PY" qa/deploy-probes/verify-manifest.py . 2>&1 | tail -1 ) || echo "verify-manifest WARN（探针自身失败不否决 sha 已过结果，记录进问题列）"
 fi

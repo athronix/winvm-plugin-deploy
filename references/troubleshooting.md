@@ -41,6 +41,8 @@
 | `install-host` rc≠0 且日志有 `errno=12` | 宿主内存压力下 node 崩（脆弱 node） | 重跑本步；排障时用 `node -e` 冒烟确认解释器 |
 | `connector-states ⚠` | 平台账户态噪声 | 忽略，不参与判据 |
 | `connector skills < 8` | skills 没落到 connectors 目录 | 在包根跑 `node delivery/deploy-shared-skills.mjs` |
+| `RELEASE_TAG=<新版本>` 打出「版本 = <旧版本>」，**rc=0** | 状态文件 `$DEPLOY_ROOT/pkg-root.txt` 排在 tag 探测之前（v2.5.5 之前）。**这是本项目最危险的一类缺陷**：不是失败，而是「一路绿灯跑在错误基准上」——`5d` 的 fresh 对账、`PKG_VERSION`、`deploy-state.env` 全部跟错包走，矩阵会给出**错误的 PASS** | 先做**四面对账**：`MANIFEST.txt` 的 version 行 / `pkg-root.txt` / `deploy-state.env` 的 `PKG_VERSION` / 实际文件内容，四者不一致即确诊。v2.5.5 起会直接 `PKG_TAG_MISMATCH` 退出并列出盘上实际版本。**别用「删 pkg-root.txt」绕过**——掩盖过一次，下次还会犯 |
+| 本步 FAIL，但日志写 `download-verify rc=0` | `if ! cmd; then` 里的 `$?` 恒为 0（取反即求值），真退出码丢失（v2.5.5 之前）。**失败行的数字不可信 = 没有证据**，会把人推去怀疑脚本逻辑 | 直接看 `download-verify.log` 末行判真因：`DOWNLOAD_FAILED`=rc1（网络或 tag 不存在）、`SHA256_MISMATCH`=rc2（**事故，绝不重试**）、`PKG_ROOT_NOT_FOUND`=解出来的版本与 tag 不符。v2.5.5 起失败行打真 rc |
 
 ## 第 3 步：起 tunnel 并验证
 

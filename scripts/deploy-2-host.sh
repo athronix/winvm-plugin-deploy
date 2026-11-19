@@ -14,10 +14,18 @@ resolve_env; need_node; need_py
 # ── 2a 取包（缓存命中即跳过下载）──
 st_begin 2a "取发布包（sha256 校验 + 隔离解压）"
 DV="$(sub_log download-verify)"
-if ! bash "$SCRIPTDIR/download-verify.sh" ${RELEASE_TAG:+--tag "$RELEASE_TAG"} > "$DV" 2>&1; then
+DVRC=0
+bash "$SCRIPTDIR/download-verify.sh" ${RELEASE_TAG:+--tag "$RELEASE_TAG"} > "$DV" 2>&1 || DVRC=$?
+if [ "$DVRC" -ne 0 ]; then
   tail -12 "$DV"
-  st_end 1 FAIL "download-verify rc=$?"
-  die "取包失败" "下载/校验/解压三者之一" "$DV 末行：$(tail -1 "$DV")" \
+  # P18（2026-11-19 真机暴露）：旧写法是 `if ! bash ...; then` + `rc=$?`，而 `!` 取反后
+  # `$?` 恒为 0 ⇒ 无论失败原因是什么，日志都打 `download-verify rc=0`。
+  # 这条恰恰是「最该看清的一行」：rc=0 会让人以为「脚本本身没问题、是别的原因」，
+  # 而真凶可能是 rc=1（下载/打包不可达）或 rc=2（sha 不一致，属事故）。
+  # 判据纪律：**失败路径上的诊断信息必须本身可信**，否则等于没有证据。
+  st_end 1 FAIL "download-verify rc=$DVRC"
+  die "取包失败" "下载/校验/解压三者之一（rc=1 网络或 tag 不存在；rc=2 sha256 不一致属事故）" \
+      "$DV 末行：$(tail -1 "$DV")" \
       "看 $DV；离线时用 SKIP_DOWNLOAD=1 复用本地包"
 fi
 PKG="$(grep -E '^PKG_ROOT=' "$DV" | tail -1 | cut -d= -f2-)"
@@ -31,6 +39,16 @@ PKG="$(grep -E '^PKG_ROOT=' "$DV" | tail -1 | cut -d= -f2-)"
 VER="$(sed -n 's/^version[[:space:]]*[:=][[:space:]]*//p' "$PKG/MANIFEST.txt" 2>/dev/null | head -1 | tr -d '\r')"
 echo "  包根 = $PKG"
 echo "  版本 = ${VER:-unknown}"
+# P17（2026-11-19 真机）：指定了版本却装到另一版，是本报告里唯一「rc=0 跑错基准」的缺陷。
+# download-verify 侧已保证「选中层声明==TAG」，这里再对账一次并**硬失败**——
+# 两道锁不是冗余：download-verify 可能被 SKIP_DOWNLOAD / 手工摆包绕过，
+# 而 2a 是「包根进入 state」的唯一入口，错在这一步，后面 4b/4c/5d 全都在错基准上判 PASS。
+if [ -n "${RELEASE_TAG:-}" ] && [ "$VER" != "$RELEASE_TAG" ]; then
+  st_end 1 FAIL "tag=$RELEASE_TAG 实得 ver=${VER:-unknown}"
+  die "包版本与指定 TAG 不符" "显式 RELEASE_TAG 必须严格命中（P17：状态文件/旧层不得覆盖显式参数）" \
+      "RELEASE_TAG=$RELEASE_TAG  包根=$PKG  MANIFEST version=${VER:-unknown}" \
+      "先 RELEASE_TAG=$RELEASE_TAG bash scripts/download-verify.sh，或改用盘上已有版本"
+fi
 state_set PKG_ROOT "$PKG"
 [ -n "${VER:-}" ] && state_set PKG_VERSION "$VER"
 st_end 0 PASS "pkg=$PKG ver=${VER:-unknown}"
