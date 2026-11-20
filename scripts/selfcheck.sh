@@ -281,6 +281,45 @@ def c_payload(root):
     return bad
 
 
+# vm-remove-local.ps1 的头注释自称 "mirrors delivery/uninstall.mjs buildVmPs1() exactly"。
+# 这条自述是契约：母项目加了能力而这里不跟 ⇒ 通道 DOWN 时的兜底卸载路径静默退化。
+# 真实事故（v2.5.5）：母项目已上 pid 精确查杀 + 删除失败可证伪，本脚本仍是旧版
+# （只靠命令签名全表扫描、Remove-Item 失败静默留空骨架），而没有任何门禁盯着这件事。
+def c_uninstall_parity(root):
+    p = os.path.join(root, 'scripts', 'vm-remove-local.ps1')
+    if not os.path.exists(p):
+        return ['缺 vm-remove-local.ps1']
+    body = strip_comments(read(p))
+    bad = []
+    # ① pid 快路：函数定义 + 两个 pid 文件各自至少出现一次调用（0 段 / 2 段各一轮）
+    if 'function Kill-PidFile' not in body:
+        bad.append('缺 Kill-PidFile（pid 精确查杀快路）')
+    for fn in ('service.pid', 'ps-bridge.pid'):
+        n = len(re.findall(re.escape("'" + fn + "'"), body))
+        if n < 2:
+            bad.append("%s 只被查 %d 次（应 >=2：段 0 + 段 2 各一次）" % (fn, n))
+    # ② pid 快路必须排在签名扫描之前：先猜后查等于没快路，且误杀窗口更大
+    i_pid = body.find("Kill-PidFile 'service node (pid file)'")
+    i_sig = body.find("Kill-Sig 'vm-service node'")
+    if i_pid < 0:
+        bad.append('段 0 未调 Kill-PidFile（pid 快路未接线）')
+    elif i_sig >= 0 and i_pid > i_sig:
+        bad.append('pid 快路被排在签名扫描之后（先猜后查）')
+    # ③ pid 复用防护：必须同时校验进程名与 StartTime，缺一不可
+    if 'pid reuse guard' not in body:
+        bad.append('缺 pid 复用防护（Windows 会回收 pid）')
+    if 'StartTime' not in body or 'TotalSeconds' not in body:
+        bad.append('缺 StartTime 二次校验（仅比名字挡不住 pid 复用）')
+    # ④ 目录删除必须可证伪：以前 -ErrorAction Continue 时静默留空骨架，日志照样"跑过了"
+    if 'Remove-Item $BridgeDir -Recurse -Force -ErrorAction Stop' not in body:
+        bad.append('目录删除未用 -ErrorAction Stop（失败会静默，重演空骨架）')
+    if 'BRIDGE_HOLDER PID=' not in body:
+        bad.append('删除失败无 BRIDGE_HOLDER 取证行（无法定位占位进程）')
+    if 'BRIDGE_RESIDUE_ITEMS=' not in body:
+        bad.append('删除失败无 BRIDGE_RESIDUE_ITEMS（无法区分空壳与真残留）')
+    return bad
+
+
 def c_parallel(root):
     bad = []
     body = strip_comments(read(os.path.join(root, 'scripts', 'deploy.sh')))
@@ -1303,7 +1342,7 @@ CHECKS = [
     ('password-bootstrap', c_password_bootstrap), ('purge-all', c_purge_all),
     ('bom-contract', c_bom_contract), ('purge-completeness', c_purge_completeness),
     ('deps-gap', c_deps_gap), ('pkg-tag-priority', c_pkg_tag_priority),
-    ('rc-honesty', c_rc_honesty),
+    ('rc-honesty', c_rc_honesty), ('uninstall-parity', c_uninstall_parity),
 ]
 
 
@@ -1543,6 +1582,18 @@ MUTATIONS = [
     ('M57 失败行 rc 恒为 0', 'scripts/deploy-2-host.sh',
      'DVRC=0\nbash "$SCRIPTDIR/download-verify.sh" ${RELEASE_TAG:+--tag "$RELEASE_TAG"} > "$DV" 2>&1 || DVRC=$?',
      'DVRC=0\nif ! bash "$SCRIPTDIR/download-verify.sh" ${RELEASE_TAG:+--tag "$RELEASE_TAG"} > "$DV" 2>&1; then DVRC=$?; fi'),
+    # 通道 DOWN 的兜底卸载脚本悄悄落后母项目一整段能力（v2.5.5 真实事故）：
+    # 头注释自称 mirror uninstall.mjs，但既无 pid 快路、删除失败又静默留空骨架。
+    # 撤掉段 0 的两处 Kill-PidFile 调用 ⇒ uninstall-parity 必须报案。
+    ('M58 兜底卸载丢 pid 快路', 'scripts/vm-remove-local.ps1',
+     "Kill-PidFile 'service node (pid file)' 'service.pid' 'node.exe'\n"
+     "Kill-PidFile 'ps-bridge (pid file)' 'ps-bridge.pid' 'powershell.exe'\n",
+     ''),
+    # 删除退回 `-ErrorAction Continue`（默认）：进程占着 cwd 时 Remove-Item 一声不响，
+    # 目录留成空骨架，日志却显示这步跑过了 —— 下一次部署上来就继承这片废墟。
+    ('M59 删除失败退回静默', 'scripts/vm-remove-local.ps1',
+     'try { Remove-Item $BridgeDir -Recurse -Force -ErrorAction Stop }',
+     'try { Remove-Item $BridgeDir -Recurse -Force }'),
 ]
 
 
