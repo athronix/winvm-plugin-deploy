@@ -320,6 +320,35 @@ def c_uninstall_parity(root):
     return bad
 
 
+# 1b 必须用 --host-only **显式声明** VM 相位归第 2 步。
+# 历史问题（V1.4.35 及以前）：脚本解析不到 VM 目标时无条件 failures++ ⇒ 每轮
+# host-only 卸载都打「APPLY finished with 1 failure(s)」+ rc=1，而 11 项复验全 PASS。
+# 人最先看的那行数字在说谎，属 P18 同类形态。V1.4.36 起脚本支持 --host-only（不计失败）。
+# 这条门禁钉两件事：① 1b 必须显式传；② 判据不得只靠 rc（旧包不认该参数，必须仍能判对）。
+def c_host_only_intent(root):
+    p = os.path.join(root, 'scripts', 'undeploy-1-host.sh')
+    if not os.path.exists(p):
+        return ['缺 undeploy-1-host.sh']
+    body = strip_comments(read(p))
+    bad = []
+    # 锚定到**实际调用行**，不能只查 '--host-only' 子串：该字样在判据/诊断行里也出现，
+    # 删掉调用处的开关后子串检查仍命中 ⇒ 假绿（M60 变异实证）。
+    if not re.search(r'delivery/uninstall\.mjs\s+--apply\s+--host-only', body):
+        bad.append('1b 调用行未传 --host-only（卸载器会把「VM 相位跳过」计成失败 ⇒ rc=1 误报）')
+    # 必须仍保留 HOST 行判据：装旧包时 --host-only 不被识别，只能靠这个判对。
+    # 注意脚本里写的是 awk 正则 `\[PASS\] HOST`（带转义），不能按字面 '[PASS] HOST' 匹配。
+    if 'PASS\\] HOST' not in body or 'FAIL\\] HOST' not in body:
+        bad.append('1b 判据丢了 HOST 行（旧包不认 --host-only 时会误红）')
+    # 判据必须仍是「HOST 行 + VM 相位未混入」三条件，不能退化只看 rc：
+    # 旧包不认 --host-only 恒 rc=1，只看 rc 会让每轮都误红。
+    if not re.search(r'if\s*\[\s*"\$HFAIL"\s*!=\s*"0"\s*\]\s*\|\|\s*\[\s*"\$\{HPASS:-0\}"\s*-lt\s*11\s*\]', body):
+        bad.append('1b 判据退化为只看 rc（旧包必误红）')
+    # 新包若认了 --host-only 却 rc!=0，那是真失败，必须当场判死（不能靠 HPASS/HFAIL 蒙混）
+    if not re.search(r'HOSTONLY_NEW.*-ge 1.*HRC.*!=.*0', body):
+        bad.append('1b 未把「--host-only 已生效但 rc!=0」判为真失败（会放过真实故障）')
+    return bad
+
+
 def c_parallel(root):
     bad = []
     body = strip_comments(read(os.path.join(root, 'scripts', 'deploy.sh')))
@@ -1343,6 +1372,7 @@ CHECKS = [
     ('bom-contract', c_bom_contract), ('purge-completeness', c_purge_completeness),
     ('deps-gap', c_deps_gap), ('pkg-tag-priority', c_pkg_tag_priority),
     ('rc-honesty', c_rc_honesty), ('uninstall-parity', c_uninstall_parity),
+    ('host-only-intent', c_host_only_intent),
 ]
 
 
@@ -1594,6 +1624,15 @@ MUTATIONS = [
     ('M59 删除失败退回静默', 'scripts/vm-remove-local.ps1',
      'try { Remove-Item $BridgeDir -Recurse -Force -ErrorAction Stop }',
      'try { Remove-Item $BridgeDir -Recurse -Force }'),
+    # 1b 不传 --host-only ⇒ 卸载器（新版）仍按老语义计一次失败并 rc=1，
+    # 每轮 host-only 卸载都以「1 failure(s)」收尾而 11 项全 PASS。
+    ('M60 1b 丢 --host-only', 'scripts/undeploy-1-host.sh',
+     'delivery/uninstall.mjs --apply --host-only > "$AL" 2>&1 ); HRC=$?',
+     'delivery/uninstall.mjs --apply > "$AL" 2>&1 ); HRC=$?'),
+    # 判据退化成只看 rc ⇒ 装旧包（不认 --host-only，恒 rc=1）时每轮必红。
+    ('M61 1b 判据退化为只看 rc', 'scripts/undeploy-1-host.sh',
+     'if [ "$HFAIL" != "0" ] || [ "${HPASS:-0}" -lt 11 ] || [ "$VMINHOST" != "0" ]; then',
+     'if [ "$HRC" != "0" ]; then'),
 ]
 
 

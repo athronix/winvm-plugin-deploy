@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）；--purge-all 一键回到裸机（②追加 2e 运行时深清 node/codebuddy/私钥，③的同一 SYSTEM 任务里卸 sshd MSI 与两处 authorized_keys）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
-version: 2.5.6
+version: 2.5.7
 agent_created: true
 ---
 
@@ -203,6 +203,7 @@ bash scripts/selfcheck.sh --mutate        # 变异自证：往副本注缺陷，
 | 卸载日志 `[SKIP] no pid file: service node (pid file)` | **正常，不是失败**。pid 文件只在**新版插件启动时**才写（`<部署根>\run\service.pid` / `ps-bridge.pid`）；装的是旧包或服务从没起过 ⇒ 没文件 ⇒ 自动降级到命令签名清扫（紧随其后的 `taskkill ... vm-service node PID <n>` 才是真正干活的那行）。**别手工造 pid 文件** |
 | 卸载/重启日志 `[SKIP] pid <n> start time differs by <s>s ... (pid reuse guard)` | **防护生效，不是 bug**。Windows 会回收 pid，陈旧的 pid 文件可能已指向一个全新的无关进程；此时按「进程名 + StartTime（容差 2s）」双校验拒绝查杀，改由签名清扫兜底。若 `<s>` 是几千秒量级，说明部署早已重启过、pid 文件是上一轮的遗留——**安全跳过是对的，不要绕过** |
 | 部署/VM-START 报 `VM_START_PID_REUSED` | 同上，pid 文件与实际进程的 StartTime 对不上 ⇒ 拒绝查杀转签名兜底。若紧接着 18443 起不来，看有没有**别的**进程占着端口（`Get-NetTCPConnection -LocalPort 18443`），而不是怀疑 pid 逻辑 |
+| 卸载 1b 打出 `APPLY finished with 1 failure(s)` / `uninstall_rc=1`，但 `HOST_PASS=11 HOST_FAIL=0` | **装的是 V1.4.35 及以前的老包才会遇到**：卸载器解析不到 VM 目标时无条件 `failures++`，于是每轮 host-only 调用（1b 就是）都误报一次失败，而 11 项复验全 PASS —— 人最先看的那行数字在说谎。V1.4.36 起本技能显式传 `--host-only`，脚本按「设计内跳过」处理、**不计失败且 rc=0**。真机上 1b 会打 `host_only_ack=1`；老包则为 `host_only_ack=0` 且 rc=1，**1b 仍判 PASS 是对的**（判据只看 HOST 行）。要消掉这条噪音就升包到 V1.4.36+，**别去手工改判据把它放绿** |
 | verify 报 `ENV_WINDOW=1` | 通道瞬态窗，环境问题非功能失败。等健康窗只重跑 `verify.sh` |
 | 探针报 `total-33!=34` / `skip-N!=4` | 探针项数被改动 → 同步改 `deploy-5-verify.sh` 的 `EXP_TOTAL/EXP_SKIP`（刻意告警，别放宽） |
 

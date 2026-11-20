@@ -60,25 +60,39 @@ fi
 
 AL="$(sub_log uninstall-host)"
 if [ -n "$PKG" ]; then
+  # --host-only：显式声明「VM 相位由第 2 步独占」。V1.4.36 起这个开关让脚本
+  # **不计失败、rc=0**；老包不认这个参数（未知参数被忽略）⇒ 退化成 rc=1，
+  # 所以下面的判据仍然只信 HOST 行 —— 新旧包都能正确判。
   ( cd "$PKG" && unset WINVM_VM_HOST WINVM_VM_USER WINVM_VM_SSH_PORT && \
-    timeout 180 "$NODE" delivery/uninstall.mjs --apply > "$AL" 2>&1 ); HRC=$?
+    timeout 180 "$NODE" delivery/uninstall.mjs --apply --host-only > "$AL" 2>&1 ); HRC=$?
 else
   HRC=1; echo "[HOST] 无包根：本机可能从未装过" > "$AL"
 fi
 restore_targets; trap - EXIT INT TERM
 
-# 判据只看 HOST 行（host-only 时总 rc=1 是设计内：VM 相位 skipped 计一次失败）
+# 判据只看 HOST 行。原因：装的是**旧包**时 --host-only 不被识别，脚本仍会
+# 按老语义把「VM 相位 skipped」计成一次失败并 rc=1；而 host 侧 11 项照样全 PASS。
+# 新版（V1.4.36+）会打 `VM side checks skipped by design (--host-only)` 且 rc=0，
+# 这里额外把「rc=0」当作正向证据，但不把它设成硬要求（否则旧包必红）。
 HPASS="$(awk '/\[PASS\] HOST/{n++} END{print n+0}' "$AL" 2>/dev/null)"; : "${HPASS:=0}"
 HFAIL="$(awk '/\[FAIL\] HOST/{n++} END{print n+0}' "$AL" 2>/dev/null)"; : "${HFAIL:=0}"
 VMINHOST="$(awk '/^--- VM: .* pushed via scp/{n++} END{print n+0}' "$AL" 2>/dev/null)"; : "${VMINHOST:=0}"
-grep -E '\[FAIL\] HOST|APPLY' "$AL" | head -6 || true
-echo "  HOST_PASS=$HPASS HOST_FAIL=$HFAIL VM_PHASE_IN_HOST=$VMINHOST uninstall_rc=$HRC"
+HOSTONLY_NEW="$(awk '/skipped by design \(--host-only\)/{n++} END{print n+0}' "$AL" 2>/dev/null)"; : "${HOSTONLY_NEW:=0}"
+grep -E '\[FAIL\] HOST|APPLY|--host-only' "$AL" | head -6 || true
+if [ "$HOSTONLY_NEW" -ge 1 ] && [ "$HRC" != "0" ]; then
+  # 新包认了 --host-only 却仍 rc!=0 ⇒ 是真失败，不能放过。
+  echo "  HOST_PASS=$HPASS HOST_FAIL=$HFAIL VM_PHASE_IN_HOST=$VMINHOST uninstall_rc=$HRC host_only=yes(rc!=0)"
+  st_end 1 FAIL "host-only 语义已生效但 rc=$HRC"
+  die "host 端卸载真实失败" "host 清理项出错（与 VM 相位无关，它已按设计跳过）" "$AL" \
+      "看 $AL 的 [FAIL]/[WARN] 行"
+fi
+echo "  HOST_PASS=$HPASS HOST_FAIL=$HFAIL VM_PHASE_IN_HOST=$VMINHOST uninstall_rc=$HRC host_only_ack=$HOSTONLY_NEW"
 if [ "$HFAIL" != "0" ] || [ "${HPASS:-0}" -lt 11 ] || [ "$VMINHOST" != "0" ]; then
   st_end 1 FAIL "HOST_PASS=$HPASS HOST_FAIL=$HFAIL VM_PHASE=$VMINHOST"
   die "host 端卸载未达判据" "$([ "$VMINHOST" != "0" ] && echo 'VM 目标未屏蔽干净，host 相位跑成了双端' || echo 'host 清理项有失败')" \
       "$AL" "看 $AL；VM_PHASE!=0 说明 .env/vm-conn.json 屏蔽失败"
 fi
-st_end 0 PASS "HOST_PASS=$HPASS HOST_FAIL=0 VM_PHASE=0"
+st_end 0 PASS "HOST_PASS=$HPASS HOST_FAIL=0 VM_PHASE=0 host_only_ack=$HOSTONLY_NEW"
 
 st_begin 1c "host 端清空复核（含命名空间兜底）"
 _C1=0
