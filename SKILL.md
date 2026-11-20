@@ -1,7 +1,7 @@
 ---
 name: winvm-plugin-deploy
 description: "WinVM Bridge（workbuddy-virtual-win-plugin）鸿蒙宿主 + Windows VM 双端部署/卸载/复验的唯一执行权威。结构 = 5 步部署（①建 ssh 免密通道 ②取包装 host 端 ③起 tunnel 并验证 ④装 VM 端（含全局 npm 上游 agent-browser/agent-desktop）、起 mcp/a2a service、上游工具面判据 ⑤verify（三探针 + 终态矩阵 + 上游工具面））+ 3 步卸载（①停 tunnel 卸 host ②停 VM 服务 + 卸 VM 模块 + 卸上游 CLI ③拆 ssh 通道 --remove-ssh-tunnel yes|no 默认 no）；--purge-all 一键回到裸机（②追加 2e 运行时深清 node/codebuddy/私钥，③的同一 SYSTEM 任务里卸 sshd MSI 与两处 authorized_keys）。每步一个脚本、可单独重跑、失败定点重来；第 1 步失败时只给用户一条可整段粘贴的 VM 管理员 PowerShell 命令（远端脚本只从技能仓取、Gitee/GitHub 双源回退，全程无需 token；-File 执行复制自身，irm|iex 执行则自下载落盘到 VM 固定路径，卸载时同一条 -Rollback）。Use when: 部署/重装/卸载/复验 winvm-plugin；按技能 URL 安装或卸载；VM ssh 连不上、免密通道要建或要拆、发布包或一次性脚本下载失败、插件健康复验、agent-browser / agent-desktop 上游装没装或工具面通不通。"
-version: 2.5.8
+version: 2.5.9
 agent_created: true
 ---
 
@@ -9,6 +9,68 @@ agent_created: true
 
 把「鸿蒙宿主 ⇄ Windows VM 跑 WinVM Bridge」压成**两类任务、每步一个脚本**。没有可选分支、没有中间决策层：
 一个命令跑到底，失败就只重跑那一步。
+
+## 零配置上手（agent 照这一段做即可）
+
+**默认目标已经写在脚本里，不用问也能跑**：`VM_HOST=172.16.100.2` / `VM_USER=User` / **无密码**。
+换机器用环境变量覆盖，不要改脚本：`VM_HOST=<ip> VM_USER=<user> bash scripts/deploy.sh`。
+
+### 第一次就跑这一条（不带任何参数）
+
+```bash
+bash scripts/deploy.sh
+```
+
+**不要**在第一次就自作主张加 `--only` / `--from` / `RELEASE_TAG`，也不要在它失败后立刻重跑。
+先看它打了什么——`deploy.sh` 的收尾只有三种，按行文判断即可：
+
+| 收尾行 | 含义 | 下一步 |
+|---|---|---|
+| `DEPLOY=PASS` | 全链通了 | 完事，向用户报告版本与路径 |
+| `DEPLOY=NEED_USER_ACTION rc=2` | 第 1 步需要人去 VM 粘一条管理员命令（唯一人工步骤） | 把那条命令原样交给用户，**粘完重跑同一条 `deploy.sh`**（已完成步骤幂等） |
+| `DEPLOY=FAIL rc=1` | 真失败 | 读四元组（现象/根因/证据/处置）→ 定点 `--only <步号>` 重试，**别整链重跑** |
+
+### 只有这三种情况才需要问用户
+
+1. **`DEPLOY=FAIL` 且处置指向「VM_HOST 不可达」** → 问 IP（默认 `172.16.100.2` 是不是这台）。
+2. **`rc=2` 且用户说这台 VM 账户有密码** → 走下面「有密码」那条，**别让用户去粘命令**。
+3. **用户明说换机器/换账户** → 问 IP 与账户名。
+
+除这三点外不要追问。尤其是**不要**一上来就问 IP —— 默认值通常就是对的，多问一轮纯属浪费。
+
+### 有密码时（推荐，比交互输入更稳）
+
+口令**不要**走命令行参数（会进 shell history 和进程列表）。写进文件、用变量指过去：
+
+```bash
+umask 077; printf '%s' '<口令>' > ~/.winvm-pass
+bash scripts/deploy.sh          # ~/.winvm-pass 会被自动认到（默认 WINVM_PASSWORD_FILE）
+```
+
+- 默认口令文件就是 `~/.winvm-pass`（`_common.sh` 的 `resolve_env` 在文件存在时自动设
+  `WINVM_PASSWORD_FILE`），**不需要你在命令行里再传一次**。
+- 也可以显式指定别的路径：`WINVM_PASSWORD_FILE=/path/to/pass bash scripts/deploy.sh`。
+- 也可以直接给环境变量：`VM_PASSWORD='...' bash scripts/deploy.sh`（优先级更高，但易泄漏，不如文件）。
+- 脚本**只读不写**这个文件，也**绝不**把它写进任何日志或状态文件。
+- 交互输入也行（`deploy.sh` 在 tty 下会提示），但 agent 里没有 tty，**别指望它**——没 tty 时会按「无密码」尝试。
+
+### 没有密码（默认）
+
+什么都不用做。1p 阶段会自动按「空口令」登录试一把：
+
+- 能登录 → 通道全自动建好，第 1 步整步结束，**没有任何人工步骤**；
+- 被 Windows 出厂策略拒绝（`PermitEmptyPasswords no` + `LimitBlankPasswordUse=1`）→
+  自动退到 1c，给你那条管理员命令。这不是故障，照 `rc=2` 那条走即可。
+- 想显式禁止空口令尝试（确定有密码但没给）：`WINVM_SSH_DEFAULT_EMPTY=0 bash scripts/deploy.sh`。
+
+### 临时目录：一律走 `$TMPDIR` / `$HOME/wbtmp`，**禁止 `/tmp`**
+
+鸿蒙沙箱的 `/tmp` 是只读 tmpfs —— `touch /tmp/x` 报 `Read-only file system`，
+`curl -o /tmp/x` 报 `curl: (23) client returned ERROR on write`。任何「下载到 /tmp 再解压」
+的写法都会当场炸，且报错信息看着像网络问题，极易误判。
+
+脚本内部已全部走 `vm_tmpdir()`（= `${TMPDIR:-$HOME/wbtmp}`）。**你在命令行里落任何临时文件，
+也照这个来**：`d="$(vm_tmpdir)"` 或直接 `$HOME/wbtmp`。
 
 ## 部署 = 5 步
 
@@ -23,7 +85,8 @@ agent_created: true
 **1‖2 并行**（互不依赖），**3‖4 并行**，最后 5。编排与并行在 `deploy.sh` 里，脚本本身都能单独跑。
 
 ```bash
-VM_HOST=172.16.100.2 bash scripts/deploy.sh                    # 全链（首次会停在第 1 步，见下）
+bash scripts/deploy.sh                                         # 全链（默认 172.16.100.2 / User / 无密码）
+VM_HOST=10.0.0.5 bash scripts/deploy.sh                        # 换机器：只覆盖 IP
 VM_HOST=... bash scripts/deploy.sh --only 4                    # 只重跑第 4 步
 VM_HOST=... bash scripts/deploy.sh --from 3                    # 从第 3 步起
 VM_HOST=... bash scripts/deploy.sh --serial                    # 关并行（排障）

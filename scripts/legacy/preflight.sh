@@ -13,8 +13,9 @@ echo "==== WinVM deploy preflight (host=${VM_HOST:-未设}) ===="
 if [ -z "$VM_HOST" ]; then echo "RED: VM_HOST 未设 → 执行协议 P-1 问用户"; RED=$((RED+1)); else echo "OK: VM_HOST=$VM_HOST"; fi
 
 # 2) 宿主运行时（冒烟探测）
+_PF_TMP="${TMPDIR:-$HOME/wbtmp}"; mkdir -p "$_PF_TMP" 2>/dev/null || true
 if [ -f "$HOME/wbtmp/vmdeploy-env.sh" ]; then . "$HOME/wbtmp/vmdeploy-env.sh"; echo "OK: NODE=${NODE:-?}"; else
-  bash "$_here/env-detect.sh" >/tmp/pf-node.$$ 2>&1 && . "$HOME/wbtmp/vmdeploy-env.sh" && echo "OK: 运行时探测通过 NODE=${NODE:-?}" || { echo "RED: 无健康 node/python（见 env-detect 输出）"; cat /tmp/pf-node.$$ | tail -3; RED=$((RED+1)); }
+  bash "$_here/env-detect.sh" >"$_PF_TMP/pf-node.$$" 2>&1 && . "$HOME/wbtmp/vmdeploy-env.sh" && echo "OK: 运行时探测通过 NODE=${NODE:-?}" || { echo "RED: 无健康 node/python（见 env-detect 输出）"; cat "$_PF_TMP/pf-node.$$" | tail -3; RED=$((RED+1)); }
 fi
 NODE="${NODE:-$(command -v node || true)}"
 

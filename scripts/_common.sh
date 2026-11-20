@@ -20,6 +20,14 @@ export SCRIPTDIR SKILLDIR
 WINVM_HOME="${WINVM_HOME:-$HOME/.workbuddy/winvm}"
 STATE_FILE="${VMDEPLOY_STATE_FILE:-$WINVM_HOME/deploy-state.env}"
 DEPLOY_ROOT="${DEPLOY_ROOT:-$HOME/winvm-deploy}"
+# 临时目录唯一来源。鸿蒙沙箱的 /tmp 是只读 tmpfs（实测 `touch /tmp/x` = Read-only
+# file system，`curl -o /tmp/x` = curl 23），任何落 /tmp 的写法都会当场失败。
+# 故**全仓禁用 /tmp**，一律走本函数：TMPDIR > $HOME/wbtmp。
+vm_tmpdir() {
+  local d="${TMPDIR:-$HOME/wbtmp}"
+  mkdir -p "$d" 2>/dev/null || true
+  printf '%s' "$d"
+}
 : "${VMDEPLOY_RUN_DIR:=${HOME}/wbtmp/winvm-deploy-$(date +%Y%m%d-%H%M%S)}"
 LOGD="${VMDEPLOY_LOG_DIR:-$VMDEPLOY_RUN_DIR}"
 export WINVM_HOME STATE_FILE DEPLOY_ROOT VMDEPLOY_RUN_DIR LOGD
@@ -85,9 +93,17 @@ state_dump() {
 
 resolve_env() {
   state_load
-  : "${VM_HOST:=}"
+  # 默认值来自用户口径（2026-11-20）：这台 VM 就是「172.16.100.2 / User / 无密码」。
+  # 写成默认值是为了让**新机器上一条命令就能跑通**，不必先知道 IP 才能起步；
+  # 换机器仍是 `VM_HOST=<ip> bash scripts/deploy.sh` 覆盖，无需改脚本。
+  : "${VM_HOST:=172.16.100.2}"
   : "${VM_USER:=User}"
   : "${VM_SSH_PORT:=22}"
+  # 口令文件默认 ~/.winvm-pass（用户自建、脚本只读不写）。只有文件真实存在才生效：
+  # 不存在时保持空值 ⇒ 后续按「无口令」处理，不会把「空文件」误判成「空口令意图」。
+  if [ -z "${WINVM_PASSWORD_FILE:-}" ] && [ -f "$HOME/.winvm-pass" ]; then
+    WINVM_PASSWORD_FILE="$HOME/.winvm-pass"
+  fi
   # 密钥三级链：env > vm-conn.json.identityFile > 约定默认（本插件建的通道钥）
   if [ -z "${WINVM_VM_KEY:-}" ] && [ -f "$WINVM_HOME/vm-conn.json" ]; then
     local k=""
@@ -96,6 +112,8 @@ resolve_env() {
   fi
   : "${WINVM_VM_KEY:=$HOME/.ssh/id_ed25519_winvm}"
   export VM_HOST VM_USER VM_SSH_PORT WINVM_VM_KEY
+  if [ -n "${WINVM_PASSWORD_FILE:-}" ]; then export WINVM_PASSWORD_FILE; fi
+  return 0
 }
 
 require_host() {

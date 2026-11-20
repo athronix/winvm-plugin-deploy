@@ -52,7 +52,7 @@ AK_ADMIN='C:/ProgramData/ssh/administrators_authorized_keys'
 # 用户级授权文件（非管理员分支生效的那个）
 AK_USER="C:/Users/${VM_USER}/.ssh/authorized_keys"
 
-# ── 口令来源解析（优先级：env > VM_PASSWORD > 用户文件 > tty）──
+# ── 口令来源解析（优先级：env > VM_PASSWORD > 用户文件 > tty > 默认无口令）──
 # 返回 0 = 有「登录意图」（含显式空口令，此时 WINVM_SSH_PASSWORD_EMPTY=1）
 resolve_password() {
   if [ -n "${WINVM_SSH_PASSWORD:-}" ]; then return 0; fi
@@ -73,6 +73,15 @@ resolve_password() {
       WINVM_SSH_PASSWORD="$p"; export WINVM_SSH_PASSWORD; return 0
     fi
     # 直接回车 ⇒ 用户表达的正是「该账户无密码」，属显式意图，允许空口令尝试
+    WINVM_SSH_PASSWORD=""; WINVM_SSH_PASSWORD_EMPTY=1
+    export WINVM_SSH_PASSWORD WINVM_SSH_PASSWORD_EMPTY
+    return 0
+  fi
+  # 无 tty（agent 跑脚本就是这样）且上面三种来源都没有 ⇒ 按用户口径默认「无密码」尝试。
+  # 这是**默认配置就是无密码**的直接后果：不这么做，agent 环境下 1p 永远走不到，
+  # 会静默退化成「给用户一条管理员命令」——而用户从头到尾没被告知需要密码。
+  # 想显式拒绝空口令（真的有密码只是没给）用 DEFAULT_EMPTY=0。
+  if [ "${WINVM_SSH_DEFAULT_EMPTY:-1}" = "1" ]; then
     WINVM_SSH_PASSWORD=""; WINVM_SSH_PASSWORD_EMPTY=1
     export WINVM_SSH_PASSWORD WINVM_SSH_PASSWORD_EMPTY
     return 0

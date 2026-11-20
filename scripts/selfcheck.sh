@@ -349,6 +349,76 @@ def c_host_only_intent(root):
     return bad
 
 
+# 零配置上手口径（2026-11-20 用户裁定）：新鸿蒙机上「一条 deploy.sh 不带参数」就要能跑。
+# 三个默认值 + 一条 /tmp 禁令，任何一条被改回去都会让新用户的首次体验退化成「先问我 IP」。
+# 这是产品口径，不是实现细节，所以必须由门禁钉死。
+def c_zero_config(root):
+    bad = []
+    common = strip_comments(read(os.path.join(root, 'scripts', '_common.sh')))
+
+    # ① VM_HOST 默认值。写成 `: "${VM_HOST:=}"` 就退回「必须先知道 IP」。
+    if not re.search(r':\s*"\$\{VM_HOST:=172\.16\.100\.2\}"', common):
+        bad.append('_common.sh 丢了 VM_HOST 默认值 172.16.100.2（新用户首次必停在 require_host）')
+    # ② VM_USER 默认值
+    if not re.search(r':\s*"\$\{VM_USER:=User\}"', common):
+        bad.append('_common.sh 丢了 VM_USER 默认值 User')
+    # ③ 口令文件默认 ~/.winvm-pass。注意必须**以文件存在为条件**：
+    #    无条件赋值会让「文件不存在」也变成「用户提供了口令文件」，掩盖真实缺失。
+    if not re.search(r'\[ -f "\$HOME/\.winvm-pass" \]', common):
+        bad.append('_common.sh 不再自动认 ~/.winvm-pass（用户写了口令文件却不生效）')
+    if not re.search(r'WINVM_PASSWORD_FILE="\$HOME/\.winvm-pass"', common):
+        bad.append('_common.sh 未把 WINVM_PASSWORD_FILE 默认指向 ~/.winvm-pass')
+    # 脚本绝不写口令文件（只读契约）
+    if re.search(r'>\s*"\$HOME/\.winvm-pass"|>>\s*"\$HOME/\.winvm-pass"', common):
+        bad.append('_common.sh 竟在写 ~/.winvm-pass（脚本只读不写）')
+
+    # ④ /tmp 禁令：鸿蒙 /tmp 只读，落 /tmp 的写法必炸且报错像网络问题。
+    #    必须先有 vm_tmpdir() 这个唯一来源，再逐个脚本扫 /tmp 字面量。
+    if not re.search(r'^vm_tmpdir\(\)\s*\{', common, re.M):
+        bad.append('_common.sh 缺 vm_tmpdir()（临时目录没有唯一来源）')
+    if 'TMPDIR:-$HOME/wbtmp' not in common:
+        bad.append('vm_tmpdir 未按 ${TMPDIR:-$HOME/wbtmp} 解析（鸿蒙 /tmp 只读）')
+    offenders = []
+    for fn in sorted(os.listdir(os.path.join(root, 'scripts'))):
+        if not fn.endswith('.sh'):
+            continue
+        fp = os.path.join(root, 'scripts', fn)
+        if fn == 'selfcheck.sh':
+            continue   # 本文件里出现 /tmp 只可能是断言文本
+        body = strip_comments(read(fp))
+        # 排除 Windows 侧路径（C:/.../Temp/）；只抓裸 /tmp 前缀。
+        # 不能要求尾斜杠 —— `cd /tmp && ...` 这类行尾写法才是最典型的踩坑形态（M64 实证：
+        # 早先写成 `/tmp/` 带斜杠，`cd /tmp` 反而抓不到，门禁假绿）。
+        for m in re.finditer(r'(?<![\w:/.])/tmp(?![\w-])', body):
+            line = body[:m.start()].count('\n') + 1
+            offenders.append('%s:%d' % (fn, line))
+    if offenders:
+        bad.append('出现裸 /tmp 落盘（鸿蒙只读，必炸）：' + ', '.join(offenders[:5]))
+
+    # ⑤ 默认无密码：无 tty 时也必须走到 1p，否则 agent 环境下永远静默退化成人工命令。
+    autokey = strip_comments(read(os.path.join(root, 'scripts', 'deploy-1p-autokey.sh')))
+    if not re.search(r'WINVM_SSH_DEFAULT_EMPTY:-1', autokey):
+        bad.append('1p 缺「默认无密码」兜底（agent 无 tty ⇒ 1p 永远走不到，静默退化人工）')
+    # 该兜底必须排在 resolve_password 的 tty 分支之后、return 1 之前
+    i_tty = autokey.find('if [ -t 0 ]; then')
+    i_def = autokey.find('WINVM_SSH_DEFAULT_EMPTY:-1')
+    if i_tty < 0 or i_def < i_tty:
+        bad.append('1p 的默认无密码兜底位置不对（必须在 tty 探测之后，否则会抢掉真口令）')
+
+    # ⑥ SKILL.md 必须把这套口径写给 agent 看（否则脚本对了、执行者仍会先问 IP）
+    skill = read(os.path.join(root, 'SKILL.md'))
+    for need, why in [
+        ('零配置上手', 'SKILL.md 缺「零配置上手」段落'),
+        ('bash scripts/deploy.sh', 'SKILL.md 未给出「不带参数」的第一条命令'),
+        ('NEED_USER_ACTION rc=2', 'SKILL.md 未解释 rc=2 的语义（会被当失败重跑）'),
+        ('~/.winvm-pass', 'SKILL.md 未写口令文件默认路径'),
+        ('禁止 `/tmp`', 'SKILL.md 未写 /tmp 禁令'),
+    ]:
+        if need not in skill:
+            bad.append(why)
+    return bad
+
+
 def c_parallel(root):
     bad = []
     body = strip_comments(read(os.path.join(root, 'scripts', 'deploy.sh')))
@@ -859,10 +929,19 @@ def c_password_bootstrap(root):
     if 'exit 2' not in t:
         bad.append('deploy-1p-autokey.sh 缺「不可用即退 2」的降级语义（会把第 1 步拖成硬失败）')
 
-    # 空口令意图必须在**两处**都能置起（tty 直接回车 / WINVM_SSH_ALLOW_EMPTY），
-    # 少一处就有一条「无密码账户」的用户走不到自动建通道。
-    if len(re.findall(r'WINVM_SSH_PASSWORD_EMPTY=1', t)) < 2:
-        bad.append('「无密码登录」准入面不全（tty 回车与 WINVM_SSH_ALLOW_EMPTY 两处都须置空口令意图）')
+    # 空口令意图必须在**两条准入面**都能置起：① tty 直接回车；② 无 tty 时的默认无密码。
+    # 不能只数 `WINVM_SSH_PASSWORD_EMPTY=1` 的出现次数 —— 加减一处仍可能凑够 2 次，
+    # 于是「抹掉 tty 那条」照样绿（M28 就这样变成假绿）。必须逐条锚定各自独有的上文。
+    # 注意：strip_comments 已剥掉注释，锚点只能用**代码**（tty 那条的独有上文是 `read -rs p`
+    # 与随后的 printf '\n'），不能用「直接回车」这种只存在于注释里的字样。
+    m_tty = re.search(r"IFS= read -rs p[^\n]*\n\s*printf '\\n'[^\n]*\n\s*if \[ -n \"\$p\" \]; then"
+                      r"[^\n]*\n[^\n]*return 0\n\s*fi\n\s*WINVM_SSH_PASSWORD=\"\";\s*WINVM_SSH_PASSWORD_EMPTY=1", t)
+    if not m_tty:
+        bad.append('tty 直接回车未置空口令意图（有密码账户的回车通道丢失）')
+    if not re.search(r'WINVM_SSH_DEFAULT_EMPTY[^\n]*\n\s*WINVM_SSH_PASSWORD="";\s*WINVM_SSH_PASSWORD_EMPTY=1', t):
+        bad.append('无 tty 时的默认无密码准入面丢失（agent 永远走不到 1p）')
+    if 'WINVM_SSH_ALLOW_EMPTY' not in t:
+        bad.append('缺 WINVM_SSH_ALLOW_EMPTY 显式开关（无法人工要求空口令尝试）')
     # ── 提权面：登录后按身份选授权文件（管理员 → ProgramData；否则 → 用户级），且不重启 sshd ──
     # 注意断言必须打在**赋值**上：`administrators_authorized_keys` 也出现在子步骤标题文字里，
     # 只判「字符串在不在」会被标题满足 ⇒ 真把 AK_ADMIN 改成用户级也照样绿（M29 曾因此漏检）。
@@ -1373,6 +1452,7 @@ CHECKS = [
     ('deps-gap', c_deps_gap), ('pkg-tag-priority', c_pkg_tag_priority),
     ('rc-honesty', c_rc_honesty), ('uninstall-parity', c_uninstall_parity),
     ('host-only-intent', c_host_only_intent),
+    ('zero-config', c_zero_config),
 ]
 
 
@@ -1488,8 +1568,12 @@ MUTATIONS = [
      '\n    password) _ssh_t _askpass_env ssh -F /dev/null'),
     # 「无密码登录」准入面被删：tty 直接回车不再置空口令意图 ⇒ 空串被当成「未提供口令」，
     # 无密码账户永远走不到自动建通道，只能靠人工（用户 2026-11-18 明确要求覆盖的 case）。
+    # 注入点必须唯一：文件里有多处同样两行（tty 直接回车 / 无 tty 默认空口令），
+    # 故锚定 tty 分支独有的上文，避免 count=2 让本条突变直接失效（M28 曾因此变 [MISS]）。
     ('M28 空口令准入面丢失', 'scripts/deploy-1p-autokey.sh',
+     '    # 直接回车 ⇒ 用户表达的正是「该账户无密码」，属显式意图，允许空口令尝试\n'
      '    WINVM_SSH_PASSWORD=""; WINVM_SSH_PASSWORD_EMPTY=1',
+     '    # 直接回车 ⇒ 用户表达的正是「该账户无密码」，属显式意图，允许空口令尝试\n'
      '    WINVM_SSH_PASSWORD=""'),
     # 登录后提权面退化成「只写用户级文件」：管理员账户的 Match Group administrators
     # 分支读的是 ProgramData 那份，写用户级等于白写 ⇒ 回验必挂 ⇒ 白跑一轮。
@@ -1633,6 +1717,25 @@ MUTATIONS = [
     ('M61 1b 判据退化为只看 rc', 'scripts/undeploy-1-host.sh',
      'if [ "$HFAIL" != "0" ] || [ "${HPASS:-0}" -lt 11 ] || [ "$VMINHOST" != "0" ]; then',
      'if [ "$HRC" != "0" ]; then'),
+    # 零配置口径退化成「必须先知道 IP」：新用户首次必停在 require_host。
+    ('M62 VM_HOST 默认值被清空', 'scripts/_common.sh',
+     ': "${VM_HOST:=172.16.100.2}"', ': "${VM_HOST:=}"'),
+    # 口令文件默认丢掉 ⇒ 用户按文档写了 ~/.winvm-pass 却完全不生效。
+    ('M63 丢 ~/.winvm-pass 默认', 'scripts/_common.sh',
+     '[ -f "$HOME/.winvm-pass" ]', '[ -f "$HOME/.no-such-file" ]'),
+    # 落盘目录退回裸 /tmp ⇒ 鸿蒙只读，curl 报 23，且报错像网络问题（极难归因）。
+    # 注入点选 download-verify 的 cd：这正是「下载到 /tmp 再解压」的真实形态。
+    ('M64 落盘退回裸 /tmp', 'scripts/download-verify.sh',
+     '( cd "$DEPLOY_ROOT/pkg" && \\',
+     '( cd /tmp && \\'),
+    # agent 无 tty 时 1p 永远走不到 ⇒ 静默退化成「给用户一条管理员命令」，
+    # 而用户压根不知道为什么要粘这条命令。
+    ('M65 1p 丢默认无密码', 'scripts/deploy-1p-autokey.sh',
+     'if [ "${WINVM_SSH_DEFAULT_EMPTY:-1}" = "1" ]; then',
+     'if [ "${WINVM_SSH_DEFAULT_EMPTY:-0}" = "1" ] && false; then'),
+    # SKILL.md 丢了口径说明 ⇒ 脚本对了但执行者仍会先问 IP（门禁必须管文档）。
+    ('M66 SKILL.md 丢零配置段', 'SKILL.md',
+     '## 零配置上手（agent 照这一段做即可）', '## 上手'),
 ]
 
 

@@ -8,12 +8,17 @@
 #   5 verify（三探针 + 终态矩阵 + 上游工具面）
 #
 # 用法：
-#   VM_HOST=172.16.100.2 bash scripts/deploy.sh                 # 全链
+#   bash scripts/deploy.sh                                      # 全链（默认 172.16.100.2 / User / 无密码）
+#   VM_HOST=10.0.0.5 bash scripts/deploy.sh                     # 换机器：只覆盖 IP
 #   VM_HOST=... bash scripts/deploy.sh --only 3                 # 只跑某一步（定点重跑）
 #   VM_HOST=... bash scripts/deploy.sh --from 3                 # 从第 3 步起
 #   VM_HOST=... bash scripts/deploy.sh --serial                 # 关并行（排障用）
 #   VM_HOST=... RELEASE_TAG=V1.4.30 bash scripts/deploy.sh      # 锁版本
 #   VM_HOST=... SKIP_UPSTREAMS=1 bash scripts/deploy.sh         # 不装/不验两个上游工具面
+#
+# **第一次就裸跑 `bash scripts/deploy.sh`，不要先加任何参数。**
+# 收尾只有三种：DEPLOY=PASS / DEPLOY=NEED_USER_ACTION rc=2 / DEPLOY=FAIL rc=1，
+# 三者的下一步见 SKILL.md 的「零配置上手」。失败用 --only <步号> 定点重试，别整链重跑。
 #
 # 首次运行会在第 1 步打印一条「用户只需要做这一件事」的命令并退出（rc=2）。
 # 用户在 VM 粘贴执行后，**重跑同一条命令**即可；已完成的步骤幂等跳过。
